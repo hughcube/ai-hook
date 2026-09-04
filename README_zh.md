@@ -333,6 +333,12 @@ ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
 # 4. 安装至系统 PATH 目录（如 ~/bin/ai-hook.exe）
 ai-hook install
+
+# 5. 一键自我更新至 GitHub 最新 Release（自动匹配系统架构并安全替换自身）
+ai-hook update
+
+# 强制重新下载覆盖
+ai-hook update --force
 ```
 
 ---

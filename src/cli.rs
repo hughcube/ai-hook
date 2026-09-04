@@ -82,4 +82,15 @@ pub enum Commands {
         #[arg(short, long)]
         target_dir: Option<PathBuf>,
     },
+
+    /// Update ai-hook to the latest release from GitHub
+    Update {
+        /// Force re-installation even if already at latest version
+        #[arg(short, long)]
+        force: bool,
+
+        /// Custom GitHub repository in format owner/repo (default: hughcube/ai-hook)
+        #[arg(long, default_value = "hughcube/ai-hook")]
+        repo: String,
+    },
 }

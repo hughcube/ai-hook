@@ -25,6 +25,12 @@ fn main() {
             ref scripts,
         }) => handle_bench(&args, iterations, command, scripts),
         Some(Commands::Install { ref target_dir }) => handle_install(target_dir.clone()),
+        Some(Commands::Update { force, ref repo }) => {
+            if let Err(e) = ai_hook::update::handle_update(force, repo) {
+                eprintln!("[ai-hook update] Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         None => handle_dispatch(&args),
     }
 }

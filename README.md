@@ -333,6 +333,12 @@ ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
 # 4. Install binary to system bin directory (e.g. ~/bin/ai-hook.exe)
 ai-hook install
+
+# 5. One-command self-update to latest GitHub release
+ai-hook update
+
+# Force download and replace even if on the same version
+ai-hook update --force
 ```
 
 ---
