@@ -21,18 +21,172 @@ impl std::fmt::Display for Platform {
     }
 }
 
+/// What a file-oriented tool intends to do with the target file. Normalized
+/// across hosts from the tool name (see `normalize_file_operation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FileAction {
+    Read,
+    Write,
+    Edit,
+    Delete,
+    List,
+    #[default]
+    Other,
+}
+
+impl FileAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileAction::Read => "read",
+            FileAction::Write => "write",
+            FileAction::Edit => "edit",
+            FileAction::Delete => "delete",
+            FileAction::List => "list",
+            FileAction::Other => "other",
+        }
+    }
+}
+
+/// Session identity handed to the hook by the host (when provided).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationInfo {
+    pub id: Option<String>,
+    /// Absolute path of the full conversation transcript (JSONL) — rules may
+    /// read it via `sys.fs.readText()` for context-aware decisions.
+    pub transcript_path: Option<String>,
+}
+
+/// Normalized view of a file-touching tool invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileContext {
+    pub path: Option<String>,
+    pub action: FileAction,
+}
+
+/// Fully parsed and normalized hook context (v2, one semantic per property —
+/// no aliases). `raw` / `rawInput` always carry the complete original payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookContext {
     pub platform: Platform,
+    /// Host permission mode verbatim, e.g. "default" | "plan" | "acceptEdits"
+    /// | "dontAsk" | "bypassPermissions" (hosts that provide it).
+    pub permission_mode: Option<String>,
+    /// True when the host will not ask for confirmation
+    /// (permission_mode bypassPermissions/dontAsk, or AGY skip flag).
+    pub is_yolo: bool,
+    pub conversation: Option<ConversationInfo>,
+    /// Working directory of the command / session.
+    pub cwd: String,
+    pub model: Option<String>,
+    /// Canonical host tool name (e.g. "Bash", "run_command", "Write", "Edit").
     pub tool_name: String,
-    pub cmd: String,
-    pub target_file: String,
+    /// Normalized command line — only for command tools (e.g. Bash,
+    /// run_command); `None` for every other tool.
+    pub cmd: Option<String>,
+    /// Normalized file view — only for file tools; `None` otherwise.
+    pub file: Option<FileContext>,
+    /// Tool arguments exactly as the host provided them.
+    pub tool_args: serde_json::Value,
+    /// Raw payload as text and as parsed JSON (always available).
     pub raw_input: String,
     pub raw_value: serde_json::Value,
-    pub tool_args: serde_json::Value,
-    pub is_yolo: bool,
-    pub cwd: String,
-    pub conversation_id: Option<String>,
+}
+
+/// Single source of truth for boolean environment flags, so CLI and env
+/// detection never diverge: accepts `1`/`true` (case-insensitive), trimmed.
+pub fn env_flag_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+fn current_dir_string() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn get_str<'a>(val: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    for k in keys {
+        if let Some(v) = val.get(*k).and_then(|v| v.as_str()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// YOLO = host runs without confirmation prompts.
+fn permission_mode_is_yolo(mode: &str) -> bool {
+    let m = mode.to_ascii_lowercase();
+    m.contains("bypass") || m.contains("dontask")
+}
+
+/// True for hosts that mirror the Claude Code envelope
+/// (`hook_event_name` + `tool_name` + `tool_input`).
+fn has_claude_envelope(val: &serde_json::Value) -> bool {
+    val.get("tool_input").is_some() || val.get("tool_name").is_some()
+}
+
+/// Classifies command/file tools and extracts the normalized payload for the
+/// tool the host is about to invoke.
+fn normalize_semantics(
+    platform: Platform,
+    tool_name: &str,
+    args: Option<&serde_json::Value>,
+) -> (Option<String>, Option<FileContext>) {
+    let lower = tool_name.to_ascii_lowercase();
+    let args = match args {
+        Some(a) if a.is_object() => a,
+        _ => return (None, None),
+    };
+
+    // 1. Command tools: a single shell command string.
+    let command_keys = match platform {
+        Platform::Antigravity => &["CommandLine", "command", "cmd"][..],
+        _ => &["command", "CommandLine", "cmd"][..],
+    };
+    let command_tools = [
+        "bash",
+        "run_command",
+        "shell",
+        "powershell",
+        "command",
+        "terminal",
+    ];
+    if command_tools.contains(&lower.as_str()) {
+        return (get_str(args, command_keys).map(str::to_string), None);
+    }
+
+    // 2. File tools: normalize {path, action} from the tool name.
+    let path_keys: &[&str] = match platform {
+        Platform::Antigravity => &["file_path", "FilePath", "TargetFile", "path", "file"],
+        _ => &["file_path", "filePath", "path", "TargetFile", "file"],
+    };
+    let action = match lower.as_str() {
+        // Read
+        "read" | "view_file" | "read_file" => FileAction::Read,
+        // Write / create
+        "write" | "write_to_file" | "create_file" | "overwrite_file" => FileAction::Write,
+        // Edit (in place)
+        "edit"
+        | "multi_edit"
+        | "notebookedit"
+        | "apply_patch"
+        | "replace_file_content"
+        | "multi_replace_file_content"
+        | "edit_file"
+        | "modify_file" => FileAction::Edit,
+        // Delete
+        "delete" | "delete_file" | "remove_file" | "rm" => FileAction::Delete,
+        // List directory
+        "list_dir" | "list" | "read_dir" => FileAction::List,
+        _ => return (None, None), // not a file tool we model
+    };
+    let path = get_str(args, path_keys).map(str::to_string);
+    (None, Some(FileContext { path, action }))
 }
 
 impl HookContext {
@@ -43,181 +197,141 @@ impl HookContext {
             Err(_) => {
                 return Self {
                     platform: Platform::Generic,
+                    permission_mode: None,
+                    is_yolo: false,
+                    conversation: None,
+                    cwd: current_dir_string(),
+                    model: None,
                     tool_name: String::new(),
-                    cmd: String::new(),
-                    target_file: String::new(),
+                    cmd: None,
+                    file: None,
+                    tool_args: serde_json::Value::Null,
                     raw_input: raw_json.to_string(),
                     raw_value: serde_json::Value::Null,
-                    tool_args: serde_json::Value::Null,
-                    is_yolo: false,
-                    cwd: std::env::current_dir()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    conversation_id: None,
                 };
             }
         };
 
-        // 1. Antigravity: contains "toolCall" object or "conversationId"
-        if val.get("toolCall").is_some() || val.get("conversationId").is_some() {
-            let tool_name = val
-                .get("toolName")
-                .or_else(|| val.get("tool_name"))
-                .and_then(|v| v.as_str())
+        // ---- 1. Google Antigravity: `toolCall` envelope ----
+        if val.get("toolCall").is_some() {
+            let tool_call = val.get("toolCall").cloned().unwrap_or_default();
+            let tool_name = get_str(&tool_call, &["name", "toolName"])
                 .unwrap_or("")
                 .to_string();
-            let args = val
-                .get("toolCall")
-                .and_then(|t| t.get("args").or_else(|| t.get("parameters")))
-                .or_else(|| val.get("args"))
-                .or_else(|| val.get("parameters"));
-            let cmd = args
-                .and_then(|a| {
-                    a.get("CommandLine")
-                        .or_else(|| a.get("command"))
-                        .or_else(|| a.get("cmd"))
-                })
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let target_file = args
-                .and_then(|a| {
-                    a.get("TargetFile")
-                        .or_else(|| a.get("file_path"))
-                        .or_else(|| a.get("targetFile"))
-                        .or_else(|| a.get("path"))
-                })
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let conversation_id = val
-                .get("conversationId")
-                .or_else(|| val.get("conversation_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let is_yolo = std::env::var("AGY_DANGEROUSLY_SKIP_PERMISSIONS")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-
-            let cwd = args
-                .and_then(|a| a.get("Cwd").or_else(|| a.get("cwd")))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                });
-
+            let args = tool_call
+                .get("args")
+                .or_else(|| tool_call.get("parameters"));
+            let (cmd, file) = normalize_semantics(Platform::Antigravity, &tool_name, args);
             let tool_args = args.cloned().unwrap_or(serde_json::Value::Null);
+
+            let conversation = ConversationInfo {
+                id: get_str(&val, &["conversationId", "conversation_id"]).map(str::to_string),
+                transcript_path: get_str(&val, &["transcriptPath", "transcript_path"])
+                    .map(str::to_string),
+            };
+            let conversation =
+                if conversation.id.is_none() && conversation.transcript_path.is_none() {
+                    None
+                } else {
+                    Some(conversation)
+                };
 
             return Self {
                 platform: Platform::Antigravity,
+                permission_mode: None,
+                is_yolo: env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS"),
+                conversation,
+                cwd: args
+                    .and_then(|a| get_str(a, &["Cwd", "cwd"]))
+                    .map(str::to_string)
+                    .unwrap_or_else(current_dir_string),
+                model: get_str(&val, &["modelName"]).map(str::to_string),
                 tool_name,
                 cmd,
-                target_file,
+                file,
+                tool_args,
                 raw_input: raw_json.to_string(),
                 raw_value: val,
-                tool_args,
-                is_yolo,
-                cwd,
-                conversation_id,
             };
         }
 
-        // 2. Codex: has "turn_id"
-        if val.get("turn_id").is_some() {
-            let tool_name = val
-                .get("tool_name")
-                .and_then(|v| v.as_str())
+        // ---- 2. Claude-Code-shaped hosts: Codex / Claude Code / CodeBuddy ----
+        if has_claude_envelope(&val) {
+            let tool_name = get_str(&val, &["tool_name", "toolName"])
                 .unwrap_or("")
                 .to_string();
             let tool_input = val.get("tool_input");
-            let cmd = tool_input
-                .and_then(|i| i.get("command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let target_file = tool_input
-                .and_then(|i| i.get("file_path").or_else(|| i.get("TargetFile")))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let is_yolo = val
-                .get("permission_mode")
-                .and_then(|v| v.as_str())
-                .map(|s| s.contains("bypass"))
-                .unwrap_or(false);
-
+            let (cmd, file) = normalize_semantics(
+                Platform::ClaudeCode, // shape is identical for these hosts
+                &tool_name,
+                tool_input,
+            );
             let tool_args = tool_input.cloned().unwrap_or(serde_json::Value::Null);
 
+            let permission_mode = get_str(&val, &["permission_mode"]).map(str::to_string);
+            let is_yolo = permission_mode
+                .as_deref()
+                .map(permission_mode_is_yolo)
+                .unwrap_or(false);
+
+            let conversation = ConversationInfo {
+                id: get_str(&val, &["session_id"]).map(str::to_string),
+                transcript_path: get_str(&val, &["transcript_path"]).map(str::to_string),
+            };
+            let conversation =
+                if conversation.id.is_none() && conversation.transcript_path.is_none() {
+                    None
+                } else {
+                    Some(conversation)
+                };
+
+            let is_codebuddy = std::env::var("CODEBUDDY").is_ok()
+                || std::env::var("CODEBUDDY_CLI").is_ok()
+                || raw_json.to_lowercase().contains("codebuddy");
+
+            let platform = if val.get("turn_id").is_some() {
+                // `turn_id` is documented as Codex-only.
+                Platform::Codex
+            } else if is_codebuddy {
+                Platform::CodeBuddy
+            } else {
+                Platform::ClaudeCode
+            };
+
             return Self {
-                platform: Platform::Codex,
+                platform,
+                permission_mode,
+                is_yolo,
+                conversation,
+                cwd: get_str(&val, &["cwd"])
+                    .map(str::to_string)
+                    .unwrap_or_else(current_dir_string),
+                model: get_str(&val, &["model"]).map(str::to_string),
                 tool_name,
                 cmd,
-                target_file,
+                file,
+                tool_args,
                 raw_input: raw_json.to_string(),
                 raw_value: val,
-                tool_args,
-                is_yolo,
-                cwd: std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                conversation_id: None,
             };
         }
 
-        // 3. Claude Code / CodeBuddy: contains tool_input
-        let tool_name = val
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let tool_input = val.get("tool_input");
-        let cmd = tool_input
-            .and_then(|i| i.get("command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let target_file = tool_input
-            .and_then(|i| i.get("file_path").or_else(|| i.get("TargetFile")))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let is_yolo = val
-            .get("permission_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| s.contains("bypass"))
-            .unwrap_or(false);
-
-        let is_codebuddy = std::env::var("CODEBUDDY").is_ok()
-            || std::env::var("CODEBUDDY_CLI").is_ok()
-            || raw_json.to_lowercase().contains("codebuddy");
-
-        let platform = if is_codebuddy {
-            Platform::CodeBuddy
-        } else {
-            Platform::ClaudeCode
-        };
-
-        let tool_args = tool_input.cloned().unwrap_or(serde_json::Value::Null);
-
+        // ---- 3. Unknown shape: keep raw, expose nothing normalized ----
         Self {
-            platform,
-            tool_name,
-            cmd,
-            target_file,
+            platform: Platform::Generic,
+            permission_mode: None,
+            is_yolo: false,
+            conversation: None,
+            cwd: get_str(&val, &["cwd"])
+                .map(str::to_string)
+                .unwrap_or_else(current_dir_string),
+            model: None,
+            tool_name: String::new(),
+            cmd: None,
+            file: None,
+            tool_args: serde_json::Value::Null,
             raw_input: raw_json.to_string(),
             raw_value: val,
-            tool_args,
-            is_yolo,
-            cwd: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            conversation_id: None,
         }
     }
 }

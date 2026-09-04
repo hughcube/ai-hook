@@ -16,6 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 64-bit
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact_name: ai-hook.exe
@@ -32,6 +33,16 @@ jobs:
             os: macos-latest
             artifact_name: ai-hook
             release_asset: ai-hook-darwin-aarch64
+          # 32-bit (i686). macOS has had no 32-bit support since 10.15,
+          # so 32-bit is provided for Windows and Linux only.
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            artifact_name: ai-hook.exe
+            release_asset: ai-hook-windows-x86.exe
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: ai-hook
+            release_asset: ai-hook-linux-x86
 
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +51,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # 32-bit Linux linking needs the multilib toolchain on the runner.
+      - name: Install 32-bit link dependencies (Linux i686)
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libc6-dev-i386
 
       - name: Build Release Binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -61,11 +79,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VER="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::Release tag '$TAG' does not match Cargo.toml version '$VER'"
+            exit 1
+          fi
+
       - name: Download all built artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

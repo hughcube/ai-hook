@@ -118,10 +118,7 @@ impl SysContext {
 
 /// Binds purely nanosecond/microsecond native primitives to the JS runtime.
 /// Deliberately avoids slow subprocess spawns.
-pub fn create_sys_object<'js>(
-    js_ctx: &Ctx<'js>,
-    sys_ctx: Rc<SysContext>,
-) -> Result<Object<'js>> {
+pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Result<Object<'js>> {
     let sys = Object::new(js_ctx.clone())?;
 
     // 1. sys.env: Pure memory environment lookup (< 1 µs)
@@ -158,20 +155,23 @@ pub fn create_sys_object<'js>(
     fs_obj.set("readText", read_fn)?;
 
     let sys_for_list = sys_ctx.clone();
-    let list_fn = Function::new(js_ctx.clone(), move |dir_path: Option<String>| -> Vec<String> {
-        let target = match dir_path {
-            Some(p) => sys_for_list.resolve_path(&p),
-            None => sys_for_list.cwd.clone(),
-        };
-        if let Ok(entries) = std::fs::read_dir(target) {
-            entries
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        } else {
-            Vec::new()
-        }
-    })?;
+    let list_fn = Function::new(
+        js_ctx.clone(),
+        move |dir_path: Option<String>| -> Vec<String> {
+            let target = match dir_path {
+                Some(p) => sys_for_list.resolve_path(&p),
+                None => sys_for_list.cwd.clone(),
+            };
+            if let Ok(entries) = std::fs::read_dir(target) {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        },
+    )?;
     fs_obj.set("list", list_fn)?;
     sys.set("fs", fs_obj)?;
 

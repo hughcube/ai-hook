@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/hughcube/ai-hook)](https://github.com/hughcube/ai-hook/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Ultra-Fast (1~2ms), Zero Variable Pollution, Single-Process Closed-Loop, Autonomous Rule-Driven** Next-Gen Security Base for AI Agents.  
+> **Ultra-Fast (2~3ms) end-to-end, Zero Variable Pollution, Single-Process Closed-Loop, Autonomous Rule-Driven** Next-Gen Security Base for AI Agents.  
 > Purpose-built for **Google Antigravity**, **Claude Code**, **CodeBuddy**, and **OpenAI Codex**.
 
 English Documentation | [简体中文文档](README_zh.md)
@@ -39,13 +39,13 @@ In multi-agent collaborative development ecosystems, preventing destructive oper
 │     < 0.01ms without loading JS VM                          │
 │  2. Native Serde JSON Ingress Parser:                       │
 │     Recognizes AGY (.toolCall), CC (.tool_input), Codex     │
-│  3. Dynamic Rule Discovery (~/.agents/plugins/*/hooks/*.js):│
+│  3. Explicit Rule Loading (CLI args / AI_HOOK_RULES / ./.ai-hook):│
 │     ┌───────────────────────────────────────────────────┐   │
 │     │ Sandboxed Rule Execution (0 Variable Pollution):  │   │
-│     │ - rd/protect-prod-db-write.js (Production write)  │   │
-│     │ - xr/protect-prod-db-write.js (Whitelisted access)│   │
-│     │ - dev/protect-db-migrate.js   (Migration guard)   │   │
-│     │ - sys/protect-rm-root.js      (Root delete guard) │   │
+│     │ - ai-hook ./rules/protect-prod.js (explicit args)  │   │
+│     │ - AI_HOOK_RULES="a.js;b.js" (env var)│   │
+│     │ - ./.ai-hook/rules.js or ./.ai-hook/rules/ (local)   │   │
+│     │ - every rule runs in its own sandbox, zero merging │   │
 │     └───────────────────────────────────────────────────┘   │
 │  4. Autonomous Prerequisite Data Access (Native sys SDK):   │
 │     - sys.git.branch(): Pure memory .git/HEAD read (0.02ms) │
@@ -105,6 +105,8 @@ Download standalone precompiled executables directly from [GitHub Releases](http
 # Windows (PowerShell): Download directly into official native app directory (Zero PATH setup needed)
 Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\ai-hook.exe"
 
+> ⚠️ The `WindowsApps` directory usually requires **Developer Mode** or an elevated shell to write into. If access is denied, use `cargo install --path . && ai-hook install` instead (it auto-detects a writable PATH directory).
+
 # Linux: Download directly to system bin path
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
 chmod +x /usr/local/bin/ai-hook
@@ -116,6 +118,10 @@ chmod +x /usr/local/bin/ai-hook
 # macOS (Intel)
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-darwin-x86_64
 chmod +x /usr/local/bin/ai-hook
+
+# 32-bit (i686; macOS has no 32-bit support since 10.15, so Windows/Linux only)
+curl -Lo ai-hook.exe https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86.exe
+curl -Lo ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86 && chmod +x ai-hook
 ```
 
 Or compile and install from source:
@@ -142,12 +148,18 @@ ai:doctor() {
     if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
       powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe' -OutFile \"\$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\ai-hook.exe\""
     else
-      local arch="$(uname -m)"
       local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+      local mach="$(uname -m)"
+      case "$os:$mach" in
+        darwin:arm64|darwin:aarch64) local asset="ai-hook-darwin-aarch64" ;;
+        darwin:x86_64)               local asset="ai-hook-darwin-x86_64" ;;
+        linux:x86_64)                local asset="ai-hook-linux-x86_64" ;;
+        *) echo "Unsupported platform: $os-$mach. Download manually or build from source."; return 1 ;;
+      esac
       local target_bin="/usr/local/bin/ai-hook"
       [[ ! -w "/usr/local/bin" ]] && target_bin="$HOME/.local/bin/ai-hook"
       mkdir -p "$(dirname "$target_bin")"
-      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-${os}-${arch}" -o "$target_bin" && chmod +x "$target_bin"
+      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/${asset}" -o "$target_bin" && chmod +x "$target_bin"
     fi
     echo "✨ ai-hook successfully installed!"
   else
@@ -202,6 +214,7 @@ Configure in your hooks configuration:
 - **Intelligent Auto-Collapsing**: When there is no command to display, **the code box is completely collapsed**, eliminating awkward blank areas!
 - **Dark Mode Code Card**: When a command is present, it is rendered in a sleek `#0F172A` dark container with syntax-friendly styling and auto-scrollbars;
 - **Full Keyboard Navigation**: Press `Enter` to Allow, press `Esc` to Deny;
+- **Selectable Text**: reason and command are selectable and copyable (`Ctrl+A` then `Ctrl+C`) on Windows; macOS/Linux use native system dialogs (same structure: reason/command sections, countdown, Esc to deny) where text selection is limited by the platform dialog
 - **Topmost & Draggable**: Smooth mouse drag & drop anywhere on the card.
 
 | Env Variable / CLI Option | Default | Description |
@@ -229,16 +242,21 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
-| `ctx.agent` / `ctx.agentType` | `string` | **Current AI Agent**: `"antigravity"` (Google AGY), `"claude_code"` (Claude Code), `"codebuddy"` (CodeBuddy), `"codex"` (OpenAI Codex), `"generic"` (other) |
-| `ctx.raw` | `object` | **Full raw payload** deserialized into a JS object (access any agent-specific nested properties) |
-| `ctx.rawInput` | `string` | Raw unprocessed JSON payload string |
-| `ctx.args` | `object` | **Tool arguments object** (e.g. `ctx.args.CommandLine`, `ctx.args.TargetFile`, `ctx.args.CodeContent`) |
-| `ctx.tool` / `ctx.toolName` | `string` | Tool name being executed (e.g. `"run_command"`, `"write_to_file"`) |
-| `ctx.cmd` | `string` | Command line string (for command execution tools; empty for others) |
-| `ctx.file` / `ctx.targetFile` | `string` | Target file path (for file operations) |
-| `ctx.cwd` | `string` | Current workspace absolute directory |
-| `ctx.isYolo` | `boolean` | Whether skip-permissions/YOLO mode is active |
-| `ctx.conversationId` | `string?` | Session conversation ID (if provided by agent) |
+| Property | Type | Semantics (full contract: `ai-hook tutorial`) |
+| :--- | :--- | :--- |
+| `ctx.agent` | `string` | Detected host: `"antigravity"` / `"claude_code"` / `"codebuddy"` / `"codex"` / `"generic"` |
+| `ctx.mode` | `string?` | Host permission mode: `default`/`plan`/`acceptEdits`/`dontAsk`/`bypassPermissions` |
+| `ctx.isYolo` | `boolean` | No-confirm (mode bypassPermissions/dontAsk, or AGY skip flag) |
+| `ctx.session` | `{id, transcriptPath}?` | Session id + full transcript path (read with `sys.fs.readText`) |
+| `ctx.cwd` | `string` | Session/command working directory |
+| `ctx.model` | `string?` | Host model id (e.g. Antigravity `modelName`) |
+| `ctx.tool` | `string` | Host tool name verbatim (`"Bash"`/`"run_command"`/`"Write"`…) |
+| `ctx.cmd` | `string?` | Command tools only; `null` otherwise |
+| `ctx.file` | `{path, action}?` | File tools only; `action`: `read`/`write`/`edit`/`delete`/`list` |
+| `ctx.args` | `object` | Host tool arguments verbatim (`{command}`, `{file_path, content}`, …) |
+| `ctx.raw` | `object` | Full original host payload (always available) |
+| `ctx.rawInput` | `string` | Raw payload text |
+> Design rule: one semantic per property, no aliases; `cmd`/`file` are `null` when not applicable — guard rules with truthiness checks.
 
 ### 2. `sys` Native Microsecond Primitives
 
@@ -254,7 +272,8 @@ Subprocess spawning (`git.exe`) is eliminated. All prerequisite data is resolved
 | `sys.fs.list([dir])` | `string[]` | List files and directories in path |
 | `sys.env("KEY")` | `string?` | **< 1 µs** get environment variable (or `sys.env.get("KEY")`) |
 | `sys.cwd()` | `string` | Current working directory |
-| `console.log(...)` | `void` | Debug logging redirected to stderr (does not corrupt decision JSON) |
+| `console.log(...)` | `void` | Debug logging to stderr (never corrupts decision JSON) |
+| `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; disable `AI_HOOK_LOG=0`, override `AI_HOOK_LOG_FILE`) |
 | **Standard JS Clock** | - | `new Date()` for days, hours, freeze windows |
 
 ### 3. Controlling Decisions: Hard Block vs GUI Prompt vs Terminal Ask
@@ -299,57 +318,20 @@ return {
 return null; // or return { action: "allow" };
 ```
 
+> **Rule failure handling (fail-closed)**: if any rule fails — syntax error, runtime exception, infinite-loop timeout, or a returned Promise (async) — ai-hook **denies** the command by default and returns the rule error as the reason; a broken gate never silently opens. Every rule has a 5s execution watchdog that interrupts runaway loops. To restore the legacy allow-on-error behavior, pass `--allow-on-error` or set `AI_HOOK_ALLOW_ON_ERROR=1` (not recommended for production gates).
+> **Output language**: dialogs, messages and logs follow the system language (Windows user locale / `LANG`); force it with `AI_HOOK_LANG=zh|en`. `ai-hook tutorial` also follows the system language by default (`--lang en|zh` overrides).
+
+
 ---
 
 ## 💡 Comprehensive Feature Demo
 
-See [`examples/demo_all_features.js`](examples/demo_all_features.js) for an end-to-end example:
-
-```javascript
-/**
- * demo_all_features.js - Comprehensive ai-hook rule showcase
- */
-export default function(ctx, sys) {
-  // 1. Inspect agent & tool
-  console.log(`[Demo] Agent: ${ctx.agent}, Tool: ${ctx.tool}`);
-
-  // 2. Fatal command: Hard block without popup
-  if (ctx.cmd && /git\s+push\b.*(-f|--force)\b/.test(ctx.cmd)) {
-    const branch = sys.git.branch();
-    if (branch === "master" || branch === "main") {
-      return {
-        action: "deny",
-        reason: `【Hard Block】Force-push to '${branch}' forbidden!`
-      };
-    }
-  }
-
-  // 3. Sensitive operation: Pop up modern Fluent card
-  if (ctx.cmd && /\b(migrate|wipe|reset)\b/i.test(ctx.cmd)) {
-    return {
-      action: "confirm",
-      title: "Database Modification Authorization",
-      reason: "Destructive migration detected. Existing data may be lost!",
-      gui: true,
-      timeout: 45
-    };
-  }
-
-  // 4. Terminal confirmation (no GUI)
-  if (ctx.cmd && /\b(npm\s+publish)\b/i.test(ctx.cmd)) {
-    return {
-      action: "confirm",
-      reason: "npm publish detected. Confirm release?",
-      gui: false
-    };
-  }
-
-  return null;
-}
-```
+See [`examples/demo_all_features.js`](examples/demo_all_features.js) in the repository (single source of truth, not duplicated here). It demonstrates:
+- Agent type, raw payload and tool-argument access (`ctx.agent` / `ctx.raw` / `ctx.args`);
+- Autonomous `sys` data access (`sys.git.branch()` / `sys.fs.readText()` / `sys.env`);
+- The three decision modes: hard `deny`, desktop popup `confirm(gui: true)`, terminal ask `confirm(gui: false)`.
 
 ---
-
 ## 🛠️ CLI Reference
 
 ```bash

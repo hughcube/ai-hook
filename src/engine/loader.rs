@@ -25,9 +25,12 @@ impl RuleLoader {
             return files;
         }
 
-        // 2. Check environment variable override
+        // 2. Check environment variable override.
+        //    Path-list separator differs per platform: ';' on Windows (':' is
+        //    part of drive letters such as "C:\..."), ';' or ':' elsewhere.
         if let Ok(env_rules) = std::env::var("AI_HOOK_RULES") {
-            for part in env_rules.split(|c| c == ';' || c == ':') {
+            let separators = if cfg!(windows) { ";" } else { ";:" };
+            for part in env_rules.split(|c| separators.contains(c)) {
                 let trimmed = part.trim();
                 if !trimmed.is_empty() {
                     Self::collect_from_path(Path::new(trimmed), &mut files, &mut seen);
@@ -54,11 +57,7 @@ impl RuleLoader {
         files
     }
 
-    fn collect_from_path(
-        path: &Path,
-        files: &mut Vec<RuleSource>,
-        seen: &mut HashSet<PathBuf>,
-    ) {
+    fn collect_from_path(path: &Path, files: &mut Vec<RuleSource>, seen: &mut HashSet<PathBuf>) {
         if !path.exists() {
             return;
         }
@@ -68,22 +67,29 @@ impl RuleLoader {
                 Self::add_file(path, files, seen);
             }
         } else if path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("js") {
-                        Self::add_file(&p, files, seen);
-                    }
+            // Directory rules are evaluated in deterministic file-name order:
+            // `evaluate_all` short-circuits on the first Confirm/Deny, so the
+            // load order must not depend on filesystem enumeration order.
+            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_file())
+                        .collect()
+                })
+                .unwrap_or_default();
+            paths.sort();
+
+            for p in paths {
+                if p.extension().and_then(|s| s.to_str()) == Some("js") {
+                    Self::add_file(&p, files, seen);
                 }
             }
         }
     }
 
-    fn add_file(
-        path: &Path,
-        files: &mut Vec<RuleSource>,
-        seen: &mut HashSet<PathBuf>,
-    ) {
+    fn add_file(path: &Path, files: &mut Vec<RuleSource>, seen: &mut HashSet<PathBuf>) {
         let canonical = match path.canonicalize() {
             Ok(c) => c,
             Err(_) => path.to_path_buf(),
@@ -99,7 +105,8 @@ impl RuleLoader {
             .unwrap_or("rule")
             .to_string();
 
-        if file_stem.starts_with('_') || file_stem.ends_with(".tmp") || file_stem.ends_with(".test") {
+        if file_stem.starts_with('_') || file_stem.ends_with(".tmp") || file_stem.ends_with(".test")
+        {
             return;
         }
 

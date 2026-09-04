@@ -1,67 +1,294 @@
-use ai_hook::engine::{RuleRunner, RuleSource};
+use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner, RuleSource};
 use ai_hook::fast_path::check_fast_path;
-use ai_hook::protocol::{HookContext, HookDecision, Platform};
+use ai_hook::protocol::{FileAction, FileContext, HookContext, HookDecision, Platform};
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Builds a HookContext from a realistic Antigravity payload around `cmd`.
+fn ctx_for(cmd: &str) -> HookContext {
+    HookContext::parse(
+        &serde_json::json!({
+            "toolCall": {
+                "name": "run_command",
+                "args": { "CommandLine": cmd }
+            },
+            "conversationId": "conv-test"
+        })
+        .to_string(),
+    )
+}
+
+/// Builds a RuleSource with `id` and `code`.
+fn rule(id: &str, code: &str) -> RuleSource {
+    RuleSource {
+        id: id.to_string(),
+        path: PathBuf::from(format!("{id}.js")),
+        code: code.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast path
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_fast_path_filtering() {
-    let safe_payload = serde_json::json!({
-        "toolName": "run_command",
-        "toolCall": { "args": { "CommandLine": "git status" } }
-    }).to_string();
-    let ctx = HookContext::parse(&safe_payload);
-    assert_eq!(check_fast_path(&ctx), Some(HookDecision::Allow));
+    assert_eq!(
+        check_fast_path(&ctx_for("git status")),
+        Some(HookDecision::Allow)
+    );
+    assert_eq!(
+        check_fast_path(&ctx_for("git status > dangerous.txt")),
+        None
+    );
 
-    let dangerous_payload = serde_json::json!({
-        "toolName": "run_command",
-        "toolCall": { "args": { "CommandLine": "git status > dangerous.txt" } }
-    }).to_string();
-    let ctx_danger = HookContext::parse(&dangerous_payload);
-    assert_eq!(check_fast_path(&ctx_danger), None);
+    // Non-command contexts (no cmd) never hit the fast path.
+    let file_ctx = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/tmp/a.txt", "content": "x" }
+        })
+        .to_string(),
+    );
+    assert_eq!(check_fast_path(&file_ctx), None);
 }
 
 #[test]
-fn test_protocol_ingress_parsing() {
-    // 1. Antigravity
+fn test_fast_path_blocks_injection_and_boundary_abuse() {
+    // These MUST NOT be fast-pathed: each would otherwise let a second,
+    // non-read-only command ride on a benign prefix.
+    let malicious = [
+        "git status\ntouch pwned.txt", // newline injection
+        "ls /\nreboot",                // newline injection
+        "git status\nreboot",          // newline, no risky token
+        "echo $(reboot)",              // command substitution
+        "echo ${CMD}",                 // parameter expansion
+        "cat `reboot`",                // backticks
+        "git status && reboot",        // chaining
+        "git status; reboot",          // chaining
+        "git status | sh",             // pipe
+        "git status > out.txt",        // redirect out
+        "head -5 file < /etc/passwd",  // redirect in (never fast-path)
+        "git statusX --help",          // glued suffix must not match prefix
+        "cat/etc/passwd",              // no whitespace boundary after prefix
+        "ls-reboot",                   // not an `ls` invocation at all
+        "rm -rf /tmp/staging",         // dangerous token "rm "
+        "pkill -f agent",              // substring kill/stop
+        "shutdown -r now",             // destructive word
+    ];
+    for cmd in malicious {
+        assert_eq!(
+            check_fast_path(&ctx_for(cmd)),
+            None,
+            "command must NOT be fast-pathed: {cmd:?}"
+        );
+    }
+
+    // Genuinely benign single commands still hit the fast path.
+    let benign = [
+        "git status",
+        "git status --short",
+        "git diff HEAD~1",
+        "git branch --show-current",
+        "ls",
+        "ls -la /tmp",
+        "pwd",
+        "dir",
+        "echo hello world",
+        "which cargo",
+        "where python",
+        "cat package.json",
+        "head -20 README.md",
+        "tail -5 /var/log/syslog",
+    ];
+    for cmd in benign {
+        assert_eq!(
+            check_fast_path(&ctx_for(cmd)),
+            Some(HookDecision::Allow),
+            "command should be fast-pathed: {cmd:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Payload ingress parsing (v2: real host schemas, one semantic per property)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_protocol_ingress_antigravity() {
+    // Realistic Antigravity payload: tool name lives in `toolCall.name`,
+    // conversation/transcript/model at the top level.
     let agy_raw = serde_json::json!({
-        "toolName": "run_command",
         "toolCall": {
-            "args": {
-                "CommandLine": "echo hello",
-                "TargetFile": "target.txt"
-            }
+            "name": "run_command",
+            "args": { "CommandLine": "echo hello", "Cwd": "C:\\work" }
         },
-        "conversationId": "conv-123"
-    }).to_string();
+        "stepIdx": 3,
+        "conversationId": "conv-123",
+        "transcriptPath": "/logs/t.jsonl",
+        "modelName": "gemini-3.6-flash-medium"
+    })
+    .to_string();
     let ctx = HookContext::parse(&agy_raw);
     assert_eq!(ctx.platform, Platform::Antigravity);
-    assert_eq!(ctx.cmd, "echo hello");
-    assert_eq!(ctx.target_file, "target.txt");
-    assert_eq!(ctx.conversation_id.as_deref(), Some("conv-123"));
+    assert_eq!(ctx.tool_name, "run_command");
+    assert_eq!(ctx.cmd.as_deref(), Some("echo hello"));
+    assert_eq!(ctx.cwd, "C:\\work");
+    assert_eq!(ctx.model.as_deref(), Some("gemini-3.6-flash-medium"));
+    assert_eq!(
+        ctx.conversation.as_ref().and_then(|c| c.id.as_deref()),
+        Some("conv-123")
+    );
+    assert_eq!(
+        ctx.conversation
+            .as_ref()
+            .and_then(|c| c.transcript_path.as_deref()),
+        Some("/logs/t.jsonl")
+    );
+    assert!(ctx.file.is_none());
+}
 
-    // 2. Claude Code
+#[test]
+fn test_protocol_ingress_claude_envelope_hosts() {
+    // Claude Code shape.
     let cc_raw = serde_json::json!({
+        "session_id": "sess-cc",
+        "transcript_path": "/sessions/t.jsonl",
+        "cwd": "/workspaces/app",
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {
-            "command": "npm test"
-        }
-    }).to_string();
+        "tool_use_id": "toolu_1",
+        "tool_input": { "command": "npm test", "description": "run tests" }
+    })
+    .to_string();
     let ctx_cc = HookContext::parse(&cc_raw);
     assert_eq!(ctx_cc.platform, Platform::ClaudeCode);
-    assert_eq!(ctx_cc.cmd, "npm test");
+    assert_eq!(ctx_cc.tool_name, "Bash");
+    assert_eq!(ctx_cc.cmd.as_deref(), Some("npm test"));
+    assert_eq!(ctx_cc.cwd, "/workspaces/app");
+    assert_eq!(ctx_cc.permission_mode.as_deref(), Some("default"));
+    assert_eq!(
+        ctx_cc.conversation.as_ref().and_then(|c| c.id.as_deref()),
+        Some("sess-cc")
+    );
+    assert!(!ctx_cc.is_yolo);
 
-    // 3. Codex
+    // Codex adds `turn_id` (documented Codex-only field).
     let codex_raw = serde_json::json!({
         "turn_id": "turn-abc",
+        "session_id": "sess-cx",
+        "cwd": "/workspaces/cx",
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {
-            "command": "cargo check"
-        }
-    }).to_string();
+        "tool_input": { "command": "cargo check" }
+    })
+    .to_string();
     let ctx_codex = HookContext::parse(&codex_raw);
     assert_eq!(ctx_codex.platform, Platform::Codex);
-    assert_eq!(ctx_codex.cmd, "cargo check");
+    assert_eq!(ctx_codex.cmd.as_deref(), Some("cargo check"));
 }
+
+#[test]
+fn test_permission_mode_yolo_detection() {
+    let parse = |mode: &str| {
+        HookContext::parse(
+            &serde_json::json!({
+                "session_id": "s",
+                "permission_mode": mode,
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": { "command": "echo hi" }
+            })
+            .to_string(),
+        )
+    };
+    assert!(!parse("default").is_yolo);
+    assert!(!parse("plan").is_yolo);
+    assert!(!parse("acceptEdits").is_yolo); // edits auto-approve, commands still ask
+    assert!(parse("dontAsk").is_yolo);
+    assert!(parse("bypassPermissions").is_yolo);
+}
+
+#[test]
+fn test_file_action_normalization_across_hosts() {
+    // Claude Code / CodeBuddy / Codex style file tools.
+    let parse_cc = |tool: &str, input: serde_json::Value| {
+        HookContext::parse(
+            &serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": input
+            })
+            .to_string(),
+        )
+    };
+
+    let w = parse_cc(
+        "Write",
+        serde_json::json!({ "file_path": "/tmp/a.txt", "content": "x" }),
+    );
+    assert_eq!(
+        w.file,
+        Some(FileContext {
+            path: Some("/tmp/a.txt".into()),
+            action: FileAction::Write
+        })
+    );
+    assert!(w.cmd.is_none());
+
+    let r = parse_cc("Read", serde_json::json!({ "file_path": "/tmp/a.txt" }));
+    assert_eq!(r.file.as_ref().map(|f| f.action), Some(FileAction::Read));
+
+    let e = parse_cc(
+        "Edit",
+        serde_json::json!({ "file_path": "/tmp/a.txt", "old_string": "a" }),
+    );
+    assert_eq!(e.file.as_ref().map(|f| f.action), Some(FileAction::Edit));
+
+    let d = parse_cc("Delete", serde_json::json!({ "file_path": "/tmp/a.txt" }));
+    assert_eq!(d.file.as_ref().map(|f| f.action), Some(FileAction::Delete));
+
+    // Codex apply_patch is edit-shaped (no single path).
+    let ap = parse_cc(
+        "apply_patch",
+        serde_json::json!({ "patch": "--- a\n+++ b" }),
+    );
+    assert_eq!(ap.file.as_ref().map(|f| f.action), Some(FileAction::Edit));
+    assert_eq!(ap.file.as_ref().and_then(|f| f.path.as_deref()), None);
+
+    // Antigravity tools.
+    let parse_agy = |tool: &str, args: serde_json::Value| {
+        HookContext::parse(
+            &serde_json::json!({
+                "toolCall": { "name": tool, "args": args },
+                "conversationId": "c"
+            })
+            .to_string(),
+        )
+    };
+    let vf = parse_agy("view_file", serde_json::json!({ "file_path": "/p/a.txt" }));
+    assert_eq!(vf.file.as_ref().map(|f| f.action), Some(FileAction::Read));
+    let wtf = parse_agy(
+        "write_to_file",
+        serde_json::json!({ "file_path": "/p/b.txt", "content": "y" }),
+    );
+    assert_eq!(wtf.file.as_ref().map(|f| f.action), Some(FileAction::Write));
+    let ld = parse_agy("list_dir", serde_json::json!({ "path": "/p" }));
+    assert_eq!(ld.file.as_ref().map(|f| f.action), Some(FileAction::List));
+    assert_eq!(ld.file.as_ref().and_then(|f| f.path.as_deref()), Some("/p"));
+
+    // Non-file/non-command tools expose neither.
+    let web = parse_cc("WebSearch", serde_json::json!({ "query": "x" }));
+    assert!(web.cmd.is_none() && web.file.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// JS rule execution (v2 context injection)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_autonomous_js_rule_execution() {
@@ -69,27 +296,19 @@ fn test_autonomous_js_rule_execution() {
 
     let rule_code = r#"
         export default function(ctx, sys) {
-            if (ctx.cmd.includes("drop_database")) {
+            if (ctx.cmd && ctx.cmd.includes("drop_database")) {
                 return { action: "deny", reason: "Cannot drop database" };
             }
-            if (ctx.cmd.includes("restart_service")) {
+            if (ctx.cmd && ctx.cmd.includes("restart_service")) {
                 return { action: "confirm", reason: "Needs restart approval" };
             }
             return null;
         }
     "#;
 
-    let rule = RuleSource {
-        id: "test-rule".to_string(),
-        path: PathBuf::from("test-rule.js"),
-        code: rule_code.to_string(),
-    };
+    let rule = rule("test-rule", rule_code);
 
-    let deny_ctx = HookContext::parse(&serde_json::json!({
-        "toolName": "run_command",
-        "toolCall": { "args": { "CommandLine": "psql -c drop_database" } }
-    }).to_string());
-
+    let deny_ctx = ctx_for("psql -c drop_database");
     let res_deny = runner.execute_rule(&rule, &deny_ctx);
     assert_eq!(
         res_deny.decision,
@@ -98,11 +317,7 @@ fn test_autonomous_js_rule_execution() {
         })
     );
 
-    let confirm_ctx = HookContext::parse(&serde_json::json!({
-        "toolName": "run_command",
-        "toolCall": { "args": { "CommandLine": "systemctl restart_service" } }
-    }).to_string());
-
+    let confirm_ctx = ctx_for("systemctl restart_service");
     let res_confirm = runner.execute_rule(&rule, &confirm_ctx);
     assert_eq!(
         res_confirm.decision,
@@ -115,52 +330,258 @@ fn test_autonomous_js_rule_execution() {
         })
     );
 
-    let pass_ctx = HookContext::parse(&serde_json::json!({
-        "toolName": "run_command",
-        "toolCall": { "args": { "CommandLine": "cargo check" } }
-    }).to_string());
-
+    let pass_ctx = ctx_for("cargo check");
     let res_pass = runner.execute_rule(&rule, &pass_ctx);
     assert_eq!(res_pass.decision, None);
 }
 
 #[test]
-fn test_sys_autonomous_git_branch() {
+fn test_v2_context_shapes_inside_js() {
     let runner = RuleRunner::new().expect("Failed to initialize runner");
 
-    let rule_code = r#"
-        export default function(ctx, sys) {
-            const branch = sys.git.branch();
-            if (branch && ctx.cmd.includes("--force")) {
-                return { action: "deny", reason: `Force push blocked on ${branch}` };
+    // File tools get file{path,action} and cmd === null.
+    let file_rule = rule(
+        "file-shape",
+        r#"export default function(ctx, sys) {
+            if (ctx.cmd !== null) return { action: "deny", reason: "cmd must be null" };
+            if (!ctx.file || ctx.file.action !== "write") return { action: "deny", reason: "file action wrong" };
+            if (ctx.file.path !== "/tmp/a.txt") return { action: "deny", reason: "file path wrong" };
+            if (ctx.tool !== "Write") return { action: "deny", reason: "tool wrong" };
+            if (ctx.agent !== "claude_code") return { action: "deny", reason: "agent wrong" };
+            if (ctx.mode !== "default") return { action: "deny", reason: "mode wrong" };
+            if (!ctx.session || ctx.session.id !== "sess-1") return { action: "deny", reason: "session wrong" };
+            if (ctx.session.transcriptPath !== "/s/t.jsonl") return { action: "deny", reason: "transcript wrong" };
+            if (ctx.model !== null) return { action: "deny", reason: "model must be null for CC" };
+            return { action: "deny", reason: "shape-ok" };
+        }"#,
+    );
+    let file_ctx = HookContext::parse(
+        &serde_json::json!({
+            "session_id": "sess-1",
+            "transcript_path": "/s/t.jsonl",
+            "cwd": "/w",
+            "permission_mode": "default",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/tmp/a.txt", "content": "x" }
+        })
+        .to_string(),
+    );
+    let res = runner.execute_rule(&file_rule, &file_ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "shape-ok".to_string()
+        }),
+        "unexpected: {:?} (error {:?})",
+        res.decision,
+        res.error
+    );
+
+    // Antigravity exposes model + agent identity from the toolCall envelope.
+    let agy_rule = rule(
+        "agy-shape",
+        r#"export default function(ctx, sys) {
+            if (ctx.agent !== "antigravity") return { action: "deny", reason: "agent" };
+            if (ctx.model !== "gemini-x") return { action: "deny", reason: "model" };
+            if (ctx.cmd !== "run deploy") return { action: "deny", reason: "cmd" };
+            if (!ctx.session || ctx.session.id !== "conv-9") return { action: "deny", reason: "session" };
+            if (ctx.session.transcriptPath !== "/t/x.jsonl") return { action: "deny", reason: "transcript" };
+            if (ctx.isYolo !== false) return { action: "deny", reason: "yolo" };
+            return { action: "deny", reason: "agy-ok" };
+        }"#,
+    );
+    let agy_ctx = HookContext::parse(
+        &serde_json::json!({
+            "toolCall": { "name": "run_command", "args": { "CommandLine": "run deploy", "Cwd": "/w" } },
+            "conversationId": "conv-9",
+            "transcriptPath": "/t/x.jsonl",
+            "modelName": "gemini-x"
+        })
+        .to_string(),
+    );
+    let res2 = runner.execute_rule(&agy_rule, &agy_ctx);
+    assert_eq!(
+        res2.decision,
+        Some(HookDecision::Deny {
+            reason: "agy-ok".to_string()
+        }),
+        "unexpected: {:?} (error {:?})",
+        res2.decision,
+        res2.error
+    );
+
+    // No aliases: legacy names must be absent (undefined).
+    let no_alias = rule(
+        "no-alias",
+        r#"export default function(ctx, sys) {
+            if (ctx.agentType !== undefined) return { action: "deny", reason: "agentType alias must not exist" };
+            if (ctx.toolName !== undefined) return { action: "deny", reason: "toolName alias must not exist" };
+            if (ctx.targetFile !== undefined) return { action: "deny", reason: "targetFile alias must not exist" };
+            if (ctx.conversationId !== undefined) return { action: "deny", reason: "conversationId alias must not exist" };
+            if (ctx.platform !== undefined) return { action: "deny", reason: "platform alias must not exist" };
+            return { action: "deny", reason: "no-alias-ok" };
+        }"#,
+    );
+    let res3 = runner.execute_rule(&no_alias, &ctx_for("echo hi"));
+    assert_eq!(
+        res3.decision,
+        Some(HookDecision::Deny {
+            reason: "no-alias-ok".to_string()
+        }),
+        "unexpected: {:?} (error {:?})",
+        res3.decision,
+        res3.error
+    );
+}
+
+#[test]
+fn test_evaluate_all_short_circuits_on_first_hit_in_order() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let deny = rule(
+        "a-deny",
+        "export default function(ctx, sys) { return { action: \"deny\", reason: \"no\" }; }",
+    );
+    let allow = rule(
+        "b-allow",
+        "export default function(ctx, sys) { return { action: \"allow\" }; }",
+    );
+    let ctx = ctx_for("echo hi");
+
+    // Deny first: short-circuits, the later allow rule never runs.
+    let (dec, results) = runner.evaluate_all(
+        &[deny.clone(), allow.clone()],
+        &ctx,
+        ErrorPolicy::FailClosed,
+    );
+    assert_eq!(
+        dec,
+        HookDecision::Deny {
+            reason: "no".to_string()
+        }
+    );
+    assert_eq!(results.len(), 1);
+
+    // Allow first: continues, then deny still wins.
+    let (dec2, results2) =
+        runner.evaluate_all(&[allow.clone(), deny], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(
+        dec2,
+        HookDecision::Deny {
+            reason: "no".to_string()
+        }
+    );
+    assert_eq!(results2.len(), 2);
+}
+
+#[test]
+fn test_async_rule_is_reported_not_silently_allowed() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let async_rule = rule(
+        "async-rule",
+        r#"export default async function(ctx, sys) {
+            if (ctx.cmd && ctx.cmd.includes("danger")) {
+                return { action: "deny", reason: "async deny" };
             }
             return null;
-        }
-    "#;
+        }"#,
+    );
+    let ctx = ctx_for("danger operation");
 
-    let rule = RuleSource {
-        id: "git-test".to_string(),
-        path: PathBuf::from("git-test.js"),
-        code: rule_code.to_string(),
-    };
+    // The rule itself never yields a decision...
+    let res = runner.execute_rule(&async_rule, &ctx);
+    assert!(res.decision.is_none());
+    let err = res.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("Promise") || err.contains("async"),
+        "expected an async/Promise error, got: {err:?}"
+    );
 
-    let ctx = HookContext::parse(&serde_json::json!({
-        "toolName": "run_command",
-        "toolCall": {
-            "args": {
-                "CommandLine": "git push origin master --force",
-                "Cwd": std::env::current_dir().unwrap().to_string_lossy().to_string()
-            }
-        }
-    }).to_string());
+    // ...and the default fail-closed policy turns that into Deny.
+    let (dec, _) = runner.evaluate_all(&[async_rule.clone()], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::Deny { .. }));
 
-    let res = runner.execute_rule(&rule, &ctx);
-    assert!(res.decision.is_some());
-    if let Some(HookDecision::Deny { reason }) = res.decision {
-        assert!(reason.contains("Force push blocked on master"));
-    } else {
-        panic!("Expected Deny decision");
+    // Only an explicit opt-out restores the old allow-on-error behaviour.
+    let (dec2, _) = runner.evaluate_all(&[async_rule], &ctx, ErrorPolicy::AllowOnError);
+    assert_eq!(dec2, HookDecision::Allow);
+}
+
+#[test]
+fn test_broken_rule_fails_closed_and_can_opt_out() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let throwing = rule(
+        "boom",
+        "export default function(ctx, sys) { throw new Error(\"boom\"); }",
+    );
+    let ctx = ctx_for("echo hi");
+
+    let (dec, _) = runner.evaluate_all(&[throwing.clone()], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::Deny { .. }), "{dec:?}");
+
+    let (dec2, _) = runner.evaluate_all(&[throwing.clone()], &ctx, ErrorPolicy::AllowOnError);
+    assert_eq!(dec2, HookDecision::Allow);
+
+    // Syntax errors are just as fatal.
+    let broken = rule(
+        "broken",
+        "export default function(ctx, sys) { this is not js !!!",
+    );
+    let (dec3, _) = runner.evaluate_all(&[broken], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec3, HookDecision::Deny { .. }), "{dec3:?}");
+}
+
+#[test]
+fn test_infinite_loop_rule_is_interrupted_by_timeout() {
+    let runner =
+        RuleRunner::with_timeout(Duration::from_millis(300)).expect("Failed to initialize runner");
+    let loop_rule = rule("loop", "export default function() { while (true) {} }");
+    let ctx = ctx_for("echo hi");
+
+    let start = std::time::Instant::now();
+    let res = runner.execute_rule(&loop_rule, &ctx);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "rule execution was not bounded by the timeout"
+    );
+    assert!(res.decision.is_none());
+    let err = res.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("超时") || err.contains("timed out") || err.contains("interrupted"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_export_default_inside_comments_or_strings_is_not_misparsed() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+
+    // Block comment contains a line starting with `export default`; the string
+    // literal contains another. Neither may be rewritten into `return`.
+    let tricky = r#"
+/**
+ * 规则示例
+ * export default is documented here and must stay a comment
+ */
+const docs = "export default";
+export default function(ctx, sys) {
+    if (ctx.cmd && ctx.cmd.includes("wipe")) {
+        return { action: "deny", reason: "comment-guard ok" };
     }
+    return null;
+}
+"#;
+    let res = runner.execute_rule(&rule("tricky", tricky), &ctx_for("db wipe"));
+    assert!(
+        res.error.is_none(),
+        "comment/string content must not break parsing: {:?}",
+        res.error
+    );
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "comment-guard ok".to_string()
+        })
+    );
 }
 
 #[test]
@@ -168,19 +589,22 @@ fn test_ctx_agent_and_raw_input() {
     let runner = RuleRunner::new().expect("Failed to initialize runner");
     let rule_code = r#"
         export default function(ctx, sys) {
-            // Verify agent type detection
-            if (ctx.agent !== "antigravity" && ctx.agentType !== "antigravity") {
+            // Agent identity from the normalized envelope
+            if (ctx.agent !== "antigravity") {
                 return { action: "deny", reason: "Agent detection failed" };
             }
-            // Verify raw input access
+            // Session identity
+            if (!ctx.session || ctx.session.id !== "conv-raw") {
+                return { action: "deny", reason: "Session failed" };
+            }
+            // Raw payload access
             if (!ctx.raw || ctx.raw.customFlag !== "secret_value") {
                 return { action: "deny", reason: "Raw payload access failed" };
             }
-            // Verify args access
+            // Args access (host-verbatim)
             if (!ctx.args || ctx.args.CommandLine !== "echo hello") {
                 return { action: "deny", reason: "Args access failed" };
             }
-            // Verify GUI control return
             return {
                 action: "confirm",
                 reason: "Confirmed with GUI control",
@@ -191,21 +615,19 @@ fn test_ctx_agent_and_raw_input() {
         }
     "#;
 
-    let rule = RuleSource {
-        id: "raw-agent-test".to_string(),
-        path: PathBuf::from("raw-agent-test.js"),
-        code: rule_code.to_string(),
-    };
+    let rule = rule("raw-agent-test", rule_code);
 
-    let ctx = HookContext::parse(&serde_json::json!({
-        "toolName": "run_command",
-        "customFlag": "secret_value",
-        "toolCall": {
-            "args": {
-                "CommandLine": "echo hello"
-            }
-        }
-    }).to_string());
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "toolCall": {
+                "name": "run_command",
+                "args": { "CommandLine": "echo hello" }
+            },
+            "conversationId": "conv-raw",
+            "customFlag": "secret_value"
+        })
+        .to_string(),
+    );
 
     let res = runner.execute_rule(&rule, &ctx);
     assert_eq!(
@@ -235,15 +657,8 @@ fn test_force_gui_rule() {
             };
         }
     "#;
-    let rule1 = RuleSource {
-        id: "force-gui-1".to_string(),
-        path: PathBuf::from("force-gui-1.js"),
-        code: rule_code1.to_string(),
-    };
-    let ctx = HookContext::parse(&serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": { "command": "rm -rf build" }
-    }).to_string());
+    let rule1 = rule("force-gui-1", rule_code1);
+    let ctx = ctx_for("rm -rf build");
     let res1 = runner.execute_rule(&rule1, &ctx);
     assert_eq!(
         res1.decision,
@@ -265,11 +680,7 @@ fn test_force_gui_rule() {
             };
         }
     "#;
-    let rule2 = RuleSource {
-        id: "force-gui-2".to_string(),
-        path: PathBuf::from("force-gui-2.js"),
-        code: rule_code2.to_string(),
-    };
+    let rule2 = rule("force-gui-2", rule_code2);
     let res2 = runner.execute_rule(&rule2, &ctx);
     assert_eq!(
         res2.decision,
@@ -284,8 +695,116 @@ fn test_force_gui_rule() {
 }
 
 #[test]
+fn test_rule_logging_sys_log_api() {
+    // console.log / sys.log must not break evaluation. Disable the file
+    // channel for tests (env is process-global; no other test logs).
+    unsafe {
+        std::env::set_var("AI_HOOK_LOG", "0");
+    }
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let rule_code = r#"
+        export default function(ctx, sys) {
+            console.log("console debug line", ctx.agent);
+            sys.log("warn", "sys warn line");
+            sys.log("only-msg-form");
+            return null;
+        }
+    "#;
+    let ctx = ctx_for("echo hi");
+    let res = runner.execute_rule(&rule("logger-test", rule_code), &ctx);
+    assert!(
+        res.error.is_none(),
+        "logging must not fail rules: {:?}",
+        res.error
+    );
+    assert_eq!(res.decision, None);
+}
+
+// ---------------------------------------------------------------------------
+// Git / filesystem helpers inside rules
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sys_autonomous_git_branch() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+
+    // The expected branch is whatever this checkout is on (if it is a git
+    // repo); do not hardcode "master" so the test survives branch renames.
+    let rule_code = r#"
+        export default function(ctx, sys) {
+            const branch = sys.git.branch() || "unknown";
+            if (ctx.cmd && ctx.cmd.includes("--force")) {
+                return { action: "deny", reason: `Force push blocked on ${branch}` };
+            }
+            return null;
+        }
+    "#;
+
+    let rule = rule("git-test", rule_code);
+    let ctx = ctx_for("git push origin master --force");
+    let res = runner.execute_rule(&rule, &ctx);
+    let Some(HookDecision::Deny { reason }) = res.decision else {
+        panic!(
+            "Expected Deny decision, got {:?} (error: {:?})",
+            res.decision, res.error
+        );
+    };
+    assert!(
+        reason.starts_with("Force push blocked on "),
+        "unexpected reason: {reason}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule loader
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_loader_directory_load_is_sorted_and_deterministic() {
+    let tmp_root = std::env::temp_dir().join(format!("ai-hook-loader-{}", std::process::id()));
+    let dir = tmp_root.join("rules");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["zebra.js", "alpha.js", "mango.js"] {
+        std::fs::write(
+            dir.join(name),
+            "export default function(ctx, sys) { return null; }",
+        )
+        .unwrap();
+    }
+
+    // Load twice; the order must be file-name sorted regardless of the order
+    // the filesystem enumerates them.
+    let first = RuleLoader::load_rules(&[dir.clone()]);
+    let second = RuleLoader::load_rules(&[dir.clone()]);
+    let ids = |rules: &[RuleSource]| rules.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&first), ["alpha", "mango", "zebra"]);
+    assert_eq!(ids(&first), ids(&second));
+
+    std::fs::remove_dir_all(&tmp_root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Tutorial content
+// ---------------------------------------------------------------------------
+
+#[test]
 fn test_tutorial_output() {
-    // Verify tutorial prints without panic
-    ai_hook::tutorial::print_tutorial("zh");
-    ai_hook::tutorial::print_tutorial("en");
+    // Content must exist and the version placeholder must have been filled.
+    let zh = ai_hook::tutorial::tutorial_text("zh");
+    let en = ai_hook::tutorial::tutorial_text("en");
+    for text in [&zh, &en] {
+        assert!(text.contains("ai-hook"), "tutorial must mention ai-hook");
+        assert!(
+            !text.contains("@@VERSION@@"),
+            "version placeholder must be substituted"
+        );
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "tutorial must embed the real package version"
+        );
+    }
+    assert!(
+        zh.contains("tutorial"),
+        "zh tutorial must contain tutorial cmd"
+    );
 }

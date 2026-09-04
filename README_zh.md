@@ -38,13 +38,13 @@
 │     只读安全命令 (git status, ls, pwd 等) 0.01ms 放行，不启引擎│
 │  2. 原生 Serde JSON 纳秒级解析:                              │
 │     自动识别 AGY (.toolCall) / CC (.tool_input) / Codex (turn_id)│
-│  3. 动态发现各插件独立规则 (~/.agents/plugins/*/hooks/*.js):   │
+│  3. 显式加载规则脚本 (CLI 参数 / AI_HOOK_RULES / ./.ai-hook):   │
 │     ┌───────────────────────────────────────────────────┐   │
 │     │ 物理级独立沙箱 (零代码合并，绝无变量污染):           │   │
-│     │ - rd/protect-prod-db-write.js (生产特权写保护)    │   │
-│     │ - xr/protect-prod-db-write.js (生产库白名单放行)  │   │
-│     │ - dev/protect-db-migrate.js   (破坏性迁移阻断)    │   │
-│     │ - sys/protect-rm-root.js      (删根与整盘防护)    │   │
+│     │ - ai-hook ./rules/protect-prod.js (显式传参)    │   │
+│     │ - AI_HOOK_RULES="a.js;b.js" (环境变量)  │   │
+│     │ - ./.ai-hook/rules.js 或 ./.ai-hook/rules/ (本地)    │   │
+│     │ - 每条规则在独立沙箱执行,零合并零污染    │   │
 │     └───────────────────────────────────────────────────┘   │
 │  4. 规则自治前置数据获取 (sys 原生能力，拒绝外部子进程):         │
 │     - sys.git.branch() 纯内存读取 .git/HEAD (0.02ms)        │
@@ -105,6 +105,8 @@
 # Windows (PowerShell): 下载至原生应用路径（无需解压，零环境变量修改，全终端立即全局可用）
 Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\ai-hook.exe"
 
+> ⚠️ `WindowsApps` 目录通常需要**开发者模式**或管理员权限才可写入;若提示拒绝访问,请改用 `cargo install --path . && ai-hook install`(会自动探测可写的 PATH 目录)。
+
 # Linux: 直接下载到系统全局路径
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
 chmod +x /usr/local/bin/ai-hook
@@ -116,6 +118,10 @@ chmod +x /usr/local/bin/ai-hook
 # macOS (Intel)
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-darwin-x86_64
 chmod +x /usr/local/bin/ai-hook
+
+# 32 位 (i686;macOS 自 10.15 起已无 32 位支持,仅 Windows/Linux)
+curl -Lo ai-hook.exe https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86.exe
+curl -Lo ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86 && chmod +x ai-hook
 ```
 
 或者从源码直接编译安装：
@@ -142,12 +148,18 @@ ai:doctor() {
     if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
       powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe' -OutFile \"\$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\ai-hook.exe\""
     else
-      local arch="$(uname -m)"
       local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+      local mach="$(uname -m)"
+      case "$os:$mach" in
+        darwin:arm64|darwin:aarch64) local asset="ai-hook-darwin-aarch64" ;;
+        darwin:x86_64)               local asset="ai-hook-darwin-x86_64" ;;
+        linux:x86_64)                local asset="ai-hook-linux-x86_64" ;;
+        *) echo "暂不支持的平台: $os-$mach,请手动下载或源码编译"; return 1 ;;
+      esac
       local target_bin="/usr/local/bin/ai-hook"
       [[ ! -w "/usr/local/bin" ]] && target_bin="$HOME/.local/bin/ai-hook"
       mkdir -p "$(dirname "$target_bin")"
-      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-${os}-${arch}" -o "$target_bin" && chmod +x "$target_bin"
+      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/${asset}" -o "$target_bin" && chmod +x "$target_bin"
     fi
     echo "✨ ai-hook 安装完成！"
   else
@@ -202,6 +214,7 @@ ai:doctor() {
 - **智能自适应高度**：当无命令内容时，**代码框自动彻底折叠隐藏**，彻底消灭中间空白区域！仅保留紧凑的授权提示卡片；
 - **暗色高亮代码预览**：当有命令时，采用 `#0F172A` 深色代码卡片，自适应最大高度并自带横纵滚动条；
 - **全键盘支持**：按 `Enter` 快速允许，按 `Esc` 快速拒绝；
+- **文本可复制**：原因与命令文本可拖选 / `Ctrl+A` / `Ctrl+C`(Windows)；macOS 与 Linux 使用系统原生对话框(结构一致:原因/命令分区、倒计时、Esc 拒绝),文本选择能力受平台对话框限制
 - **置顶与拖拽**：窗体默认置顶吸附，鼠标按住任意区域可平滑拖拽。
 
 | 环境变量 / CLI 参数 | 默认值 | 作用说明 |
@@ -227,18 +240,22 @@ export default function(ctx, sys) {
 
 通过 `ctx` 对象，你可以直接拿到当前是哪个 AI Agent、完整的原始输入 Payload、调用的工具名称与参数：
 
-| 属性名 | 类型 | 说明与示例 |
+| 属性 | 类型 | 语义(完整契约见 `ai-hook tutorial`) |
 | :--- | :--- | :--- |
-| `ctx.agent` / `ctx.agentType` | `string` | **当前 AI Agent 类型**：`"antigravity"` (Google AGY)、`"claude_code"` (Claude Code)、`"codebuddy"` (CodeBuddy)、`"codex"` (OpenAI Codex)、`"generic"` (其他) |
-| `ctx.raw` | `object` | **AI 宿主下发的完整原始 Payload**（已自动反序列化为 JS 对象，可任意读取 `ctx.raw.conversationId` 等宿主私有字段） |
-| `ctx.rawInput` | `string` | AI 宿主下发的原始未经处理的 JSON 字符串 |
-| `ctx.args` | `object` | **当前工具调用的参数对象**（如 `ctx.args.CommandLine`, `ctx.args.TargetFile`, `ctx.args.CodeContent` 等） |
-| `ctx.tool` / `ctx.toolName` | `string` | 当前被调用的工具名称（如 `"run_command"`, `"write_to_file"`, `"replace_file_content"`） |
-| `ctx.cmd` | `string` | 待执行的命令行文本（针对命令执行工具，非命令工具时为空字符串） |
-| `ctx.file` / `ctx.targetFile` | `string` | 目标文件绝对/相对路径（针对文件读写工具） |
-| `ctx.cwd` | `string` | 当前宿主工作目录绝对路径 |
-| `ctx.isYolo` | `boolean` | 是否处于免确认/自动授权模式（如 `AGY_DANGEROUSLY_SKIP_PERMISSIONS=1`） |
-| `ctx.conversationId` | `string?` | 当前会话 ID（如果宿主提供了） |
+| `ctx.agent` | `string` | 检测到的宿主:`"antigravity"` / `"claude_code"` / `"codebuddy"` / `"codex"` / `"generic"` |
+| `ctx.mode` | `string?` | 宿主权限模式:`default`/`plan`/`acceptEdits`/`dontAsk`/`bypassPermissions` |
+| `ctx.isYolo` | `boolean` | 免确认(mode 含 bypassPermissions/dontAsk,或 AGY 免确认标志) |
+| `ctx.session` | `{id, transcriptPath}?` | 会话 id 与全量对话记录路径(可用 `sys.fs.readText` 读取上下文) |
+| `ctx.cwd` | `string` | 会话/命令工作目录 |
+| `ctx.model` | `string?` | 宿主模型标识(如 Antigravity `modelName`) |
+| `ctx.tool` | `string` | 宿主工具名原文(`"Bash"`/`"run_command"`/`"Write"`…) |
+| `ctx.cmd` | `string?` | 仅命令类工具非空;其余为 `null` |
+| `ctx.file` | `{path, action}?` | 仅文件类工具;`action`: `read`/`write`/`edit`/`delete`/`list`(按工具名归一) |
+| `ctx.args` | `object` | 宿主工具参数原文(`{command}`、`{file_path, content}`、`{CommandLine}`…) |
+| `ctx.raw` | `object` | 宿主完整原始 payload(永远可用,字段以宿主为准) |
+| `ctx.rawInput` | `string` | payload 原始文本 |
+> 设计原则:一语义一属性,无别名;非适用工具时 `cmd`/`file` 为 `null`(规则请先判空)。
+
 
 ### 2. `sys` 原生极速自治能力（微秒级原生数据获取）
 
@@ -254,7 +271,8 @@ export default function(ctx, sys) {
 | `sys.fs.list([dir])` | `string[]` | 列出目标目录下的所有文件名 |
 | `sys.env("KEY")` | `string?` | **< 1 µs** 获取宿主环境变量，亦可使用 `sys.env.get("KEY")` |
 | `sys.cwd()` | `string` | 获取当前工作目录 |
-| `console.log(...)` | `void` | 规则内调试日志输出（自动重定向到 stderr，不破坏 Agent 决策 JSON 输出） |
+| `console.log(...)` | `void` | 调试日志到 stderr(绝不污染决策 JSON) |
+| `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义) |
 | **标准 JS 原生时钟** | - | 使用原生 `new Date()` 即可做星期几、小时、日期、封网期计算 |
 
 ### 3. 决策返回值：精确控制是强制阻断、还是弹窗确认
@@ -299,57 +317,19 @@ return {
 return null; // 或 return { action: "allow" };
 ```
 
+> **规则执行失败的处理(fail-closed)**:任意规则出现语法错误、运行时异常、死循环超时或返回 Promise(async)时,ai-hook **默认直接拒绝**该命令,并把规则异常作为拒绝原因返回——绝不静默放行。每条规则受 5 秒执行超时保护(死循环会被自动中断)。如需旧版"出错即放行"行为,可显式传 `--allow-on-error` 或设置环境变量 `AI_HOOK_ALLOW_ON_ERROR=1`(不推荐用于生产安全门禁)。
+> **输出语言**:弹窗、提示与日志语言跟随系统语言(Windows 系统区域 / `LANG`),可用 `AI_HOOK_LANG=zh|en` 强制指定;`ai-hook tutorial` 默认也跟随系统语言,`--lang en|zh` 可覆盖。
+
 ---
 
 ## 💡 完整全功能演示规则 (Demo)
 
-完整演示规则参见源码仓库中的 [`examples/demo_all_features.js`](examples/demo_all_features.js)：
-
-```javascript
-/**
- * demo_all_features.js - ai-hook 全能力演示规则
- */
-export default function(ctx, sys) {
-  // 1. 打印 Agent 与工具信息
-  console.log(`[Demo] 当前 Agent: ${ctx.agent}, 工具: ${ctx.tool}`);
-
-  // 2. 致命高危命令：直接强制拦截，绝不弹窗
-  if (ctx.cmd && /git\s+push\b.*(-f|--force)\b/.test(ctx.cmd)) {
-    const branch = sys.git.branch();
-    if (branch === "master" || branch === "main") {
-      return {
-        action: "deny",
-        reason: `【硬阻断】主分支 '${branch}' 严禁 force-push！`
-      };
-    }
-  }
-
-  // 3. 敏感操作：唤起现代化 Fluent 吸附弹窗
-  if (ctx.cmd && /\b(migrate|wipe|reset)\b/i.test(ctx.cmd)) {
-    return {
-      action: "confirm",
-      title: "数据库结构变更授权",
-      reason: "检测到数据库重置或变更命令，可能影响现有数据！",
-      gui: true,
-      timeout: 45
-    };
-  }
-
-  // 4. 终端提示确认（不弹窗）
-  if (ctx.cmd && /\b(npm\s+publish)\b/i.test(ctx.cmd)) {
-    return {
-      action: "confirm",
-      reason: "检测到 npm 发布操作，是否继续？",
-      gui: false
-    };
-  }
-
-  return null;
-}
-```
+完整演示规则参见源码仓库中的 [`examples/demo_all_features.js`](examples/demo_all_features.js)(仓库内为唯一权威版本,本文档不再内嵌以免漂移)。该示例覆盖:
+- Agent 类型、原始 Payload 与参数读取(`ctx.agent` / `ctx.raw` / `ctx.args`);
+- `sys` 自治数据获取(`sys.git.branch()` / `sys.fs.readText()` / `sys.env`);
+- 三种决策模式:硬阻断 `deny`、桌面弹窗 `confirm(gui: true)`、终端 ask `confirm(gui: false)`。
 
 ---
-
 ## 🛠️ CLI 命令行指南
 
 ```bash

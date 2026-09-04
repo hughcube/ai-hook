@@ -1,4 +1,5 @@
 use super::input::{HookContext, Platform};
+use crate::i18n::{Msg, t};
 use serde_json::json;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,8 +17,28 @@ pub enum HookDecision {
     },
 }
 
+/// The offending command (or file when no command) of the current context.
+fn ctx_target(ctx: &HookContext) -> &str {
+    if let Some(cmd) = ctx.cmd.as_deref() {
+        if !cmd.is_empty() {
+            return cmd;
+        }
+    }
+    ctx.file
+        .as_ref()
+        .and_then(|f| f.path.as_deref())
+        .unwrap_or("")
+}
+
+/// Localized wrapper messages (rule-supplied `reason` text itself is kept
+/// verbatim — it is authored by the rule writer in their own language).
 impl HookDecision {
     pub fn to_json_output(&self, ctx: &HookContext, gui_approved: Option<bool>) -> String {
+        let target = ctx_target(ctx);
+        let denied_label = t(Msg::M005);
+        let command_label = t(Msg::M006);
+        let about_to_run = t(Msg::M007);
+
         match ctx.platform {
             Platform::Antigravity => match self {
                 HookDecision::Allow => json!({ "decision": "allow" }).to_string(),
@@ -27,9 +48,8 @@ impl HookDecision {
                             json!({ "decision": "allow" }).to_string()
                         } else {
                             let deny_reason = format!(
-                                "【安全门禁已拒绝】用户在弹窗中选择拒绝或倒计时超时：\n{}\n命令：{}",
-                                reason,
-                                if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
+                                "{}\n{}\n{}: {}",
+                                denied_label, reason, command_label, target
                             );
                             json!({
                                 "decision": "deny",
@@ -39,10 +59,8 @@ impl HookDecision {
                         }
                     } else if ctx.is_yolo {
                         // In YOLO mode with GUI disabled, reject for safety
-                        let manual_reason = format!(
-                            "【硬阻断】免确认模式下未获得授权。请在终端手动执行：\n{}",
-                            if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                        );
+                        let manual_reason =
+                            format!("{}\n{}: {}", t(Msg::M008), command_label, target);
                         json!({
                             "decision": "deny",
                             "reason": manual_reason
@@ -50,11 +68,7 @@ impl HookDecision {
                         .to_string()
                     } else {
                         // Interactive terminal ask
-                        let ask_msg = format!(
-                            "{}\n即将执行：\n{}",
-                            reason,
-                            if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                        );
+                        let ask_msg = format!("{}\n{}:\n{}", reason, about_to_run, target);
                         json!({
                             "decision": "force_ask",
                             "reason": ask_msg
@@ -63,11 +77,7 @@ impl HookDecision {
                     }
                 }
                 HookDecision::Deny { reason } => {
-                    let msg = format!(
-                        "{}\n{}",
-                        reason,
-                        if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                    );
+                    let msg = format!("{}\n{}: {}", reason, command_label, target);
                     json!({
                         "decision": "deny",
                         "reason": msg
@@ -76,15 +86,13 @@ impl HookDecision {
                 }
             },
             Platform::Codex => match self {
-                HookDecision::Allow => {
-                    json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "allow"
-                        }
-                    })
-                    .to_string()
-                }
+                HookDecision::Allow => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow"
+                    }
+                })
+                .to_string(),
                 HookDecision::Confirm { reason, .. } => {
                     if gui_approved == Some(true) {
                         json!({
@@ -96,8 +104,11 @@ impl HookDecision {
                         .to_string()
                     } else {
                         let manual_reason = format!(
-                            "【硬阻断】用户拒绝或 Codex PreToolUse 不支持交互式确认。命令：\n{}\n原因: {}",
-                            if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd },
+                            "{}\n{}: {}\n{}: {}",
+                            t(Msg::M009),
+                            command_label,
+                            target,
+                            t(Msg::M010),
                             reason
                         );
                         json!({
@@ -111,11 +122,7 @@ impl HookDecision {
                     }
                 }
                 HookDecision::Deny { reason } => {
-                    let msg = format!(
-                        "{}\n{}",
-                        reason,
-                        if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                    );
+                    let msg = format!("{}\n{}: {}", reason, command_label, target);
                     json!({
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
@@ -134,9 +141,8 @@ impl HookDecision {
                             String::new()
                         } else {
                             let deny_reason = format!(
-                                "【安全门禁已拒绝】用户在弹窗中选择拒绝或倒计时超时：\n{}\n命令：{}",
-                                reason,
-                                if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
+                                "{}\n{}\n{}: {}",
+                                denied_label, reason, command_label, target
                             );
                             json!({
                                 "hookSpecificOutput": {
@@ -148,11 +154,7 @@ impl HookDecision {
                             .to_string()
                         }
                     } else {
-                        let ask_msg = format!(
-                            "{}\n即将执行：\n{}",
-                            reason,
-                            if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                        );
+                        let ask_msg = format!("{}\n{}:\n{}", reason, about_to_run, target);
                         json!({
                             "hookSpecificOutput": {
                                 "hookEventName": "PreToolUse",
@@ -164,11 +166,7 @@ impl HookDecision {
                     }
                 }
                 HookDecision::Deny { reason } => {
-                    let msg = format!(
-                        "{}\n{}",
-                        reason,
-                        if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                    );
+                    let msg = format!("{}\n{}: {}", reason, command_label, target);
                     json!({
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",

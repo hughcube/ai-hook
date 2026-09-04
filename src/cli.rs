@@ -36,6 +36,12 @@ pub struct Cli {
     /// Dry run mode (does not trigger GUI popups)
     #[arg(long, global = true)]
     pub dry_run: bool,
+
+    /// Allow command execution when a rule script fails (syntax/runtime error,
+    /// timeout, async rule). Default is fail-closed: any rule error DENIES the
+    /// command instead of silently allowing it.
+    #[arg(long, global = true)]
+    pub allow_on_error: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -101,8 +107,9 @@ pub enum Commands {
     /// Display comprehensive tutorial and rule authoring guide
     #[command(alias = "guide")]
     Tutorial {
-        /// Tutorial language: "zh" for Chinese or "en" for English (default: "zh")
-        #[arg(short, long, default_value = "zh")]
-        lang: String,
+        /// Tutorial language: "zh" for Chinese or "en" for English
+        /// (default: follow the system language)
+        #[arg(short, long)]
+        lang: Option<String>,
     },
 }

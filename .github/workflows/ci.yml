@@ -27,6 +27,12 @@ jobs:
       - name: Cargo Check
         run: cargo check --verbose
 
+      - name: Format Check
+        run: cargo fmt --check
+
+      - name: Run Unit & Integration Tests
+        run: cargo test --verbose
+
       - name: Cargo Build Release
         run: cargo build --release --verbose
 

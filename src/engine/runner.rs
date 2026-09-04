@@ -1,13 +1,49 @@
 use super::loader::RuleSource;
-use super::sys::{create_sys_object, RequestCache, SysContext};
+use super::sys::{RequestCache, SysContext, create_sys_object};
+use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision};
 use rquickjs::{Context, Function, Object, Runtime, Value};
+use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// Default per-rule execution budget. Rules are synchronous QuickJS scripts;
+/// without this bound a buggy infinite loop would hang the whole hook.
+pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum size of the rule log file before it rotates to `<name>.1`.
+const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Localized message for rules that return a Promise (async is unsupported).
+fn async_rule_error() -> String {
+    t(Msg::M000).to_string()
+}
+
+/// How to treat a rule that failed (syntax error, runtime exception,
+/// timeout, async rule, ...). The engine is a security gate, so the
+/// default is FailClosed: a broken rule must never silently allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorPolicy {
+    /// Any rule error short-circuits to Deny (default).
+    FailClosed,
+    /// Errors are recorded and evaluation continues with the next rule.
+    AllowOnError,
+}
+
+impl ErrorPolicy {
+    pub fn from_flag(allow_on_error: bool) -> Self {
+        if allow_on_error {
+            Self::AllowOnError
+        } else {
+            Self::FailClosed
+        }
+    }
+}
 
 pub struct RuleRunner {
     runtime: Runtime,
     cache: RequestCache,
+    timeout: Duration,
 }
 
 #[allow(dead_code)]
@@ -20,8 +56,124 @@ pub struct RuleExecutionResult {
     pub error: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Rule log sink: stderr (default) + optional file channel.
+//
+// Design (per user decision):
+// - Location:     ~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log  (UTC day)
+// - Aggregation:  one file per agent per day; every line is JSONL with
+//                 ts/sessionId/rule/level/msg so one session's story can be
+//                 reconstructed with `grep '"sessionId":"..."' file.log`.
+// - Cost:         the file is only opened when a rule actually logs; rules
+//                 that never log cost zero I/O.
+// - Rotation:     >20MB renames to `<name>.1` (checked once per open).
+// - Overrides:    AI_HOOK_LOG_FILE=<path>  custom file,
+//                 AI_HOOK_LOG=0|false|off  disable file logging entirely.
+// ---------------------------------------------------------------------------
+
+fn log_file_disabled() -> bool {
+    std::env::var("AI_HOOK_LOG")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "0" || v == "false" || v == "no" || v == "off"
+        })
+        .unwrap_or(false)
+}
+
+/// Returns the default (or AI_HOOK_LOG_FILE-overridden) log file path.
+fn resolve_log_path(agent: &str) -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var("AI_HOOK_LOG_FILE") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            return Some(std::path::PathBuf::from(custom));
+        }
+    }
+    let home = dirs::home_dir()?;
+    Some(home.join(".ai-hook").join("logs").join(format!(
+        "ai-hook-{}-{}.log",
+        agent,
+        utc_date_ymd()
+    )))
+}
+
+/// Days since 1970-01-01 -> (y, m, d) in UTC (civil-from-days, Hinnant).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Current UTC date as `YYYYMMDD` (file-name granularity; line timestamps are
+/// epoch millis, so UTC-vs-local day boundaries only affect file splitting).
+fn utc_date_ymd() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i128)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
+    format!("{y:04}{m:02}{d:02}")
+}
+
+/// Appends one JSONL line to the rule log (opened on demand, then closed).
+/// Never fails the caller: logging must not break rule evaluation.
+fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: &str, msg: &str) {
+    if log_file_disabled() {
+        return;
+    }
+    let Some(path) = resolve_log_path(agent) else {
+        return;
+    };
+
+    // Rotate once if oversized (checked at open time — cheap).
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_LOG_BYTES {
+            if let Some(name) = path.file_name() {
+                let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
+                let _ = std::fs::rename(&path, &rotated);
+            }
+        }
+    }
+
+    let line = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        "agent": agent,
+        "sessionId": session_id,
+        "rule": rule_id,
+        "level": level,
+        "msg": msg,
+    })
+    .to_string();
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Append-only open: atomic for concurrent hook processes per line.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
 impl RuleRunner {
     pub fn new() -> rquickjs::Result<Self> {
+        Self::with_timeout(DEFAULT_RULE_TIMEOUT)
+    }
+
+    pub fn with_timeout(timeout: Duration) -> rquickjs::Result<Self> {
         let runtime = Runtime::new()?;
         // Memory limit 64MB, adequate for lightweight security rules
         runtime.set_memory_limit(64 * 1024 * 1024);
@@ -31,15 +183,12 @@ impl RuleRunner {
         Ok(Self {
             runtime,
             cache: RequestCache::new(),
+            timeout,
         })
     }
 
     /// Evaluates a single rule in an isolated QuickJS context.
-    pub fn execute_rule(
-        &self,
-        rule: &RuleSource,
-        ctx: &HookContext,
-    ) -> RuleExecutionResult {
+    pub fn execute_rule(&self, rule: &RuleSource, ctx: &HookContext) -> RuleExecutionResult {
         let start = Instant::now();
         let js_context = match Context::full(&self.runtime) {
             Ok(c) => c,
@@ -49,7 +198,7 @@ impl RuleRunner {
                     rule_path: rule.path.clone(),
                     decision: None,
                     duration: start.elapsed(),
-                    error: Some(format!("Failed to create JS context: {}", e)),
+                    error: Some(tf(Msg::M001, &[&e])),
                 };
             }
         };
@@ -58,71 +207,130 @@ impl RuleRunner {
         let mut decision = None;
         let mut error = None;
 
+        // Interrupt handler: QuickJS invokes it periodically while running JS.
+        // Returning true aborts execution (thrown as an "interrupted" error),
+        // which bounds runaway/infinite rule scripts.
+        let timeout = self.timeout;
+        let deadline = Instant::now() + timeout;
+        self.runtime
+            .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+
+        let agent_str = ctx.platform.to_string();
+        let session_id = ctx.conversation.as_ref().and_then(|c| c.id.as_deref());
+
         let res = js_context.with(|js_ctx| -> rquickjs::Result<()> {
-            // 1. Build ctx object
-            let ctx_obj = Object::new(js_ctx.clone())?;
+            // 1. Build the full v2 ctx object from one JSON document (nested
+            //    nulls, sessions, files serialize cleanly this way).
+            let ctx_value = serde_json::json!({
+                "agent": agent_str,
+                "mode": ctx.permission_mode,
+                "isYolo": ctx.is_yolo,
+                "session": ctx.conversation.as_ref().map(|c| serde_json::json!({
+                    "id": c.id,
+                    "transcriptPath": c.transcript_path,
+                })),
+                "cwd": ctx.cwd,
+                "model": ctx.model,
+                "tool": ctx.tool_name,
+                "cmd": ctx.cmd,
+                "file": ctx.file.as_ref().map(|f| serde_json::json!({
+                    "path": f.path,
+                    "action": f.action.as_str(),
+                })),
+                "args": ctx.tool_args,
+                "raw": ctx.raw_value,
+                "rawInput": ctx.raw_input,
+            });
+            let ctx_obj: Value = js_ctx.json_parse(ctx_value.to_string().as_bytes())?;
 
-            let agent_str = ctx.platform.to_string();
-            ctx_obj.set("agent", agent_str.clone())?;
-            ctx_obj.set("agentType", agent_str.clone())?;
-            ctx_obj.set("platform", agent_str)?;
-
-            ctx_obj.set("cmd", ctx.cmd.clone())?;
-            ctx_obj.set("tool", ctx.tool_name.clone())?;
-            ctx_obj.set("toolName", ctx.tool_name.clone())?;
-            ctx_obj.set("file", ctx.target_file.clone())?;
-            ctx_obj.set("targetFile", ctx.target_file.clone())?;
-            ctx_obj.set("cwd", ctx.cwd.clone())?;
-            ctx_obj.set("rawInput", ctx.raw_input.clone())?;
-            ctx_obj.set("isYolo", ctx.is_yolo)?;
-
-            if let Some(ref cid) = ctx.conversation_id {
-                ctx_obj.set("conversationId", cid.clone())?;
-            }
-
-            // Injected parsed raw payload
-            if let Ok(raw_val) = js_ctx.json_parse(ctx.raw_input.as_bytes()) {
-                ctx_obj.set("raw", raw_val)?;
-            } else {
-                ctx_obj.set("raw", ctx.raw_input.clone())?;
-            }
-
-            // Injected tool arguments
-            let args_json_str = ctx.tool_args.to_string();
-            if let Ok(args_val) = js_ctx.json_parse(args_json_str.as_bytes()) {
-                ctx_obj.set("args", args_val)?;
-            }
-
-            // 1.5 Setup console.log
+            // 1.5 Setup console.log -> stderr (+ optional file channel)
             let console_obj = Object::new(js_ctx.clone())?;
-            let log_fn = Function::new(js_ctx.clone(), |args: rquickjs::function::Rest<String>| {
-                eprintln!("[rule-debug] {}", args.0.join(" "));
-            })?;
+            let agent_for_log = agent_str.clone();
+            let session_for_log = session_id.map(str::to_string);
+            let rule_id_for_log = rule.id.clone();
+            let log_fn = Function::new(
+                js_ctx.clone(),
+                move |args: rquickjs::function::Rest<String>| {
+                    let msg = args.0.join(" ");
+                    eprintln!("[rule-debug] {}", msg);
+                    append_rule_log(
+                        &agent_for_log,
+                        session_for_log.as_deref(),
+                        &rule_id_for_log,
+                        "log",
+                        &msg,
+                    );
+                },
+            )?;
             console_obj.set("log", log_fn.clone())?;
             console_obj.set("error", log_fn)?;
             js_ctx.globals().set("console", console_obj)?;
 
-            // 2. Build sys object
+            // 2. Build sys object (fs/git/env/cwd) + sys.log(level, ...msg)
             let sys_obj = create_sys_object(&js_ctx, sys_ctx)?;
+            {
+                let agent_for_log = agent_str.clone();
+                let session_for_log = session_id.map(str::to_string);
+                let rule_id_for_log = rule.id.clone();
+                let sys_log_fn = Function::new(
+                    js_ctx.clone(),
+                    move |args: rquickjs::function::Rest<String>| {
+                        let mut parts = args.0.into_iter();
+                        let first = parts.next().unwrap_or_default();
+                        let (level, msg) = if parts.len() == 0 {
+                            ("log".to_string(), first)
+                        } else {
+                            (first, parts.collect::<Vec<_>>().join(" "))
+                        };
+                        eprintln!("[rule-debug][{}] {}", level, msg);
+                        append_rule_log(
+                            &agent_for_log,
+                            session_for_log.as_deref(),
+                            &rule_id_for_log,
+                            &level,
+                            &msg,
+                        );
+                    },
+                )?;
+                sys_obj.set("log", sys_log_fn)?;
+            }
 
+            // 3. Prepare rule code: rewrite the top-level `export default`
+            //    into a `return` statement (comments/strings are respected).
             let raw_code = rule.code.as_str();
-            let re_export = regex::Regex::new(r"(?m)^\s*export\s+default\s+").unwrap();
-            let prepared_code = if re_export.is_match(raw_code) {
-                re_export.replace(raw_code, "return ").to_string()
-            } else {
-                raw_code.to_string()
+            let prepared_code = match find_export_default(raw_code) {
+                Some(pos) => {
+                    let mut s = raw_code.to_string();
+                    s.replace_range(pos..pos + EXPORT_DEFAULT_LEN, "return ");
+                    s
+                }
+                None => raw_code.to_string(),
             };
 
             let wrapper = r#"
                 (function(code, ctx, sys) {
+                    function isThenable(v) {
+                        return v != null &&
+                               (typeof v === 'object' || typeof v === 'function') &&
+                               typeof v.then === 'function';
+                    }
                     try {
                         var factory = new Function("ctx", "sys", code);
                         var result = factory(ctx, sys);
                         if (typeof result === 'function') {
-                            return result(ctx, sys);
+                            result = result(ctx, sys);
+                        }
+                        if (isThenable(result)) {
+                            // Structured marker; the localized message is
+                            // generated on the Rust side (language-agnostic).
+                            return { __async_error: true };
                         }
                         return result;
                     } catch (err) {
+                        // NOTE: the watchdog interrupt (deadline exceeded) also
+                        // lands here as an opaque "Exception generated by
+                        // QuickJS"; execute_rule classifies timeouts by elapsed
+                        // time afterwards instead of parsing this text.
                         return { __error: String(err) };
                     }
                 })
@@ -132,8 +340,13 @@ impl RuleRunner {
             let raw_val: Value = eval_fn.call((prepared_code, ctx_obj, sys_obj))?;
 
             if let Some(obj) = raw_val.as_object() {
+                if obj.get::<_, bool>("__async_error").unwrap_or(false) {
+                    error = Some(async_rule_error());
+                    return Ok(());
+                }
+
                 if let Ok(err_msg) = obj.get::<_, String>("__error") {
-                    error = Some(err_msg);
+                    error = Some(normalize_rule_error(&err_msg));
                     return Ok(());
                 }
 
@@ -179,7 +392,7 @@ impl RuleRunner {
             } else if let Some(b) = raw_val.as_bool() {
                 if !b {
                     decision = Some(HookDecision::Deny {
-                        reason: format!("Rule {} returned false", rule.id),
+                        reason: tf(Msg::M002, &[&rule.id]),
                     });
                 }
             }
@@ -187,10 +400,24 @@ impl RuleRunner {
             Ok(())
         });
 
+        // Always clear the interrupt handler so it cannot leak into later rules.
+        self.runtime.set_interrupt_handler(None);
+
+        let elapsed = start.elapsed();
+
         if let Err(e) = res {
             if error.is_none() {
-                error = Some(e.to_string());
+                error = Some(normalize_rule_error(&e.to_string()));
             }
+        }
+
+        // The watchdog interrupt fires once the deadline passes, whether it
+        // surfaces as a Rust error or is swallowed by the wrapper's catch.
+        // Execution that outlived the deadline without producing a decision is
+        // a timeout and must be reported as such (not as an opaque engine
+        // error), regardless of the interrupt's textual representation.
+        if elapsed >= timeout && decision.is_none() {
+            error = Some(tf(Msg::M003, &[&format!("{:?}", timeout)]));
         }
 
         RuleExecutionResult {
@@ -202,16 +429,30 @@ impl RuleRunner {
         }
     }
 
-    /// Evaluates a list of rules sequentially. Short-circuits on first Confirm or Deny.
+    /// Evaluates a list of rules sequentially. Short-circuits on the first
+    /// Confirm or Deny. Under `ErrorPolicy::FailClosed`, a failing rule also
+    /// short-circuits to Deny so a broken gate never opens silently.
     pub fn evaluate_all(
         &self,
         rules: &[RuleSource],
         ctx: &HookContext,
+        policy: ErrorPolicy,
     ) -> (HookDecision, Vec<RuleExecutionResult>) {
         let mut results = Vec::new();
 
         for rule in rules {
             let res = self.execute_rule(rule, ctx);
+
+            // A rule that failed without producing a decision must not be
+            // treated as "pass" when the gate is fail-closed.
+            if policy == ErrorPolicy::FailClosed && res.decision.is_none() {
+                if let Some(err) = res.error.clone() {
+                    results.push(res);
+                    let reason = tf(Msg::M004, &[&rule.id, &err]);
+                    return (HookDecision::Deny { reason }, results);
+                }
+            }
+
             let hit = res.decision.clone();
             results.push(res);
 
@@ -227,4 +468,83 @@ impl RuleRunner {
 
         (HookDecision::Allow, results)
     }
+}
+
+/// Length of the literal `export default` (14 chars) replaced by `return `.
+const EXPORT_DEFAULT_LEN: usize = "export default".len();
+
+/// Normalizes error text (rquickjs prefixes vary across versions).
+fn normalize_rule_error(err: &str) -> String {
+    err.trim().to_string()
+}
+
+/// Locates the first top-level `export default` occurrence that is NOT inside a
+/// comment or a string literal, is preceded by a non-identifier boundary and is
+/// the first code on its line. Returns the byte offset of `export` in `code`.
+///
+/// This is deliberately conservative: if we cannot prove a candidate is the
+/// real module export we return None (the code is then passed through as-is
+/// and any real `export default` inside `new Function` surfaces as a syntax
+/// error reported by the wrapper instead of a silent mis-replace).
+fn find_export_default(code: &str) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+
+    while i < n {
+        let b = bytes[i];
+        match b {
+            // Line comment
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Block comment
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            // String / template literals (with escape handling)
+            b'\'' | b'"' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => {
+                if b == b'e' && bytes[i..].starts_with(b"export default") {
+                    // Boundary: previous char must not be identifier-ish.
+                    let prev_ok = i == 0
+                        || !(bytes[i - 1].is_ascii_alphanumeric()
+                            || bytes[i - 1] == b'_'
+                            || bytes[i - 1] == b'$');
+                    // Must be the first code on its line (only whitespace before).
+                    let line_ok = code[..i]
+                        .rfind('\n')
+                        .map(|ls| code[ls + 1..i].chars().all(|c| c.is_whitespace()))
+                        .unwrap_or_else(|| code[..i].chars().all(|c| c.is_whitespace()));
+                    if prev_ok && line_ok {
+                        return Some(i);
+                    }
+                    i += "export".len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    None
 }

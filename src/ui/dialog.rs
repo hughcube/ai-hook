@@ -1,8 +1,36 @@
 use std::process::Command;
 
+// macOS/Linux dialog code paths pull strings from the message table; on
+// Windows those functions are compiled out, so the import is cfg-gated to
+// avoid an unused-import warning there.
+#[cfg(not(windows))]
+use crate::i18n::{Msg, t, tf};
+
 pub struct GuiDialog;
 
 impl GuiDialog {
+    /// Joins a rule-provided reason with the offending command for display in
+    /// the macOS/Linux dialogs (localized connector). Windows does not use it
+    /// (the WPF dialog assembles its own layout).
+    #[cfg(not(windows))]
+    /// Joins a rule-provided reason with the offending command for display in
+    /// the macOS/Linux dialogs. Structurally aligned with the Windows dialog:
+    /// reason paragraph first, then a "Command: ..." labeled line (omitted
+    /// when there is no command; the whole block reduces to reason only).
+    #[cfg(not(windows))]
+    fn join_reason_command(reason: &str, command: &str) -> String {
+        if command.is_empty() {
+            reason.to_string()
+        } else {
+            let cmd_line = format!("{}: {}", t(Msg::M006), command);
+            if reason.is_empty() {
+                cmd_line
+            } else {
+                format!("{}\n\n{}", reason, cmd_line)
+            }
+        }
+    }
+
     /// Determines whether GUI dialog prompt is enabled (defaults to true).
     pub fn is_enabled(no_gui_flag: bool) -> bool {
         if no_gui_flag {
@@ -72,21 +100,13 @@ impl GuiDialog {
 
         #[cfg(target_os = "macos")]
         {
-            let body = if command.is_empty() {
-                reason.to_string()
-            } else {
-                format!("{}\n\n即将执行：\n{}", reason, command)
-            };
+            let body = Self::join_reason_command(reason, command);
             return Self::prompt_macos_native(title, &body, timeout_sec);
         }
 
         #[cfg(target_os = "linux")]
         {
-            let body = if command.is_empty() {
-                reason.to_string()
-            } else {
-                format!("{}\n\n即将执行：\n{}", reason, command)
-            };
+            let body = Self::join_reason_command(reason, command);
             return Self::prompt_linux_native(title, &body, timeout_sec);
         }
 
@@ -161,8 +181,19 @@ impl GuiDialog {
                 $shadowOpa  = "0.18"
             }
 
-            # 3. Parameters & Smart Empty-Reason Fallback
-            $Title = if ($env:AI_HOOK_DLG_TITLE) { $env:AI_HOOK_DLG_TITLE } else { "操作安全授权确认" }
+            # 3. Locale-aware UI strings (language passed by the Rust side)
+            $Zh = ($env:AI_HOOK_DLG_LANG -eq "zh")
+            $BadgeText     = if ($Zh) { "安全门禁" } else { "Security Gate" }
+            $AllowBtn      = if ($Zh) { "允许执行 (Enter)" } else { "Allow (Enter)" }
+            $DenyBtn       = if ($Zh) { "拒绝 (Esc)" } else { "Deny (Esc)" }
+            $CountdownFmt  = if ($Zh) { "剩余 {0} 秒自动拒绝" } else { "Auto-deny in {0}s" }
+            $ReasonCmdFb   = if ($Zh) { "AI Agent 准备在当前工作区执行以下操作，请确认是否允许继续：" } else { "An AI agent is about to perform the following operation in your workspace. Allow it to continue?" }
+            $ReasonLabel   = if ($Zh) { "授权原因" } else { "Reason" }
+            $CmdLabel      = if ($Zh) { "命令" } else { "Command" }
+            $ReasonNoneFb  = if ($Zh) { "AI Agent 发起了一项安全敏感操作，请确认是否授权继续执行。" } else { "An AI agent requested a security-sensitive operation. Do you authorize it?" }
+
+            # 4. Parameters & Smart Empty-Reason Fallback
+            $Title = if ($env:AI_HOOK_DLG_TITLE) { $env:AI_HOOK_DLG_TITLE } elseif ($Zh) { "操作安全授权确认" } else { "Security Authorization Required" }
             $RawReason = if ($env:AI_HOOK_DLG_REASON) { $env:AI_HOOK_DLG_REASON.Trim() } else { "" }
             $Command = if ($env:AI_HOOK_DLG_CMD) { $env:AI_HOOK_DLG_CMD } else { "" }
             $Agent = if ($env:AI_HOOK_DLG_AGENT) { $env:AI_HOOK_DLG_AGENT } else { "AI Agent" }
@@ -174,9 +205,9 @@ impl GuiDialog {
             $effectiveReason = if ($RawReason.Length -gt 0) {
                 $RawReason
             } elseif ($hasCommand) {
-                "AI Agent 准备在当前工作区执行以下操作，请确认是否允许继续："
+                $ReasonCmdFb
             } else {
-                "AI Agent 发起了一项安全敏感操作，请确认是否授权继续执行。"
+                $ReasonNoneFb
             }
 
             $safeTitle = [System.Security.SecurityElement]::Escape($Title)
@@ -188,9 +219,12 @@ impl GuiDialog {
             $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        ToolTip="Selectable text: drag to select, Ctrl+C to copy"
         Title="$safeTitle"
-        Width="620"
+        Width="920"
+        MaxWidth="920"
         SizeToContent="Height"
+        MaxHeight="800"
         WindowStartupLocation="CenterScreen"
         Topmost="True"
         ResizeMode="NoResize"
@@ -198,6 +232,7 @@ impl GuiDialog {
         AllowsTransparency="True"
         Background="Transparent"
         FontFamily="Segoe UI, Microsoft YaHei UI, -apple-system, sans-serif">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0">
     <Border Background="$cardBg"
             BorderBrush="$cardBorder"
             BorderThickness="1"
@@ -227,7 +262,7 @@ impl GuiDialog {
                         <Viewbox Width="13" Height="13" Margin="0,0,5,0">
                             <Path Fill="$badgeFg" Data="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 2.18l7 3.12v4.7c0 4.67-3.13 8.94-7 10.08-3.87-1.14-7-5.41-7-10.08V6.3l7-3.12z"/>
                         </Viewbox>
-                        <TextBlock Text="安全门禁" FontWeight="Bold" Foreground="$badgeFg" FontSize="12"/>
+                        <TextBlock Text="$BadgeText" FontWeight="Bold" Foreground="$badgeFg" FontSize="12"/>
                     </StackPanel>
                 </Border>
 
@@ -238,15 +273,37 @@ impl GuiDialog {
                 </Border>
             </Grid>
 
-            <!-- Row 1: Reason Text -->
-            <TextBlock Grid.Row="1" Text="$safeReason" TextWrapping="Wrap" FontSize="13.5" LineHeight="20" Foreground="$reasonFg" Margin="0,0,0,16"/>
+            <!-- Row 1: Reason label + text (selectable, auto-height up to MaxHeight) -->
+            <StackPanel Grid.Row="1" Margin="0,0,0,16">
+                <StackPanel Orientation="Horizontal" Margin="12,0,0,6">
+                    <Border Width="3" Height="14" CornerRadius="1.5" Background="$timerFg" VerticalAlignment="Center" Margin="0,0,7,0"/>
+                    <TextBlock Text="$ReasonLabel" FontSize="13" FontWeight="SemiBold" Foreground="$timerFg" VerticalAlignment="Center"/>
+                </StackPanel>
+                <RichTextBox x:Name="TxtReason" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                             VerticalScrollBarVisibility="Auto" MaxHeight="280" Padding="10,2,14,0"
+                             FontFamily="Segoe UI, Microsoft YaHei UI, sans-serif">
+                    <FlowDocument PagePadding="0">
+                        <Paragraph x:Name="ReasonPara" Margin="0" FontSize="13.5" Foreground="$reasonFg"/>
+                    </FlowDocument>
+                </RichTextBox>
+            </StackPanel>
 
-            <!-- Row 2: Code block (collapsed completely if empty) -->
-            <Border Grid.Row="2" Visibility="$cmdVisibility" Background="$codeBg" BorderBrush="$codeBorder" BorderThickness="1" CornerRadius="9" Padding="14,12" Margin="0,0,0,20">
-                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" MaxHeight="150">
-                    <TextBlock Text="$safeCmd" FontFamily="Consolas, Cascadia Code, Courier New" FontSize="12.5" Foreground="$codeFg"/>
-                </ScrollViewer>
-            </Border>
+            <!-- Row 2: Command label + code block (collapsed completely if empty) -->
+            <StackPanel Grid.Row="2" Visibility="$cmdVisibility" Margin="0,0,0,20">
+                <StackPanel Orientation="Horizontal" Margin="12,0,0,6">
+                    <Border Width="3" Height="14" CornerRadius="1.5" Background="$timerFg" VerticalAlignment="Center" Margin="0,0,7,0"/>
+                    <TextBlock Text="$CmdLabel" FontSize="13" FontWeight="SemiBold" Foreground="$timerFg" VerticalAlignment="Center"/>
+                </StackPanel>
+                <Border Background="$codeBg" BorderBrush="$codeBorder" BorderThickness="1" CornerRadius="9" Padding="14,12" Margin="0">
+                    <RichTextBox x:Name="TxtCmd" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                                 FontFamily="Consolas, Cascadia Code, Courier New" VerticalScrollBarVisibility="Auto"
+                                 HorizontalScrollBarVisibility="Auto" MaxHeight="200" Padding="10,4,14,6">
+                        <FlowDocument PagePadding="0" PageWidth="700">
+                            <Paragraph x:Name="CmdPara" Margin="0" FontSize="12.5" Foreground="$codeFg"/>
+                        </FlowDocument>
+                    </RichTextBox>
+                </Border>
+            </StackPanel>
 
             <!-- Row 3: Action Bar with Vector Clock -->
             <Grid Grid.Row="3">
@@ -260,10 +317,10 @@ impl GuiDialog {
                     <Viewbox Width="14" Height="14" Margin="0,0,6,0">
                         <Path Fill="$timerFg" Data="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8zm.5-13h-1.2v6l5.2 3.1.6-1.1-4.6-2.7z"/>
                     </Viewbox>
-                    <TextBlock Name="TxtCountdown" Text="剩余 $Timeout 秒自动拒绝" FontSize="12.5" Foreground="$timerFg" FontWeight="Medium" VerticalAlignment="Center"/>
+                    <TextBlock Name="TxtCountdown" Text="" FontSize="12.5" Foreground="$timerFg" FontWeight="Medium" VerticalAlignment="Center"/>
                 </StackPanel>
 
-                <Button Name="BtnDeny" Grid.Column="1" Content="拒绝 (Esc)" Margin="0,0,10,0" Width="105" Height="36"
+                <Button Name="BtnDeny" Grid.Column="1" Content="$DenyBtn" Margin="0,0,10,0" Width="105" Height="36"
                         Background="$denyBg" Foreground="$denyFg" FontWeight="SemiBold" FontSize="13"
                         BorderThickness="0" Cursor="Hand">
                     <Button.Resources>
@@ -273,7 +330,7 @@ impl GuiDialog {
                     </Button.Resources>
                 </Button>
 
-                <Button Name="BtnAllow" Grid.Column="2" Content="允许执行 (Enter)" Width="125" Height="36"
+                <Button Name="BtnAllow" Grid.Column="2" Content="$AllowBtn" Width="125" Height="36"
                         Background="$allowBg" Foreground="$allowFg" FontWeight="Bold" FontSize="13"
                         BorderThickness="0" Cursor="Hand">
                     <Button.Resources>
@@ -285,6 +342,7 @@ impl GuiDialog {
             </Grid>
         </Grid>
     </Border>
+    </ScrollViewer>
 </Window>
 "@
 
@@ -294,6 +352,38 @@ impl GuiDialog {
             $btnAllow = $win.FindName("BtnAllow")
             $btnDeny = $win.FindName("BtnDeny")
             $txtCountdown = $win.FindName("TxtCountdown")
+            $txtCountdown.Text = $CountdownFmt -f $Timeout
+
+            # Populate text as runtime objects (no XAML parsing -> no injection)
+            $reasonRun = New-Object System.Windows.Documents.Run($effectiveReason)
+            $win.FindName("ReasonPara").Inlines.Add($reasonRun)
+            $cmdRun = New-Object System.Windows.Documents.Run($Command)
+            $win.FindName("CmdPara").Inlines.Add($cmdRun)
+
+            # Dynamic no-wrap: PageWidth tracks the widest line so short
+            # commands show NO horizontal scrollbar while long lines stay
+            # unwrapped and scrollable. 700 approximates the visible width of
+            # the code box inside the 920px window.
+            if ($hasCommand) {
+                $longestLine = ($Command -split "`n" | Sort-Object Length -Descending | Select-Object -First 1)
+                $doc = $win.FindName("TxtCmd").Document
+                try {
+                    $tf = New-Object System.Windows.Media.Typeface("Consolas, Cascadia Code, Courier New")
+                    $ft = New-Object System.Windows.Media.FormattedText(
+                        $longestLine,
+                        [System.Globalization.CultureInfo]::CurrentUICulture,
+                        [System.Windows.FlowDirection]::LeftToRight,
+                        $tf, 12.5,
+                        [System.Windows.Media.Brushes]::Black,
+                        1.0)
+                    $needed = [Math]::Ceiling($ft.Width) + 56
+                    if ($needed -gt 700) { $doc.PageWidth = $needed } else { $doc.PageWidth = 660 }
+                } catch {
+                    # fallback: rough estimate if FormattedText is unavailable
+                    $len = [Math]::Max(1, $longestLine.Length)
+                    $doc.PageWidth = [Math]::Min(10000.0, $len * 7.5 + 56)
+                }
+            }
 
             $result = 1
 
@@ -307,7 +397,7 @@ impl GuiDialog {
                 $win.Close()
             })
 
-            $win.Add_KeyDown({
+            $win.Add_PreviewKeyDown({
                 param($s, $e)
                 if ($e.Key -eq [System.Windows.Input.Key]::Escape) {
                     $script:result = 1
@@ -320,7 +410,29 @@ impl GuiDialog {
 
             $win.Add_MouseLeftButtonDown({
                 param($s, $e)
-                $win.DragMove()
+                # Allow text selection inside the (read-only, selectable)
+                # TextBoxes — only drag the window from non-text areas.
+                # OriginalSource is often an inner template element, so walk
+                # the visual tree to detect any ancestor TextBox.
+                $src = $e.OriginalSource
+                $inTextBox = $false
+                while ($src -ne $null) {
+                    if ($src -is [System.Windows.Controls.Primitives.TextBoxBase]) { $inTextBox = $true; break }
+                    $src = [System.Windows.Media.VisualTreeHelper]::GetParent($src)
+                }
+                if (-not $inTextBox) { $win.DragMove() }
+            })
+
+            # Double-click inside text selects the whole paragraph for easy copy.
+            $win.Add_PreviewMouseLeftButtonDown({
+                param($s, $e)
+                if ($e.ClickCount -ge 2) {
+                    $src = $e.OriginalSource
+                    while ($src -ne $null) {
+                        if ($src -is [System.Windows.Controls.Primitives.TextBoxBase]) { $src.SelectAll(); break }
+                        $src = [System.Windows.Media.VisualTreeHelper]::GetParent($src)
+                    }
+                }
             })
 
             $script:remaining = $Timeout
@@ -328,7 +440,7 @@ impl GuiDialog {
             $timer.Interval = [TimeSpan]::FromSeconds(1)
             $timer.Add_Tick({
                 $script:remaining--
-                $txtCountdown.Text = "剩余 $script:remaining 秒自动拒绝"
+                $txtCountdown.Text = $CountdownFmt -f $script:remaining
                 if ($script:remaining -le 0) {
                     $timer.Stop()
                     $script:result = 1
@@ -354,6 +466,14 @@ impl GuiDialog {
             .env("AI_HOOK_DLG_CMD", command)
             .env("AI_HOOK_DLG_AGENT", agent)
             .env("AI_HOOK_DLG_TIMEOUT", timeout_sec.to_string())
+            .env(
+                "AI_HOOK_DLG_LANG",
+                if crate::i18n::lang().is_zh() {
+                    "zh"
+                } else {
+                    "en"
+                },
+            )
             .status();
 
         match status {
@@ -363,23 +483,43 @@ impl GuiDialog {
     }
 
     #[cfg(target_os = "macos")]
+    #[cfg(target_os = "macos")]
     fn prompt_macos_native(title: &str, body: &str, timeout_sec: u32) -> bool {
-        let clean_title = title.replace('"', "\\\"");
-        let clean_body = body.replace('"', "\\\"");
+        // Escape the text for embedding inside an AppleScript string literal.
+        // Backslash MUST be escaped before quotes: a raw '\' followed by '"'
+        // would otherwise close the string early and inject AppleScript code
+        // (title/command originate from rules or the agent, not from us).
+        fn apple_escape(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        let clean_title = apple_escape(title);
+        let clean_body = apple_escape(body);
+        // Strings come from the centralized message table (M011 gate title,
+        // M013 timeout note, AllowWord/DenyWord button labels).
+        let gate_title = t(Msg::M011);
+        let timeout_hint = tf(Msg::M013, &[&timeout_sec.to_string()]);
+        let allow_label = t(Msg::AllowWord);
+        let deny_label = t(Msg::DenyWord);
+        let expected = format!("button returned:{}", allow_label);
         let script = format!(
-            "display dialog \"{}\n\n即将执行：\n{}\n\n({} 秒内无响应将自动拒绝)\" with title \"安全门禁授权\" buttons {{\"拒绝\", \"允许\"}} default button \"拒绝\" cancel button \"拒绝\" with icon caution giving up after {}",
-            clean_title, clean_body, timeout_sec, timeout_sec
+            "display dialog \"{}\n\n{}\n\n{}\" with title \"{}\" buttons {{\"{}\", \"{}\"}} default button \"{}\" cancel button \"{}\" with icon caution giving up after {}",
+            clean_title,
+            clean_body,
+            timeout_hint,
+            gate_title,
+            deny_label,
+            allow_label,
+            deny_label,
+            deny_label,
+            timeout_sec
         );
 
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output();
+        let output = Command::new("osascript").arg("-e").arg(&script).output();
 
         match output {
             Ok(out) => {
                 let res = String::from_utf8_lossy(&out.stdout);
-                res.contains("button returned:允许")
+                res.contains(expected)
             }
             Err(_) => false,
         }
@@ -387,11 +527,15 @@ impl GuiDialog {
 
     #[cfg(target_os = "linux")]
     fn prompt_linux_native(title: &str, body: &str, timeout_sec: u32) -> bool {
+        let gate_title = t(Msg::M011);
+        let question = format!("{}\n\n{}", body, t(Msg::M012));
+        let timeout_note = tf(Msg::M013, &[&timeout_sec.to_string()]);
+
         // Try zenity modern GTK dialog first
         let status = Command::new("zenity")
             .arg("--question")
-            .arg(format!("--title=安全门禁授权: {}", title))
-            .arg(format!("--text=即将执行：\n\n{}\n\n是否授权继续执行？\n({} 秒内无响应将自动拒绝)", body, timeout_sec))
+            .arg(format!("--title={}: {}", gate_title, title))
+            .arg(format!("--text={}\n\n{}", question, timeout_note))
             .arg(format!("--timeout={}", timeout_sec))
             .arg("--default-cancel")
             .status();
@@ -400,11 +544,17 @@ impl GuiDialog {
             return s.success();
         }
 
-        let kdialog_status = Command::new("kdialog")
+        // kdialog has no CLI timeout; wrap it with coreutils `timeout` so the
+        // "auto-reject after N seconds" contract holds on every platform.
+        // If `timeout` is unavailable the spawn fails -> false (deny), which is
+        // the safe direction.
+        let kdialog_status = Command::new("timeout")
+            .arg(timeout_sec.to_string())
+            .arg("kdialog")
             .arg("--title")
-            .arg("安全门禁授权")
+            .arg(gate_title)
             .arg("--yesno")
-            .arg(format!("即将执行：\n\n{}\n\n是否授权继续执行？", body))
+            .arg(format!("{}\n\n{}", question, timeout_note))
             .status();
 
         match kdialog_status {

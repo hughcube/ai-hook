@@ -13,22 +13,24 @@ export default function(ctx, sys) {
   // =========================================================================
   // 1. 获取当前是什么类型的 AI Agent
   // =========================================================================
-  // ctx.agent / ctx.agentType 可取值：
+  // ctx.agent 可取值：
   // - "antigravity" : Google Antigravity
   // - "claude_code"  : Anthropic Claude Code
   // - "codebuddy"    : CodeBuddy
   // - "codex"        : OpenAI Codex
   // - "generic"      : 通用/其他未知 Agent
-  console.log(`[Demo] 当前 AI Agent: ${ctx.agent} (agentType: ${ctx.agentType})`);
+  console.log(`[Demo] 当前 AI Agent: ${ctx.agent}`);
 
   // =========================================================================
   // 2. 获取 AI 原始输入与工具上下文
   // =========================================================================
   // ctx.raw      : 宿主传入的完整原始 payload（已自动反序列化为 JS 对象）
   // ctx.rawInput : 宿主传入的原始 JSON 字符串
-  // ctx.tool     : 当前调用的工具名称（如 "run_command", "write_to_file"）
-  // ctx.cmd      : 命令行指令文本（如果是 run_command 等命令行工具）
-  // ctx.file     : 目标文件路径（如果是文件读写工具）
+  // ctx.tool     : 当前调用的工具名称（如 "Bash", "run_command", "Write"）
+  // ctx.cmd      : 命令行指令文本；仅命令类工具非 null
+  // ctx.file     : { path, action } 仅文件类工具非 null；action: read|write|edit|delete|list
+  // ctx.session  : { id, transcriptPath } 会话与对话记录（宿主提供时）
+  // ctx.mode     : 宿主权限模式 default|plan|acceptEdits|dontAsk|bypassPermissions
   // ctx.cwd      : 当前工作目录
   // ctx.args     : 工具调用的完整参数对象（如 ctx.args.CommandLine, ctx.args.TargetFile）
   // ctx.isYolo   : 是否处于免确认/自动授权模式 (YOLO mode)
@@ -54,6 +56,21 @@ export default function(ctx, sys) {
 
   // 3.4 环境变量获取
   const appEnv = sys.env("APP_ENV") || "local";
+
+  // 3.5 文件操作语义化防护 (ctx.file.action)：写敏感文件直接拒绝
+  if (ctx.file && ctx.file.action === "write") {
+    const fp = ctx.file.path || "";
+    if (/\.env$|\.pem$|id_rsa|credentials\.json$/i.test(fp)) {
+      return {
+        action: "deny",
+        reason: `【文件门禁】禁止 AI 直接覆写敏感文件: ${fp}`
+      };
+    }
+  }
+
+  // 3.6 结构化日志 (sys.log)：默认进 stderr 与 ~/.ai-hook/logs/ 当日文件
+  if (ctx.file) sys.log("info", `file op: ${ctx.file.action} ${ctx.file.path || ""}`);
+  if (ctx.cmd) sys.log("debug", `cmd: ${ctx.cmd}`);
 
   // =========================================================================
   // 4. 决策控制：直接强制不通过 vs 弹窗确认 vs 终端确认 vs 放行
