@@ -274,7 +274,7 @@ Subprocess spawning is eliminated for standard reads. In addition, controlled co
 | `sys.cwd()` | `string` | Current working directory |
 | `sys.ruleDir` / `sys.__dirname` | `string` | Absolute directory path of the executing rule script |
 | `sys.rulePath` / `sys.__filename` | `string` | Absolute file path of the executing rule script |
-| `sys.exec(cmd, args?, opt?)` | `object` | **Command Execution**: execute external command/script (powers 0-token intercepts). Bypasses Windows WSL stub to target Git Bash. Returns `{ code, status, exitCode, stdout, stderr, success }` |
+| `sys.exec(target, args?, opt?)` | `object` | **Universal Execution Engine (macOS/Linux/Windows, 0 hardcoded paths)**: executes system commands in PATH, native binaries (ELF/Mach-O/PE exe directly executed), scripts and Shebangs (`#!/bin/sh`, `#!/usr/bin/env bash/zsh/python3/node`, etc. adaptively dispatched based on system environment without single-shell binding); returns `{ code, status, exitCode, stdout, stderr, success }` |
 | `sys.http.get(url, opt?)` | `object` | **Lightweight HTTP GET**: supports `headers`/`timeout`, returns `{ status, ok, headers, body }` |
 | `sys.http.post(url, opt?)` | `object` | **Lightweight HTTP POST**: supports `headers`/`body`/`timeout`, returns `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | Debug logging to stderr (never corrupts decision JSON) |

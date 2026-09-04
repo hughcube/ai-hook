@@ -1193,6 +1193,88 @@ fn test_sys_exec_api() {
 }
 
 #[test]
+fn test_sys_exec_script_file_auto_resolve() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let tmp = std::env::temp_dir().join(format!("ai-hook-script-resolve-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let script_path = tmp.join("test_run.bat");
+    std::fs::write(&script_path, "@echo off\r\necho script-auto-resolve-ok %1\r\n").expect("write bat");
+    let script_str = script_path.to_string_lossy().replace('\\', "/");
+
+    let rule_content = format!(
+        r#"export default function(ctx, sys) {{
+            let res = sys.exec("{}", ["test_arg"]);
+            if (res.status !== 0 || !res.stdout.includes("script-auto-resolve-ok test_arg")) {{
+                return {{ action: "deny", reason: "exec failed: " + JSON.stringify(res) }};
+            }}
+            return null;
+        }}"#,
+        script_str
+    );
+
+    let script_rule = rule("test-script-resolve", &rule_content);
+    let ctx = ctx_for("test");
+    let (dec, _) = runner.evaluate_all(&[script_rule], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(dec, HookDecision::Allow);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_sys_exec_sh_shebang_auto_resolve() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let tmp = std::env::temp_dir().join(format!("ai-hook-sh-shebang-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let script_path = tmp.join("test_sh.sh");
+    std::fs::write(&script_path, "#!/bin/sh\necho sh-shebang-ok $1\n").expect("write sh");
+    let script_str = script_path.to_string_lossy().replace('\\', "/");
+
+    let rule_content = format!(
+        r#"export default function(ctx, sys) {{
+            let res = sys.exec("{}", ["arg_val"]);
+            if (res.status !== 0 || !res.stdout.includes("sh-shebang-ok arg_val")) {{
+                return {{ action: "deny", reason: "exec failed: " + JSON.stringify(res) }};
+            }}
+            return null;
+        }}"#,
+        script_str
+    );
+
+    let script_rule = rule("test-sh-shebang", &rule_content);
+    let ctx = ctx_for("test");
+    let (dec, _) = runner.evaluate_all(&[script_rule], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(dec, HookDecision::Allow);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_sys_exec_env_shebang_auto_resolve() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let tmp = std::env::temp_dir().join(format!("ai-hook-env-shebang-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let script_path = tmp.join("test_env.sh");
+    std::fs::write(&script_path, "#!/usr/bin/env sh\necho env-shebang-ok $1\n").expect("write env sh");
+    let script_str = script_path.to_string_lossy().replace('\\', "/");
+
+    let rule_content = format!(
+        r#"export default function(ctx, sys) {{
+            let res = sys.exec("{}", ["env_val"]);
+            if (res.status !== 0 || !res.stdout.includes("env-shebang-ok env_val")) {{
+                return {{ action: "deny", reason: "exec failed: " + JSON.stringify(res) }};
+            }}
+            return null;
+        }}"#,
+        script_str
+    );
+
+    let script_rule = rule("test-env-shebang", &rule_content);
+    let ctx = ctx_for("test");
+    let (dec, _) = runner.evaluate_all(&[script_rule], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(dec, HookDecision::Allow);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+
+#[test]
 fn test_sys_http_api_exposed() {
     let runner = RuleRunner::new().expect("Failed to initialize runner");
     let http_rule = rule(

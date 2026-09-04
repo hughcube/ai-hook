@@ -274,9 +274,7 @@ export default function(ctx, sys) {
 | `sys.env("KEY")` | `string?` | **< 1 µs** 获取宿主环境变量，亦可使用 `sys.env.get("KEY")` |
 | `sys.cwd()` | `string` | 获取当前工作目录 |
 | `sys.ruleDir` / `sys.__dirname` | `string` | 当前规则脚本所在目录的绝对路径 |
-| `sys.rulePath` / `sys.__filename` | `string` | 当前规则脚本文件的绝对路径 |
-| `sys.exec(cmd, args?, opt?)` | `object` | **进程调度**：执行外部命令/脚本（专为 0 Token 拦截加速），支持 `cwd`/`env`/`input`，Windows 自动防 WSL 存根劫持定位 Git Bash；返回 `{ code, status, exitCode, stdout, stderr, success }` |
-| `sys.http.get(url, opt?)` | `object` | **轻量同步 HTTP**：支持 `headers`/`timeout`，返回 `{ status, ok, headers, body }` |
+| `sys.exec(target, args?, opt?)` | `object` | **通用命令/脚本/二进制调度（macOS/Linux/Windows 跨平台原生通用，零写死路径）**：支持系统 PATH 中任意命令、原生二进制（ELF/Mach-O/PE 直接原生执行）、任意脚本与 Shebang（`#!/bin/sh`、`#!/usr/bin/env bash/zsh/python3/node` 等，根据系统环境变量与可用解释器智能自适应调度，不绑定任何单一 shell 或特定安装路径）；支持 `cwd`/`env`/`input`；返回 `{ code, status, exitCode, stdout, stderr, success }` |
 | `sys.http.post(url, opt?)` | `object` | **轻量同步 HTTP POST**：支持 `headers`/`body`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | 调试日志到 stderr(绝不污染决策 JSON) |
 | `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义) |

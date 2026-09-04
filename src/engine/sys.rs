@@ -214,24 +214,26 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
         move |ctx: Ctx<'js>,
               cmd: String,
               args: rquickjs::function::Opt<Vec<String>>,
-              options: rquickjs::function::Opt<Object<'js>>|
-              -> Result<Object<'js>> {
-            let exec_cmd = if cfg!(windows) && cmd.eq_ignore_ascii_case("bash") {
-                resolve_windows_bash(&cmd)
-            } else {
-                cmd
-            };
-            let mut cmd_obj = std::process::Command::new(&exec_cmd);
-            if let Some(a) = args.0 {
-                cmd_obj.args(a);
-            }
+              options: rquickjs::function::Opt<Object<'js>>| -> Result<Object<'js>> {
+            let raw_args = args.0.unwrap_or_default();
             let mut opt_input = None;
-            if let Some(opt) = options.0 {
+            let mut target_cwd = sys_for_exec.cwd.clone();
+
+            if let Some(ref opt) = options.0 {
                 if let Ok(cwd_val) = opt.get::<_, String>("cwd") {
-                    cmd_obj.current_dir(sys_for_exec.resolve_path(&cwd_val));
-                } else {
-                    cmd_obj.current_dir(&sys_for_exec.cwd);
+                    target_cwd = sys_for_exec.resolve_path(&cwd_val);
                 }
+                if let Ok(inp) = opt.get::<_, String>("input") {
+                    opt_input = Some(inp);
+                }
+            }
+
+            let resolved = resolve_executable(&cmd, raw_args, &target_cwd);
+            let mut cmd_obj = std::process::Command::new(&resolved.program);
+            cmd_obj.args(&resolved.args);
+            cmd_obj.current_dir(&target_cwd);
+
+            if let Some(ref opt) = options.0 {
                 if let Ok(env_obj) = opt.get::<_, Object<'js>>("env") {
                     for key in env_obj.keys::<String>() {
                         if let Ok(k) = key {
@@ -241,11 +243,6 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                         }
                     }
                 }
-                if let Ok(inp) = opt.get::<_, String>("input") {
-                    opt_input = Some(inp);
-                }
-            } else {
-                cmd_obj.current_dir(&sys_for_exec.cwd);
             }
 
             cmd_obj.stdout(std::process::Stdio::piped());
@@ -407,29 +404,351 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     Ok(sys)
 }
 
-#[cfg(windows)]
-fn resolve_windows_bash(fallback: &str) -> String {
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let dir_str = dir.to_string_lossy();
-            if dir_str.to_ascii_lowercase().contains("system32") {
-                continue;
+#[derive(Debug, Clone)]
+pub struct ResolvedCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+pub fn resolve_executable(cmd: &str, raw_args: Vec<String>, cwd: &Path) -> ResolvedCommand {
+    let direct_path = Path::new(cmd);
+    let candidate_file = if direct_path.is_absolute() {
+        if direct_path.is_file() {
+            Some(direct_path.to_path_buf())
+        } else {
+            None
+        }
+    } else {
+        let joined = cwd.join(direct_path);
+        if joined.is_file() {
+            Some(joined)
+        } else if direct_path.is_file() {
+            Some(direct_path.to_path_buf())
+        } else {
+            None
+        }
+    };
+
+    if let Some(file_path) = candidate_file {
+        return resolve_script_or_binary_file(&file_path, raw_args);
+    }
+
+    resolve_command_name(cmd, raw_args)
+}
+
+fn is_binary_executable(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext == "exe" {
+        return true;
+    }
+
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let mut magic = [0u8; 4];
+        if let Ok(n) = f.read(&mut magic) {
+            if n >= 2 && magic[0] == b'M' && magic[1] == b'Z' {
+                return true;
             }
-            let candidate = dir.join("bash.exe");
-            if candidate.is_file() {
-                return candidate.to_string_lossy().to_string();
+            if n >= 4 {
+                if magic == [0x7f, b'E', b'L', b'F'] {
+                    return true;
+                }
+                if magic == [0xFE, 0xED, 0xFA, 0xCE]
+                    || magic == [0xCE, 0xFA, 0xED, 0xFE]
+                    || magic == [0xFE, 0xED, 0xFA, 0xCF]
+                    || magic == [0xCF, 0xFA, 0xED, 0xFE]
+                    || magic == [0xCA, 0xFE, 0xBA, 0xBE]
+                    || magic == [0xBE, 0xBA, 0xFE, 0xCA]
+                {
+                    return true;
+                }
             }
         }
     }
-    let default_git_bash = std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe");
-    if default_git_bash.is_file() {
-        return default_git_bash.to_string_lossy().to_string();
-    }
-    fallback.to_string()
+    false
 }
 
-#[cfg(not(windows))]
-fn resolve_windows_bash(fallback: &str) -> String {
-    fallback.to_string()
+struct ShebangInfo {
+    interpreter: String,
+    flags: Vec<String>,
+}
+
+fn parse_shebang(path: &Path) -> Option<ShebangInfo> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 512];
+    let n = file.read(&mut buf).ok()?;
+    if n < 3 || buf[0] != b'#' || buf[1] != b'!' {
+        return None;
+    }
+
+    let header = String::from_utf8_lossy(&buf[..n]);
+    let first_line = header.lines().next()?;
+    let line_content = first_line.trim_start_matches("#!").trim();
+    if line_content.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = line_content.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut interp_raw = parts[0];
+    let mut flags = Vec::new();
+
+    if interp_raw.ends_with("/env") || interp_raw == "env" {
+        if parts.len() > 1 {
+            interp_raw = parts[1];
+            for &p in &parts[2..] {
+                flags.push(p.to_string());
+            }
+        }
+    } else {
+        for &p in &parts[1..] {
+            flags.push(p.to_string());
+        }
+    }
+
+    let interp_name = Path::new(interp_raw)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(interp_raw)
+        .to_string();
+
+    Some(ShebangInfo {
+        interpreter: interp_name,
+        flags,
+    })
+}
+
+fn find_in_path(cmd_name: &str) -> Option<String> {
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(cmd_name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+        #[cfg(windows)]
+        {
+            if !cmd_name.ends_with(".exe") {
+                let exe = dir.join(format!("{}.exe", cmd_name));
+                if exe.is_file() {
+                    return Some(exe.to_string_lossy().to_string());
+                }
+                let cmd = dir.join(format!("{}.cmd", cmd_name));
+                if cmd.is_file() {
+                    return Some(cmd.to_string_lossy().to_string());
+                }
+                let bat = dir.join(format!("{}.bat", cmd_name));
+                if bat.is_file() {
+                    return Some(bat.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> ResolvedCommand {
+    if is_binary_executable(file_path) {
+        return ResolvedCommand {
+            program: file_path.to_string_lossy().to_string(),
+            args: raw_args,
+        };
+    }
+
+    let ext = file_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // PowerShell 脚本 (.ps1)
+    if ext == "ps1" {
+        let ps_exe = find_in_path("pwsh")
+            .or_else(|| find_in_path("powershell"))
+            .unwrap_or_else(|| "pwsh".to_string());
+        #[cfg(windows)]
+        let mut args = vec![
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            file_path.to_string_lossy().to_string(),
+        ];
+        #[cfg(not(windows))]
+        let mut args = vec![
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            file_path.to_string_lossy().to_string(),
+        ];
+        args.extend(raw_args);
+        return ResolvedCommand {
+            program: ps_exe,
+            args,
+        };
+    }
+
+    // Windows 批处理脚本 (.bat / .cmd)
+    if ext == "bat" || ext == "cmd" {
+        let cmd_exe = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut args = vec!["/c".to_string(), file_path.to_string_lossy().to_string()];
+        args.extend(raw_args);
+        return ResolvedCommand {
+            program: cmd_exe,
+            args,
+        };
+    }
+
+    // Python 脚本 (.py)
+    if ext == "py" {
+        let py_prog = find_in_path("python3")
+            .or_else(|| find_in_path("python"))
+            .unwrap_or_else(|| "python".to_string());
+        let mut args = vec![file_path.to_string_lossy().to_string()];
+        args.extend(raw_args);
+        return ResolvedCommand {
+            program: py_prog,
+            args,
+        };
+    }
+
+    // 解析 Shebang
+    let shebang = parse_shebang(file_path);
+
+    #[cfg(not(windows))]
+    {
+        if let Some(sb) = shebang {
+            let mut args = sb.flags;
+            args.push(file_path.to_string_lossy().to_string());
+            args.extend(raw_args);
+            return ResolvedCommand {
+                program: sb.interpreter,
+                args,
+            };
+        } else if ext == "zsh" {
+            let mut args = vec![file_path.to_string_lossy().to_string()];
+            args.extend(raw_args);
+            return ResolvedCommand {
+                program: "zsh".to_string(),
+                args,
+            };
+        } else if ext == "sh" {
+            let mut args = vec![file_path.to_string_lossy().to_string()];
+            args.extend(raw_args);
+            return ResolvedCommand {
+                program: "sh".to_string(),
+                args,
+            };
+        }
+        return ResolvedCommand {
+            program: file_path.to_string_lossy().to_string(),
+            args: raw_args,
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        let target_interp = if let Some(ref sb) = shebang {
+            sb.interpreter.to_ascii_lowercase()
+        } else if ext == "zsh" {
+            "zsh".to_string()
+        } else if ext == "sh" {
+            "sh".to_string()
+        } else {
+            return ResolvedCommand {
+                program: file_path.to_string_lossy().to_string(),
+                args: raw_args,
+            };
+        };
+
+        if target_interp != "bash" && target_interp != "zsh" && target_interp != "sh" {
+            let prog = find_in_path(&target_interp).unwrap_or(target_interp);
+            let mut args = shebang.map(|s| s.flags).unwrap_or_default();
+            args.push(file_path.to_string_lossy().to_string());
+            args.extend(raw_args);
+            return ResolvedCommand {
+                program: prog,
+                args,
+            };
+        }
+
+        let shell_prog = find_windows_posix_shell(&target_interp);
+        let mut args = shebang.map(|s| s.flags).unwrap_or_default();
+        args.push(file_path.to_string_lossy().replace('\\', "/"));
+        args.extend(raw_args);
+        ResolvedCommand {
+            program: shell_prog,
+            args,
+        }
+    }
+}
+
+fn resolve_command_name(cmd: &str, raw_args: Vec<String>) -> ResolvedCommand {
+    #[cfg(windows)]
+    {
+        let lower = cmd.to_ascii_lowercase();
+        let stripped = lower.strip_suffix(".exe").unwrap_or(&lower);
+        if stripped == "bash" || stripped == "zsh" || stripped == "sh" {
+            let shell_prog = find_windows_posix_shell(stripped);
+            return ResolvedCommand {
+                program: shell_prog,
+                args: raw_args,
+            };
+        }
+    }
+
+    ResolvedCommand {
+        program: cmd.to_string(),
+        args: raw_args,
+    }
+}
+
+#[cfg(windows)]
+fn find_windows_posix_shell(preferred: &str) -> String {
+    let search_order: Vec<&str> = match preferred {
+        "zsh" => vec!["zsh", "bash", "sh"],
+        "bash" => vec!["bash", "sh", "zsh"],
+        "sh" => vec!["sh", "bash", "zsh"],
+        other => vec![other, "bash", "sh", "zsh"],
+    };
+
+    if let Ok(shell_env) = std::env::var("SHELL") {
+        let shell_path = Path::new(&shell_env);
+        if shell_path.is_file() {
+            let shell_name = shell_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if search_order.contains(&shell_name.as_str()) {
+                return shell_env;
+            }
+        }
+    }
+
+    for &target in &search_order {
+        let exe_name = format!("{}.exe", target);
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let dir_str = dir.to_string_lossy().to_ascii_lowercase();
+                if dir_str.contains("system32") {
+                    continue;
+                }
+                let candidate = dir.join(&exe_name);
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+
+    preferred.to_string()
 }
 
