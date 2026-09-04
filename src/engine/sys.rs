@@ -253,16 +253,17 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                 cmd_obj.stdin(std::process::Stdio::null());
             }
 
+            use command_group::CommandGroup;
             let result_obj = Object::new(ctx)?;
-            match cmd_obj.spawn() {
-                Ok(mut child) => {
+            match cmd_obj.group_spawn() {
+                Ok(mut group_child) => {
                     if let Some(input_str) = opt_input {
-                        if let Some(mut stdin) = child.stdin.take() {
+                        if let Some(mut stdin) = group_child.inner().stdin.take() {
                             use std::io::Write;
                             let _ = stdin.write_all(input_str.as_bytes());
                         }
                     }
-                    match child.wait_with_output() {
+                    match group_child.wait_with_output() {
                         Ok(output) => {
                             let code = output.status.code().unwrap_or(-1);
                             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -430,10 +431,10 @@ pub fn resolve_executable(cmd: &str, raw_args: Vec<String>, cwd: &Path) -> Resol
     };
 
     if let Some(file_path) = candidate_file {
-        return resolve_script_or_binary_file(&file_path, raw_args);
+        return resolve_script_or_binary_file(&file_path, raw_args, cwd);
     }
 
-    resolve_command_name(cmd, raw_args)
+    resolve_command_name(cmd, raw_args, cwd)
 }
 
 fn is_binary_executable(path: &Path) -> bool {
@@ -494,68 +495,84 @@ fn parse_shebang(path: &Path) -> Option<ShebangInfo> {
         return None;
     }
 
-    let parts: Vec<&str> = line_content.split_whitespace().collect();
+    let mut parts = shlex::split(line_content)?;
     if parts.is_empty() {
         return None;
     }
 
-    let mut interp_raw = parts[0];
-    let mut flags = Vec::new();
-
+    let mut interp_raw = parts.remove(0);
     if interp_raw.ends_with("/env") || interp_raw == "env" {
-        if parts.len() > 1 {
-            interp_raw = parts[1];
-            for &p in &parts[2..] {
-                flags.push(p.to_string());
-            }
+        if !parts.is_empty() && parts[0] == "-S" {
+            parts.remove(0);
         }
-    } else {
-        for &p in &parts[1..] {
-            flags.push(p.to_string());
+        if !parts.is_empty() {
+            interp_raw = parts.remove(0);
         }
     }
 
-    let interp_name = Path::new(interp_raw)
+    let interp_name = Path::new(&interp_raw)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or(interp_raw)
+        .unwrap_or(&interp_raw)
         .to_string();
 
     Some(ShebangInfo {
         interpreter: interp_name,
-        flags,
+        flags: parts,
     })
 }
 
-fn find_in_path(cmd_name: &str) -> Option<String> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(cmd_name);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
+fn find_executable_in_path(cmd_name: &str, cwd: &Path) -> Option<String> {
+    if let Ok(p) = which::which_in(cmd_name, std::env::var_os("PATH"), cwd) {
         #[cfg(windows)]
         {
-            if !cmd_name.ends_with(".exe") {
-                let exe = dir.join(format!("{}.exe", cmd_name));
-                if exe.is_file() {
-                    return Some(exe.to_string_lossy().to_string());
-                }
-                let cmd = dir.join(format!("{}.cmd", cmd_name));
-                if cmd.is_file() {
-                    return Some(cmd.to_string_lossy().to_string());
-                }
-                let bat = dir.join(format!("{}.bat", cmd_name));
-                if bat.is_file() {
-                    return Some(bat.to_string_lossy().to_string());
-                }
+            if cmd_name.eq_ignore_ascii_case("bash")
+                && p.to_string_lossy().to_ascii_lowercase().contains("system32")
+            {
+                // 跳过 WSL System32 存根
+            } else {
+                return Some(p.to_string_lossy().to_string());
             }
         }
+        #[cfg(not(windows))]
+        {
+            return Some(p.to_string_lossy().to_string());
+        }
     }
+
+    // 在精简 Linux 容器（如 Alpine）中缺少 bash 时平滑降级至 sh
+    if cmd_name == "bash" {
+        if let Ok(p) = which::which_in("sh", std::env::var_os("PATH"), cwd) {
+            return Some(p.to_string_lossy().to_string());
+        }
+    }
+
+    if cmd_name == "zsh" {
+        if let Ok(p) = which::which_in("bash", std::env::var_os("PATH"), cwd) {
+            #[cfg(windows)]
+            {
+                if !p.to_string_lossy().to_ascii_lowercase().contains("system32") {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        if let Ok(p) = which::which_in("sh", std::env::var_os("PATH"), cwd) {
+            return Some(p.to_string_lossy().to_string());
+        }
+    }
+
     None
 }
 
-fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> ResolvedCommand {
+fn resolve_script_or_binary_file(
+    file_path: &Path,
+    raw_args: Vec<String>,
+    cwd: &Path,
+) -> ResolvedCommand {
     if is_binary_executable(file_path) {
         return ResolvedCommand {
             program: file_path.to_string_lossy().to_string(),
@@ -569,10 +586,10 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // PowerShell 脚本 (.ps1)
+    // 1. PowerShell 脚本 (.ps1)
     if ext == "ps1" {
-        let ps_exe = find_in_path("pwsh")
-            .or_else(|| find_in_path("powershell"))
+        let ps_exe = find_executable_in_path("pwsh", cwd)
+            .or_else(|| find_executable_in_path("powershell", cwd))
             .unwrap_or_else(|| "pwsh".to_string());
         #[cfg(windows)]
         let mut args = vec![
@@ -595,7 +612,7 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
         };
     }
 
-    // Windows 批处理脚本 (.bat / .cmd)
+    // 2. Windows 批处理脚本 (.bat / .cmd)
     if ext == "bat" || ext == "cmd" {
         let cmd_exe = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut args = vec!["/c".to_string(), file_path.to_string_lossy().to_string()];
@@ -606,10 +623,10 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
         };
     }
 
-    // Python 脚本 (.py)
+    // 3. Python 脚本 (.py)
     if ext == "py" {
-        let py_prog = find_in_path("python3")
-            .or_else(|| find_in_path("python"))
+        let py_prog = find_executable_in_path("python3", cwd)
+            .or_else(|| find_executable_in_path("python", cwd))
             .unwrap_or_else(|| "python".to_string());
         let mut args = vec![file_path.to_string_lossy().to_string()];
         args.extend(raw_args);
@@ -619,31 +636,34 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
         };
     }
 
-    // 解析 Shebang
+    // 4. 解析 Shebang
     let shebang = parse_shebang(file_path);
 
     #[cfg(not(windows))]
     {
         if let Some(sb) = shebang {
+            let interp = find_executable_in_path(&sb.interpreter, cwd).unwrap_or(sb.interpreter);
             let mut args = sb.flags;
             args.push(file_path.to_string_lossy().to_string());
             args.extend(raw_args);
             return ResolvedCommand {
-                program: sb.interpreter,
+                program: interp,
                 args,
             };
         } else if ext == "zsh" {
+            let interp = find_executable_in_path("zsh", cwd).unwrap_or_else(|| "zsh".to_string());
             let mut args = vec![file_path.to_string_lossy().to_string()];
             args.extend(raw_args);
             return ResolvedCommand {
-                program: "zsh".to_string(),
+                program: interp,
                 args,
             };
         } else if ext == "sh" {
+            let interp = find_executable_in_path("sh", cwd).unwrap_or_else(|| "sh".to_string());
             let mut args = vec![file_path.to_string_lossy().to_string()];
             args.extend(raw_args);
             return ResolvedCommand {
-                program: "sh".to_string(),
+                program: interp,
                 args,
             };
         }
@@ -669,7 +689,7 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
         };
 
         if target_interp != "bash" && target_interp != "zsh" && target_interp != "sh" {
-            let prog = find_in_path(&target_interp).unwrap_or(target_interp);
+            let prog = find_executable_in_path(&target_interp, cwd).unwrap_or(target_interp);
             let mut args = shebang.map(|s| s.flags).unwrap_or_default();
             args.push(file_path.to_string_lossy().to_string());
             args.extend(raw_args);
@@ -679,7 +699,7 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
             };
         }
 
-        let shell_prog = find_windows_posix_shell(&target_interp);
+        let shell_prog = find_windows_posix_shell(&target_interp, cwd);
         let mut args = shebang.map(|s| s.flags).unwrap_or_default();
         args.push(file_path.to_string_lossy().replace('\\', "/"));
         args.extend(raw_args);
@@ -690,13 +710,13 @@ fn resolve_script_or_binary_file(file_path: &Path, raw_args: Vec<String>) -> Res
     }
 }
 
-fn resolve_command_name(cmd: &str, raw_args: Vec<String>) -> ResolvedCommand {
+fn resolve_command_name(cmd: &str, raw_args: Vec<String>, cwd: &Path) -> ResolvedCommand {
     #[cfg(windows)]
     {
         let lower = cmd.to_ascii_lowercase();
         let stripped = lower.strip_suffix(".exe").unwrap_or(&lower);
         if stripped == "bash" || stripped == "zsh" || stripped == "sh" {
-            let shell_prog = find_windows_posix_shell(stripped);
+            let shell_prog = find_windows_posix_shell(stripped, cwd);
             return ResolvedCommand {
                 program: shell_prog,
                 args: raw_args,
@@ -711,14 +731,7 @@ fn resolve_command_name(cmd: &str, raw_args: Vec<String>) -> ResolvedCommand {
 }
 
 #[cfg(windows)]
-fn find_windows_posix_shell(preferred: &str) -> String {
-    let search_order: Vec<&str> = match preferred {
-        "zsh" => vec!["zsh", "bash", "sh"],
-        "bash" => vec!["bash", "sh", "zsh"],
-        "sh" => vec!["sh", "bash", "zsh"],
-        other => vec![other, "bash", "sh", "zsh"],
-    };
-
+fn find_windows_posix_shell(preferred: &str, cwd: &Path) -> String {
     if let Ok(shell_env) = std::env::var("SHELL") {
         let shell_path = Path::new(&shell_env);
         if shell_path.is_file() {
@@ -727,24 +740,23 @@ fn find_windows_posix_shell(preferred: &str) -> String {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if search_order.contains(&shell_name.as_str()) {
+            if shell_name == "zsh" || shell_name == "bash" || shell_name == "sh" {
                 return shell_env;
             }
         }
     }
 
-    for &target in &search_order {
-        let exe_name = format!("{}.exe", target);
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                let dir_str = dir.to_string_lossy().to_ascii_lowercase();
-                if dir_str.contains("system32") {
-                    continue;
-                }
-                let candidate = dir.join(&exe_name);
-                if candidate.is_file() {
-                    return candidate.to_string_lossy().to_string();
-                }
+    let search_order: Vec<&str> = match preferred {
+        "zsh" => vec!["zsh", "bash", "sh"],
+        "bash" => vec!["bash", "sh", "zsh"],
+        "sh" => vec!["sh", "bash", "zsh"],
+        other => vec![other, "bash", "sh", "zsh"],
+    };
+
+    for target in search_order {
+        if let Some(path) = find_executable_in_path(target, cwd) {
+            if !path.to_ascii_lowercase().contains("system32") {
+                return path;
             }
         }
     }
