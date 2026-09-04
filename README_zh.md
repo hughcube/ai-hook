@@ -127,9 +127,9 @@ ai-hook install
 alias ai:hook="ai-hook"
 ```
 
-### 3. 在 Agent 宿主中启用
+### 3. 在 Agent 宿主中启用（支持传入多个脚本）
 
-在各 Agent 的全局配置（如 Antigravity `~/.gemini/config/hooks.json`）中只需添加一条调度入口：
+在各 Agent 的全局配置（如 Antigravity `~/.gemini/config/hooks.json`）中直接指定基座与要执行的多个规则脚本：
 
 ```json
 {
@@ -139,7 +139,7 @@ alias ai:hook="ai-hook"
       "hooks": [
         {
           "type": "command",
-          "command": "ai-hook",
+          "command": "ai-hook ~/.agents/plugins/dev/hooks/protect-db-migrate.js ~/.agents/plugins/rd/hooks/protect-prod-db-write.js",
           "timeout": 70
         }
       ]
@@ -148,14 +148,20 @@ alias ai:hook="ai-hook"
 }
 ```
 
+> **提示**：`ai-hook` 会精准仅执行所传入的这几个脚本，绝不发生全盘盲目扫描，单次调起全规则评估仅耗时 ~2ms。
+
+### 4. 弹窗与超时环境控制
+
+| 环境变量 / CLI 参数 | 默认值 | 作用说明 |
+| :--- | :--- | :--- |
+| `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | 倒计时弹窗秒数（超时自动拒绝关闭） |
+| `AI_HOOK_GUI` / `--no-gui` | `1` (开启) | 设置为 `0` 或 `false` 可完全静默关闭弹窗 |
+
 ---
 
 ## 📝 编写自定义规则
 
-规则文件采用标准 JavaScript (ES6+)，存放于下列任一目录即可被自动扫描发现：
-1. **项目本地规则**：`./.ai-hook/rules/*.js`
-2. **用户全局规则**：`~/.ai-hook/rules/*.js`
-3. **插件规则**：`~/.agents/plugins/<插件名>/hooks/*.js`
+规则文件采用标准 JavaScript (ES6+)，可通过命令行参数直接传递给 `ai-hook`。
 
 ### 规则契约与示例
 

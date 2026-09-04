@@ -12,19 +12,31 @@ fn main() {
     let args = Cli::parse();
 
     match args.command {
-        Some(Commands::List) => handle_list(&args),
+        Some(Commands::List { ref scripts }) => handle_list(&args, scripts),
         Some(Commands::Test {
             ref command,
             ref tool,
             ref file,
-        }) => handle_test(&args, command, tool, file),
+            ref scripts,
+        }) => handle_test(&args, command, tool, file, scripts),
         Some(Commands::Bench {
             iterations,
             ref command,
-        }) => handle_bench(&args, iterations, command),
+            ref scripts,
+        }) => handle_bench(&args, iterations, command, scripts),
         Some(Commands::Install { ref target_dir }) => handle_install(target_dir.clone()),
         None => handle_dispatch(&args),
     }
+}
+
+/// Gathers explicit script paths passed via positional arguments or --rule flags.
+fn collect_target_rules(args: &Cli, extra_scripts: Option<&[PathBuf]>) -> Vec<PathBuf> {
+    let mut targets = args.scripts.clone();
+    if let Some(extra) = extra_scripts {
+        targets.extend(extra.iter().cloned());
+    }
+    targets.extend(args.rule.iter().cloned());
+    targets
 }
 
 /// Main entry point for agent hook dispatching via stdin
@@ -47,13 +59,9 @@ fn handle_dispatch(args: &Cli) {
         return;
     }
 
-    // 2. Discover rules
-    let custom_paths = if args.rule.is_empty() {
-        None
-    } else {
-        Some(args.rule.as_slice())
-    };
-    let rules = RuleLoader::discover_rules(custom_paths);
+    // 2. Load explicit rules (no full-disk auto traversal)
+    let explicit_paths = collect_target_rules(args, None);
+    let rules = RuleLoader::load_rules(&explicit_paths);
 
     if rules.is_empty() {
         let output = HookDecision::Allow.to_json_output(&ctx, None);
@@ -81,14 +89,20 @@ fn handle_dispatch(args: &Cli) {
     // 4. Handle GUI confirmation if in YOLO/skip-permissions mode
     let mut gui_approved = None;
     if let HookDecision::Confirm { ref reason } = decision {
-        if ctx.is_yolo && !args.dry_run {
+        let gui_enabled = GuiDialog::is_enabled(args.no_gui);
+        let timeout = GuiDialog::resolve_timeout(args.timeout);
+
+        if ctx.is_yolo && gui_enabled && !args.dry_run {
             let prompt_target = if ctx.cmd.is_empty() {
                 &ctx.target_file
             } else {
                 &ctx.cmd
             };
-            let approved = GuiDialog::confirm(reason, prompt_target, 60);
+            let approved = GuiDialog::confirm(reason, prompt_target, timeout);
             gui_approved = Some(approved);
+        } else if ctx.is_yolo && !gui_enabled {
+            // If GUI is explicitly disabled in YOLO mode, reject for safety
+            gui_approved = Some(false);
         }
     }
 
@@ -98,24 +112,18 @@ fn handle_dispatch(args: &Cli) {
     }
 }
 
-fn handle_list(args: &Cli) {
-    let custom_paths = if args.rule.is_empty() {
-        None
-    } else {
-        Some(args.rule.as_slice())
-    };
-    let rules = RuleLoader::discover_rules(custom_paths);
+fn handle_list(args: &Cli, scripts: &[PathBuf]) {
+    let explicit_paths = collect_target_rules(args, Some(scripts));
+    let rules = RuleLoader::load_rules(&explicit_paths);
 
     println!("============================================================");
-    println!("  ai-hook Active Rules (Total: {})", rules.len());
+    println!("  ai-hook Target Rules (Total: {})", rules.len());
     println!("============================================================");
 
     if rules.is_empty() {
-        println!("  No active rule scripts found.");
-        println!("  Rules are discovered from:");
-        println!("    1. ./.ai-hook/rules/*.js (Project local)");
-        println!("    2. ~/.ai-hook/rules/*.js (User global)");
-        println!("    3. ~/.agents/plugins/*/hooks/*.js (Plugins)");
+        println!("  No active rule scripts specified.");
+        println!("  Pass script files explicitly: ai-hook [options] <script1.js> <script2.js>...");
+        println!("  Or place in project directory: ./.ai-hook/rules.js or ./.ai-hook/rules/");
         return;
     }
 
@@ -129,8 +137,8 @@ fn handle_list(args: &Cli) {
     }
 }
 
-fn handle_test(args: &Cli, command: &str, tool: &str, file: &str) {
-    println!("Testing command against all active security rules...");
+fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[PathBuf]) {
+    println!("Testing command against specified security rules...");
     println!("Target Command : {}", command);
     println!("Target Tool    : {}", tool);
     if !file.is_empty() {
@@ -165,12 +173,14 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str) {
         return;
     }
 
-    let custom_paths = if args.rule.is_empty() {
-        None
-    } else {
-        Some(args.rule.as_slice())
-    };
-    let rules = RuleLoader::discover_rules(custom_paths);
+    let explicit_paths = collect_target_rules(args, Some(scripts));
+    let rules = RuleLoader::load_rules(&explicit_paths);
+
+    if rules.is_empty() {
+        println!("⚠️ No rule scripts provided to test against.");
+        println!("Usage: ai-hook test <command> <script1.js> <script2.js>...");
+        return;
+    }
 
     let runner = match RuleRunner::new() {
         Ok(r) => r,
@@ -210,7 +220,7 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str) {
     println!("Total Duration : {:?}", total_elapsed);
 }
 
-fn handle_bench(args: &Cli, iterations: usize, command: &str) {
+fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf]) {
     println!("Running benchmark: {} iterations on '{}'", iterations, command);
 
     let cwd = std::env::current_dir()
@@ -230,12 +240,13 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str) {
     .to_string();
 
     let ctx = HookContext::parse(&raw_payload);
-    let custom_paths = if args.rule.is_empty() {
-        None
-    } else {
-        Some(args.rule.as_slice())
-    };
-    let rules = RuleLoader::discover_rules(custom_paths);
+    let explicit_paths = collect_target_rules(args, Some(scripts));
+    let rules = RuleLoader::load_rules(&explicit_paths);
+
+    if rules.is_empty() {
+        println!("⚠️ No rule scripts provided to benchmark.");
+        return;
+    }
 
     let runner = match RuleRunner::new() {
         Ok(r) => r,
@@ -253,9 +264,10 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str) {
 
     let avg_us = elapsed.as_micros() as f64 / iterations as f64;
     println!("============================================================");
-    println!("  Total Time : {:?}", elapsed);
-    println!("  Iterations : {}", iterations);
-    println!("  Average    : {:.2} µs ({:.4} ms) per execution", avg_us, avg_us / 1000.0);
+    println!("  Target Rules : {} scripts", rules.len());
+    println!("  Total Time   : {:?}", elapsed);
+    println!("  Iterations   : {}", iterations);
+    println!("  Average      : {:.2} µs ({:.4} ms) per execution", avg_us, avg_us / 1000.0);
     println!("============================================================");
 }
 

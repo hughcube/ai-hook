@@ -1,6 +1,6 @@
 [package]
 name = "ai-hook"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["hugh.li <hugh.li0001@gmail.com>"]
 description = "High-performance, multi-agent unified hook dispatcher and autonomous rule engine"

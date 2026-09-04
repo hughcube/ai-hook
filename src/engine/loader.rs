@@ -11,50 +11,42 @@ pub struct RuleSource {
 pub struct RuleLoader;
 
 impl RuleLoader {
-    /// Discovers all rule files across system, plugin, and project directories.
-    pub fn discover_rules(custom_paths: Option<&[PathBuf]>) -> Vec<RuleSource> {
+    /// Loads only explicitly passed scripts or dedicated rules directory.
+    /// Does NOT perform whole-system or plugins-wide directory traversal.
+    pub fn load_rules(explicit_paths: &[PathBuf]) -> Vec<RuleSource> {
         let mut files = Vec::new();
         let mut seen = HashSet::new();
 
-        // 1. Custom paths if specified
-        if let Some(paths) = custom_paths {
-            for p in paths {
+        // 1. Load from explicit script paths passed in CLI args
+        if !explicit_paths.is_empty() {
+            for p in explicit_paths {
                 Self::collect_from_path(p, &mut files, &mut seen);
+            }
+            return files;
+        }
+
+        // 2. Check environment variable override
+        if let Ok(env_rules) = std::env::var("AI_HOOK_RULES") {
+            for part in env_rules.split(|c| c == ';' || c == ':') {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    Self::collect_from_path(Path::new(trimmed), &mut files, &mut seen);
+                }
             }
             if !files.is_empty() {
                 return files;
             }
         }
 
-        // 2. Environment variable override
-        if let Ok(env_path) = std::env::var("AI_HOOK_RULES_DIR") {
-            Self::collect_from_path(Path::new(&env_path), &mut files, &mut seen);
-        }
-
-        // 3. Project-level local rules: ./.ai-hook/rules/
+        // 3. Fallback to project-level rules directory if present (./.ai-hook/rules.js or ./.ai-hook/rules/)
         if let Ok(cwd) = std::env::current_dir() {
-            let local_rules = cwd.join(".ai-hook").join("rules");
-            Self::collect_from_path(&local_rules, &mut files, &mut seen);
-        }
-
-        // 4. User-level rules: ~/.ai-hook/rules/
-        if let Some(home) = dirs::home_dir() {
-            let user_rules = home.join(".ai-hook").join("rules");
-            Self::collect_from_path(&user_rules, &mut files, &mut seen);
-
-            // 5. Plugin rules: ~/.agents/plugins/*/hooks/*.js
-            let plugins_dir = home.join(".agents").join("plugins");
-            if plugins_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            let hooks_dir = path.join("hooks");
-                            if hooks_dir.is_dir() {
-                                Self::collect_from_path(&hooks_dir, &mut files, &mut seen);
-                            }
-                        }
-                    }
+            let local_rule_file = cwd.join(".ai-hook").join("rules.js");
+            if local_rule_file.is_file() {
+                Self::collect_from_path(&local_rule_file, &mut files, &mut seen);
+            } else {
+                let local_rules_dir = cwd.join(".ai-hook").join("rules");
+                if local_rules_dir.is_dir() {
+                    Self::collect_from_path(&local_rules_dir, &mut files, &mut seen);
                 }
             }
         }
@@ -107,7 +99,6 @@ impl RuleLoader {
             .unwrap_or("rule")
             .to_string();
 
-        // Skip temporary or test scripts
         if file_stem.starts_with('_') || file_stem.ends_with(".tmp") || file_stem.ends_with(".test") {
             return;
         }

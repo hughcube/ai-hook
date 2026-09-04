@@ -127,9 +127,9 @@ Add the alias to your `~/.zshrc` or `~/.bashrc`:
 alias ai:hook="ai-hook"
 ```
 
-### 3. Register in Agent Configurations
+### 3. Register in Agent Configurations (Supports Multiple Scripts)
 
-In your global agent configuration (e.g. Antigravity `~/.gemini/config/hooks.json`), you only need a single entry:
+In your agent configuration (e.g. Antigravity `~/.gemini/config/hooks.json`), specify `ai-hook` along with one or more rule script paths:
 
 ```json
 {
@@ -139,7 +139,7 @@ In your global agent configuration (e.g. Antigravity `~/.gemini/config/hooks.jso
       "hooks": [
         {
           "type": "command",
-          "command": "ai-hook",
+          "command": "ai-hook ~/.agents/plugins/dev/hooks/protect-db-migrate.js ~/.agents/plugins/rd/hooks/protect-prod-db-write.js",
           "timeout": 70
         }
       ]
@@ -148,14 +148,20 @@ In your global agent configuration (e.g. Antigravity `~/.gemini/config/hooks.jso
 }
 ```
 
+> **Note**: `ai-hook` strictly executes the explicit scripts provided, without blind whole-disk traversal. Full evaluation takes only ~2ms.
+
+### 4. GUI Prompt & Timeout Configuration
+
+| Env Variable / CLI Option | Default | Description |
+| :--- | :--- | :--- |
+| `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Countdown seconds for the approval window (auto-denies on timeout) |
+| `AI_HOOK_GUI` / `--no-gui` | `1` (enabled) | Set to `0` or `false` to disable the GUI dialog completely |
+
 ---
 
 ## 📝 Writing Autonomous Rules
 
-Rules are written in standard JavaScript (ES6+). Place your `.js` files in any of the following directories:
-1. **Project Local Rules**: `./.ai-hook/rules/*.js`
-2. **User Global Rules**: `~/.ai-hook/rules/*.js`
-3. **Plugin Rules**: `~/.agents/plugins/<plugin_name>/hooks/*.js`
+Rules are written in standard JavaScript (ES6+) and can be passed directly as arguments to `ai-hook`.
 
 ### Contract & Example
 

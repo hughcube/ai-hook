@@ -13,9 +13,21 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Specific rule file or directory to execute (can be specified multiple times)
+    /// Rule script files to execute (supports multiple scripts)
+    #[arg(trailing_var_arg = true)]
+    pub scripts: Vec<PathBuf>,
+
+    /// Rule script files or directories (can be specified multiple times)
     #[arg(short, long, global = true)]
     pub rule: Vec<PathBuf>,
+
+    /// Explicitly disable GUI popup (defaults to GUI enabled)
+    #[arg(long, global = true)]
+    pub no_gui: bool,
+
+    /// Override GUI countdown timeout in seconds (default: 60)
+    #[arg(long, global = true)]
+    pub timeout: Option<u32>,
 
     /// Dry run mode (does not trigger GUI popups)
     #[arg(long, global = true)]
@@ -24,10 +36,14 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// List all discovered security rule scripts
-    List,
+    /// List specified or configured security rule scripts
+    List {
+        /// Explicit rule scripts to inspect
+        #[arg(trailing_var_arg = true)]
+        scripts: Vec<PathBuf>,
+    },
 
-    /// Test a specific command against all discovered rules
+    /// Test a specific command against given rule scripts
     Test {
         /// Command line string to simulate and test
         command: String,
@@ -39,9 +55,13 @@ pub enum Commands {
         /// Simulated target file path
         #[arg(short, long, default_value = "")]
         file: String,
+
+        /// Explicit rule scripts to test against
+        #[arg(trailing_var_arg = true)]
+        scripts: Vec<PathBuf>,
     },
 
-    /// Run benchmark over all active rules
+    /// Run benchmark over given rule scripts
     Bench {
         /// Number of iterations to evaluate (default: 1000)
         #[arg(short, long, default_value = "1000")]
@@ -50,6 +70,10 @@ pub enum Commands {
         /// Command string to benchmark against
         #[arg(short, long, default_value = "git status --short")]
         command: String,
+
+        /// Explicit rule scripts to benchmark
+        #[arg(trailing_var_arg = true)]
+        scripts: Vec<PathBuf>,
     },
 
     /// Install binary to system bin directory (e.g. ~/bin/ai-hook)
