@@ -3,13 +3,32 @@ use ai_hook::engine::{RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
 use ai_hook::protocol::{HookContext, HookDecision};
 use ai_hook::ui::GuiDialog;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
+fn get_binary_info_help() -> String {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ai-hook"));
+    let exe_dir = current_exe
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+
+    format!(
+        "Binary Location:\n  Executable: {}\n  Directory : {}",
+        current_exe.display(),
+        exe_dir
+    )
+}
+
 fn main() {
-    let args = Cli::parse();
+    let help_info = get_binary_info_help();
+    let cmd = Cli::command()
+        .after_help(help_info.clone())
+        .after_long_help(help_info);
+    let matches = cmd.get_matches();
+    let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match args.command {
         Some(Commands::List { ref scripts }) => handle_list(&args, scripts),
@@ -49,7 +68,11 @@ fn collect_target_rules(args: &Cli, extra_scripts: Option<&[PathBuf]>) -> Vec<Pa
 fn handle_dispatch(args: &Cli) {
     if std::io::stdin().is_terminal() {
         // Invoked directly from terminal without piped input -> print help and exit
-        let _ = Cli::command().print_help();
+        let help_info = get_binary_info_help();
+        let _ = Cli::command()
+            .after_help(help_info.clone())
+            .after_long_help(help_info)
+            .print_help();
         println!();
         return;
     }
