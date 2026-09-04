@@ -18,6 +18,62 @@ macro_rules! eprint_ts {
     };
 }
 
+// --- Startup profiler (AI_HOOK_PROFILE=1): stage timings to stderr. ---
+thread_local! {
+    static PROF_T0: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static PROF_MARKS: std::cell::RefCell<Vec<(String, f64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn profile_enabled() -> bool {
+    std::env::var("AI_HOOK_PROFILE")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+macro_rules! prof_init {
+    () => {
+        if profile_enabled() {
+            PROF_T0.with(|c| c.set(Some(Instant::now())));
+        }
+    };
+}
+
+macro_rules! prof_mark {
+    ($label:expr) => {
+        if profile_enabled() {
+            PROF_T0.with(|c| {
+                if let Some(t0) = c.get() {
+                    PROF_MARKS.with(|m| {
+                        m.borrow_mut()
+                            .push(($label.to_string(), t0.elapsed().as_secs_f64() * 1000.0))
+                    });
+                }
+            });
+        }
+    };
+}
+
+macro_rules! prof_flush {
+    () => {
+        if profile_enabled() {
+            PROF_MARKS.with(|m| {
+                let marks = std::mem::take(&mut *m.borrow_mut());
+                if marks.is_empty() {
+                    return;
+                }
+                eprintln!("[ai-hook-profile] 分段耗时(从 main 入口起,创建→main 不在内):");
+                for (label, t) in &marks {
+                    eprintln!("  {:<30} @ {:.3} ms", label, t);
+                }
+            });
+        }
+    };
+}
+
 fn get_binary_info_help() -> String {
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ai-hook"));
     let exe_dir = current_exe
@@ -36,12 +92,14 @@ fn get_binary_info_help() -> String {
 }
 
 fn main() {
+    prof_init!();
     let help_info = get_binary_info_help();
     let cmd = localized_command()
         .after_help(help_info.clone())
         .after_long_help(help_info);
     let matches = cmd.get_matches();
     let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    prof_mark!("clap 解析完成");
 
     match args.command {
         Some(Commands::List { ref scripts }) => handle_list(&args, scripts),
@@ -94,6 +152,7 @@ fn collect_target_rules(args: &Cli, extra_scripts: Option<&[PathBuf]>) -> Vec<Pa
 /// Prints hook output only when non-empty (empty output = allow / no decision
 /// in every host protocol, so we must never print whitespace-only noise).
 fn print_output(output: &str) {
+    prof_flush!();
     if !output.is_empty() {
         println!("{}", output);
     }
@@ -158,12 +217,14 @@ fn handle_dispatch(args: &Cli) {
         return;
     }
 
+    prof_mark!("stdin 读取完成");
     // Debug aid (AI_HOOK_LOG_EXTERNAL=1): persist the raw payload BEFORE
     // parsing so shape / platform-detection problems stay diagnosable even
     // when parse itself fails. Never fails the hook.
     ai_hook::engine::log_inbound_payload(&buffer);
 
     let ctx = HookContext::parse(&buffer);
+    prof_mark!("payload parse");
 
     // A payload that is not valid JSON carries no tool semantics at all.
     // Failing silently (empty output would read as "allow") or running rules
@@ -224,6 +285,7 @@ fn handle_dispatch(args: &Cli) {
 
     // 3. Load explicit rules (no full-disk auto traversal)
     let rules = RuleLoader::load_rules(&explicit_paths);
+    prof_mark!("规则文件加载");
 
     if rules.is_empty() {
         // No gate at all. If the operator pointed at paths that loaded nothing
@@ -252,6 +314,7 @@ fn handle_dispatch(args: &Cli) {
         };
 
         let (decision, _) = runner.evaluate_all(&rules, &ctx, policy);
+        prof_mark!("规则执行");
 
         // 4. Handle confirmation & GUI prompt (gui 三态语义,2026-09-05 约定):
         //    gui:true / force_gui → 强制弹窗(穿透 --no-gui,仅 dry-run 演练除外);
