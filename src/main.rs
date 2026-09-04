@@ -334,20 +334,88 @@ fn handle_install(target_dir: Option<PathBuf>) {
     };
 
     let dest_file = dest_dir.join(exe_name);
-    match std::fs::copy(&current_exe, &dest_file) {
-        Ok(_) => {
-            println!(" Successfully installed ai-hook to:");
-            println!("  {}", dest_file.display());
-            println!();
-            println!("Quick Setup Recommendations:");
-            println!("  1. Ensure '{}' is in your PATH environment variable.", dest_dir.display());
-            println!("  2. Add the following alias to ~/.zshrc or ~/.bashrc:");
-            println!("     alias ai:hook=\"ai-hook\"");
-            println!("  3. Verify by running:");
-            println!("     ai-hook --version");
-        }
-        Err(e) => {
+    let norm = |p: &std::path::Path| {
+        p.canonicalize()
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_lowercase()
+    };
+    let already_there = norm(&current_exe) == norm(&dest_file);
+
+    if !already_there {
+        if let Err(e) = std::fs::copy(&current_exe, &dest_file) {
             eprintln!("Failed to copy binary to {}: {}", dest_file.display(), e);
+            return;
         }
+        println!("✨ Successfully installed ai-hook to:");
+        println!("   {}", dest_file.display());
+    } else {
+        println!("✨ ai-hook is already located at:");
+        println!("   {}", dest_file.display());
+    }
+    println!();
+
+    #[cfg(windows)]
+    {
+        let norm_dir = dest_dir.to_string_lossy().trim_end_matches('\\').to_lowercase();
+        let in_path = std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths).any(|p| {
+                    p.to_string_lossy().trim_end_matches('\\').to_lowercase() == norm_dir
+                })
+            })
+            .unwrap_or(false);
+
+        if in_path {
+            println!("✓ Global command ready! '{}' is already in your PATH.", dest_dir.display());
+            println!("  You can run 'ai-hook --version' directly from any terminal.");
+        } else {
+            let script = format!(
+                "$current = [Environment]::GetEnvironmentVariable('Path', 'User'); \
+                 $target = '{}'; \
+                 $normTarget = $target.TrimEnd('\\').ToLower(); \
+                 $exists = ($current -split ';') | Where-Object {{ $_.TrimEnd('\\').ToLower() -eq $normTarget }}; \
+                 if (-not $exists) {{ \
+                     $newPath = if ([string]::IsNullOrEmpty($current)) {{ $target }} else {{ $current.TrimEnd(';') + ';' + $target }}; \
+                     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User'); \
+                     Write-Output 'ADDED'; \
+                 }} else {{ \
+                     Write-Output 'EXISTS'; \
+                 }}",
+                dest_dir.display()
+            );
+
+            let output = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &script])
+                .output();
+
+            let added = output
+                .as_ref()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("ADDED"))
+                .unwrap_or(false);
+
+            if added {
+                println!("✓ Successfully configured Windows User PATH to include '{}'!", dest_dir.display());
+                println!("  • To use 'ai-hook' immediately in this PowerShell session, run:");
+                println!("      $env:Path += \";{}\"", dest_dir.display());
+                println!("  • All newly opened terminals will recognize 'ai-hook' globally.");
+            } else {
+                println!("✓ Global command configured! '{}' is in your User PATH registry.", dest_dir.display());
+                println!("  • To use 'ai-hook' immediately in this PowerShell session, run:");
+                println!("      $env:Path += \";{}\"", dest_dir.display());
+                println!("  • Or simply open a new terminal window.");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        println!("Quick Setup Recommendations:");
+        println!("  1. Ensure '{}' is in your PATH environment variable (e.g. in ~/.zshrc or ~/.bashrc).", dest_dir.display());
+        println!("  2. Add optional alias to ~/.zshrc or ~/.bashrc:");
+        println!("     alias ai:hook=\"ai-hook\"");
+        println!("  3. Verify by running:");
+        println!("     ai-hook --version");
     }
 }

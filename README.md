@@ -99,17 +99,24 @@ In multi-agent collaborative development ecosystems, preventing destructive oper
 
 ### 1. Download & Install
 
-Download the precompiled binary for your operating system from [GitHub Releases](https://github.com/hughcube/ai-hook/releases):
+Download standalone precompiled executables directly from [GitHub Releases](https://github.com/hughcube/ai-hook/releases) (ready to run, no extraction needed):
 
 ```bash
-# Windows
-curl -LO https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.zip
-# Unzip and place ai-hook.exe into your PATH (e.g. ~/bin or C:\Users\<Username>\bin)
+# Windows (PowerShell): Download directly into user bin directory
+New-Item -ItemType Directory -Force -Path "$HOME\bin"
+Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$HOME\bin\ai-hook.exe"
 
-# Linux / macOS
-curl -LO https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64.tar.gz
-tar -xzf ai-hook-linux-x86_64.tar.gz
-mv ai-hook /usr/local/bin/
+# Linux: Download directly to system bin path
+curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
+chmod +x /usr/local/bin/ai-hook
+
+# macOS (Apple Silicon M-series)
+curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-darwin-aarch64
+chmod +x /usr/local/bin/ai-hook
+
+# macOS (Intel)
+curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-darwin-x86_64
+chmod +x /usr/local/bin/ai-hook
 ```
 
 Or compile and install from source:
@@ -331,7 +338,7 @@ ai-hook test "git push origin master --force" ./examples/demo_all_features.js
 # 3. Run high-iteration benchmark across specified rules
 ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
-# 4. Install binary to system bin directory (e.g. ~/bin/ai-hook.exe)
+# 4. Install as a global system command (copies to user bin and verifies PATH)
 ai-hook install
 
 # 5. One-command self-update to latest GitHub release

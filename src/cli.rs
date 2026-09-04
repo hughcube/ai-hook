@@ -76,9 +76,9 @@ pub enum Commands {
         scripts: Vec<PathBuf>,
     },
 
-    /// Install binary to system bin directory (e.g. ~/bin/ai-hook)
+    /// Install binary to system bin directory (e.g. %USERPROFILE%\bin on Windows or ~/bin on Unix)
     Install {
-        /// Target bin directory (default: detects ~/bin or ~/.local/bin)
+        /// Target bin directory (default: %USERPROFILE%\bin on Windows, ~/bin on Unix)
         #[arg(short, long)]
         target_dir: Option<PathBuf>,
     },

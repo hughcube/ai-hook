@@ -99,17 +99,24 @@
 
 ### 1. 下载与安装
 
-从 [GitHub Releases](https://github.com/hughcube/ai-hook/releases) 下载适合你平台的预编译二进制：
+从 [GitHub Releases](https://github.com/hughcube/ai-hook/releases) 直接下载对应系统的独立可执行文件（开箱即用，无需解压）：
 
 ```bash
-# Windows
-curl -LO https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.zip
-# 解压并将 ai-hook.exe 放入 PATH（例如 ~/bin 或 C:\Users\<Username>\bin）
+# Windows (PowerShell): 直接下载并存入用户 bin
+New-Item -ItemType Directory -Force -Path "$HOME\bin"
+Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$HOME\bin\ai-hook.exe"
 
-# Linux / macOS
-curl -LO https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64.tar.gz
-tar -xzf ai-hook-linux-x86_64.tar.gz
-mv ai-hook /usr/local/bin/
+# Linux: 直接下载到系统全局路径
+curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
+chmod +x /usr/local/bin/ai-hook
+
+# macOS (Apple Silicon M系列)
+curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-darwin-aarch64
+chmod +x /usr/local/bin/ai-hook
+
+# macOS (Intel)
+curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-darwin-x86_64
+chmod +x /usr/local/bin/ai-hook
 ```
 
 或者从源码直接编译安装：
@@ -331,7 +338,7 @@ ai-hook test "git push origin master --force" ./examples/demo_all_features.js
 # 3. 压测规则性能（1,000 次循环评估）
 ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
-# 4. 安装至系统 PATH 目录（如 ~/bin/ai-hook.exe）
+# 4. 安装为全局命令（自动复制到用户 bin 目录并提示/校验全局 PATH）
 ai-hook install
 
 # 5. 一键自我更新至 GitHub 最新 Release（自动匹配系统架构并安全替换自身）

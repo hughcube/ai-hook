@@ -2,26 +2,54 @@ use std::io::Cursor;
 use std::io::Read;
 use std::path::PathBuf;
 
-/// Determines the expected asset name and binary filename for the current OS/architecture.
-fn get_target_asset_info() -> Result<(&'static str, &'static str), String> {
+/// Determines candidate asset names (in priority order) and internal binary name.
+fn get_target_candidates() -> Result<(&'static [&'static str], &'static str), String> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        Ok(("ai-hook-windows-x86_64.zip", "ai-hook.exe"))
+        Ok((
+            &[
+                "ai-hook-windows-x86_64.exe",
+                "ai-hook.exe",
+                "ai-hook-windows-x86_64.zip",
+            ],
+            "ai-hook.exe",
+        ))
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        Ok(("ai-hook-linux-x86_64.tar.gz", "ai-hook"))
+        Ok((
+            &[
+                "ai-hook-linux-x86_64",
+                "ai-hook",
+                "ai-hook-linux-x86_64.tar.gz",
+            ],
+            "ai-hook",
+        ))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        Ok(("ai-hook-darwin-x86_64.tar.gz", "ai-hook"))
+        Ok((
+            &[
+                "ai-hook-darwin-x86_64",
+                "ai-hook",
+                "ai-hook-darwin-x86_64.tar.gz",
+            ],
+            "ai-hook",
+        ))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        Ok(("ai-hook-darwin-aarch64.tar.gz", "ai-hook"))
+        Ok((
+            &[
+                "ai-hook-darwin-aarch64",
+                "ai-hook",
+                "ai-hook-darwin-aarch64.tar.gz",
+            ],
+            "ai-hook",
+        ))
     }
 
     #[cfg(not(any(
@@ -42,7 +70,7 @@ fn get_target_asset_info() -> Result<(&'static str, &'static str), String> {
 /// Self-update command handler
 pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     let current_version = env!("CARGO_PKG_VERSION");
-    let (asset_name, binary_name) = get_target_asset_info()?;
+    let (candidate_assets, binary_name) = get_target_candidates()?;
 
     println!("Checking for latest release from https://github.com/{} ...", repo);
 
@@ -88,24 +116,30 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Find the matching release asset
+    // Find the matching release asset by candidate priority
     let assets = release_val
         .get("assets")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "No release assets found in the latest release".to_string())?;
 
-    let matching_asset = assets.iter().find(|a| {
-        a.get("name")
-            .and_then(|n| n.as_str())
-            .map(|n| n == asset_name)
-            .unwrap_or(false)
-    });
+    let mut selected = None;
+    for &cand in candidate_assets {
+        if let Some(asset_obj) = assets.iter().find(|a| {
+            a.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n == cand)
+                .unwrap_or(false)
+        }) {
+            selected = Some((cand, asset_obj));
+            break;
+        }
+    }
 
-    let asset = matching_asset.ok_or_else(|| {
+    let (asset_name, asset) = selected.ok_or_else(|| {
         format!(
-            "Target asset '{}' was not found in release {}. Available assets: [{}]",
-            asset_name,
+            "No matching binary or archive was found in release {}. Candidates: {:?}. Available in release: [{}]",
             tag_name,
+            candidate_assets,
             assets
                 .iter()
                 .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
@@ -136,13 +170,11 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         .call()
         .map_err(|e| format!("Failed to download release asset: {}", e))?;
 
-    let mut archive_bytes = Vec::new();
+    let mut binary_bytes = Vec::new();
     download_resp
         .into_reader()
-        .read_to_end(&mut archive_bytes)
+        .read_to_end(&mut binary_bytes)
         .map_err(|e| format!("Failed to read downloaded asset: {}", e))?;
-
-    println!("Downloaded {:.2} MB. Extracting '{}' ...", archive_bytes.len() as f64 / (1024.0 * 1024.0), binary_name);
 
     let temp_dir = std::env::temp_dir();
     let nonce = std::time::SystemTime::now()
@@ -155,9 +187,10 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         nonce
     ));
 
-    // Extract binary depending on archive type
+    // Handle extraction or raw executable write
     if asset_name.ends_with(".zip") {
-        let cursor = Cursor::new(archive_bytes);
+        println!("Downloaded {:.2} MB (archive). Extracting '{}' ...", binary_bytes.len() as f64 / (1024.0 * 1024.0), binary_name);
+        let cursor = Cursor::new(binary_bytes);
         let mut zip = zip::ZipArchive::new(cursor)
             .map_err(|e| format!("Failed to parse zip archive: {}", e))?;
         let mut found = false;
@@ -183,8 +216,9 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         if !found {
             return Err(format!("Binary '{}' was not found inside the zip archive", binary_name));
         }
-    } else if asset_name.ends_with(".tar.gz") {
-        let cursor = Cursor::new(archive_bytes);
+    } else if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") {
+        println!("Downloaded {:.2} MB (archive). Extracting '{}' ...", binary_bytes.len() as f64 / (1024.0 * 1024.0), binary_name);
+        let cursor = Cursor::new(binary_bytes);
         let gz = flate2::read::GzDecoder::new(cursor);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
@@ -208,7 +242,10 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
             return Err(format!("Binary '{}' was not found inside the tar.gz archive", binary_name));
         }
     } else {
-        return Err(format!("Unsupported archive format: {}", asset_name));
+        // Raw executable binary! Directly save to temporary file
+        println!("Downloaded {:.2} MB (raw executable).", binary_bytes.len() as f64 / (1024.0 * 1024.0));
+        std::fs::write(&temp_bin_path, &binary_bytes)
+            .map_err(|e| format!("Failed to write binary to temporary file: {}", e))?;
     }
 
     #[cfg(unix)]
