@@ -9,6 +9,7 @@ pub enum HookDecision {
         title: Option<String>,
         gui: Option<bool>,
         timeout: Option<u32>,
+        force_gui: Option<bool>,
     },
     Deny {
         reason: String,

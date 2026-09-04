@@ -125,12 +125,36 @@ cargo install --path .
 ai-hook install
 ```
 
-### 2. Configure Shell Alias
+### 2. AI Dependency Management & Shell Integration
 
-Add the alias to your `~/.zshrc` or `~/.bashrc`:
+`ai-hook` serves as the primary security guardrail in multi-agent workflows. We recommend configuring a unified AI dependency self-test function in your `~/.zshrc` or `~/.bashrc` (with `ai-hook` as the first baseline dependency):
 
 ```bash
+# 1. Convenient command alias (optional)
 alias ai:hook="ai-hook"
+
+# 2. Automated AI environment dependency doctor (recommended in ~/.zshrc)
+# Automatically checks and installs/updates local AI toolchain dependencies
+ai:doctor() {
+  echo "🔍 Checking local AI toolchain dependencies & security hook dispatcher..."
+  if ! command -v ai-hook >/dev/null 2>&1; then
+    echo "⚠️  ai-hook not found. Automatically downloading and installing globally..."
+    if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
+      powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe' -OutFile \"\$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\ai-hook.exe\""
+    else
+      local arch="$(uname -m)"
+      local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+      local target_bin="/usr/local/bin/ai-hook"
+      [[ ! -w "/usr/local/bin" ]] && target_bin="$HOME/.local/bin/ai-hook"
+      mkdir -p "$(dirname "$target_bin")"
+      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-${os}-${arch}" -o "$target_bin" && chmod +x "$target_bin"
+    fi
+    echo "✨ ai-hook successfully installed!"
+  else
+    echo "✓ ai-hook is ready: $(which ai-hook 2>/dev/null || command -v ai-hook) ($(ai-hook --version 2>/dev/null))"
+  fi
+  # Extend additional AI tool dependencies here in the future...
+}
 ```
 
 ### 3. Register in Agent Configurations (Supports Multiple Scripts)
@@ -184,6 +208,7 @@ Configure in your hooks configuration:
 | :--- | :--- | :--- |
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Default countdown timeout in seconds (auto-denies on expiration) |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (enabled) | Set to `0` or `false` to disable the GUI dialog completely |
+| `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (disabled) | **Forced Popup**: Forces GUI popup confirmation even if agent supports native terminal ask (except hard deny) |
 
 ---
 
@@ -337,11 +362,15 @@ ai-hook test "git push origin master --force" ./examples/demo_all_features.js
 # 3. Run high-iteration benchmark across specified rules
 ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
-# 4. Install as a global system command (copies to user bin and verifies PATH)
+# 4. Install as a global system command (auto-detects existing PATH directory with 0 env pollution)
 ai-hook install
 
 # 5. One-command self-update to latest GitHub release
 ai-hook update
+
+# 6. View built-in interactive tutorial and rule authoring guide
+ai-hook tutorial
+ai-hook tutorial --lang en
 
 # Force download and replace even if on the same version
 ai-hook update --force

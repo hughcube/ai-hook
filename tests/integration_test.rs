@@ -111,6 +111,7 @@ fn test_autonomous_js_rule_execution() {
             title: None,
             gui: None,
             timeout: None,
+            force_gui: None,
         })
     );
 
@@ -214,6 +215,77 @@ fn test_ctx_agent_and_raw_input() {
             title: Some("Custom Auth Title".to_string()),
             gui: Some(false),
             timeout: Some(45),
+            force_gui: None,
         })
     );
+}
+
+#[test]
+fn test_force_gui_rule() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+
+    // 1. Rule with force_gui: true
+    let rule_code1 = r#"
+        export default function(ctx, sys) {
+            return {
+                action: "confirm",
+                reason: "Sensitive write operation",
+                gui: false,
+                force_gui: true
+            };
+        }
+    "#;
+    let rule1 = RuleSource {
+        id: "force-gui-1".to_string(),
+        path: PathBuf::from("force-gui-1.js"),
+        code: rule_code1.to_string(),
+    };
+    let ctx = HookContext::parse(&serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf build" }
+    }).to_string());
+    let res1 = runner.execute_rule(&rule1, &ctx);
+    assert_eq!(
+        res1.decision,
+        Some(HookDecision::Confirm {
+            reason: "Sensitive write operation".to_string(),
+            title: None,
+            gui: Some(false),
+            timeout: None,
+            force_gui: Some(true),
+        })
+    );
+
+    // 2. Rule with action: "force_gui" or "force_confirm"
+    let rule_code2 = r#"
+        export default function(ctx, sys) {
+            return {
+                action: "force_gui",
+                reason: "Forced popup rule"
+            };
+        }
+    "#;
+    let rule2 = RuleSource {
+        id: "force-gui-2".to_string(),
+        path: PathBuf::from("force-gui-2.js"),
+        code: rule_code2.to_string(),
+    };
+    let res2 = runner.execute_rule(&rule2, &ctx);
+    assert_eq!(
+        res2.decision,
+        Some(HookDecision::Confirm {
+            reason: "Forced popup rule".to_string(),
+            title: None,
+            gui: Some(true),
+            timeout: None,
+            force_gui: Some(true),
+        })
+    );
+}
+
+#[test]
+fn test_tutorial_output() {
+    // Verify tutorial prints without panic
+    ai_hook::tutorial::print_tutorial("zh");
+    ai_hook::tutorial::print_tutorial("en");
 }

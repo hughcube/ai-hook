@@ -25,6 +25,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_gui: bool,
 
+    /// Force GUI popup for all confirmations (even if agent supports terminal ask or rule specifies gui: false)
+    #[arg(long, global = true, alias = "force-popup")]
+    pub force_gui: bool,
+
     /// Override GUI countdown timeout in seconds (default: 60)
     #[arg(long, global = true)]
     pub timeout: Option<u32>,
@@ -76,9 +80,9 @@ pub enum Commands {
         scripts: Vec<PathBuf>,
     },
 
-    /// Install binary to system bin directory (e.g. %USERPROFILE%\bin on Windows or ~/bin on Unix)
+    /// Install binary to system PATH directory (auto-detects existing PATH directory with zero new env variables)
     Install {
-        /// Target bin directory (default: %USERPROFILE%\bin on Windows, ~/bin on Unix)
+        /// Target bin directory (default: auto-detected existing PATH directory)
         #[arg(short, long)]
         target_dir: Option<PathBuf>,
     },
@@ -92,5 +96,13 @@ pub enum Commands {
         /// Custom GitHub repository in format owner/repo (default: hughcube/ai-hook)
         #[arg(long, default_value = "hughcube/ai-hook")]
         repo: String,
+    },
+
+    /// Display comprehensive tutorial and rule authoring guide
+    #[command(alias = "guide")]
+    Tutorial {
+        /// Tutorial language: "zh" for Chinese or "en" for English (default: "zh")
+        #[arg(short, long, default_value = "zh")]
+        lang: String,
     },
 }

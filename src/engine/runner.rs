@@ -142,14 +142,29 @@ impl RuleRunner {
                     let title = obj.get::<_, String>("title").ok();
                     let gui = obj.get::<_, bool>("gui").ok();
                     let timeout = obj.get::<_, u32>("timeout").ok();
+                    let explicit_force_gui = obj
+                        .get::<_, bool>("force_gui")
+                        .or_else(|_| obj.get::<_, bool>("forceGui"))
+                        .ok();
 
-                    match action.to_lowercase().as_str() {
+                    let act = action.to_lowercase();
+                    match act.as_str() {
                         "confirm" | "ask" | "prompt" => {
                             decision = Some(HookDecision::Confirm {
                                 reason,
                                 title,
                                 gui,
                                 timeout,
+                                force_gui: explicit_force_gui,
+                            });
+                        }
+                        "force_confirm" | "force_ask" | "force_gui" | "force_popup" => {
+                            decision = Some(HookDecision::Confirm {
+                                reason,
+                                title,
+                                gui: Some(true),
+                                timeout,
+                                force_gui: Some(true),
                             });
                         }
                         "deny" | "block" | "reject" => {

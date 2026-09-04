@@ -1,6 +1,6 @@
 [package]
 name = "ai-hook"
-version = "0.1.5"
+version = "1.0.0"
 edition = "2024"
 authors = ["hugh.li <hugh.li0001@gmail.com>"]
 description = "High-performance, multi-agent unified hook dispatcher and autonomous rule engine"
@@ -16,7 +16,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rquickjs = { version = "0.12", features = ["std"] }
 regex = "1.11"
-chrono = "0.4"
 dirs = "5.0"
 self-replace = "1.5"
 ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }

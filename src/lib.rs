@@ -4,6 +4,7 @@ pub mod fast_path;
 pub mod protocol;
 pub mod ui;
 pub mod update;
+pub mod tutorial;
 
 pub use cli::{Cli, Commands};
 pub use engine::{RuleExecutionResult, RuleLoader, RuleRunner, RuleSource, SysContext};

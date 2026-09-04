@@ -125,12 +125,36 @@ cargo install --path .
 ai-hook install
 ```
 
-### 2. 配置 Shell 别名
+### 2. AI 依赖环境集成与 Shell 配置
 
-在 `~/.zshrc` 或 `~/.bashrc` 中添加：
+`ai-hook` 作为现代化多 Agent 研发环境的首选安全基座，推荐在系统的 Shell 配置文件（如 `~/.zshrc` 或 `~/.bashrc`）中加入 AI 工具链依赖检查与安装命令（`ai-hook` 作为 AI 基础设施的核心第一项依赖）：
 
 ```bash
+# 1. 基础命令别名（可选）
 alias ai:hook="ai-hook"
+
+# 2. AI 依赖自检与自动安装命令（推荐加入 ~/.zshrc）
+# 专用于检查并自动安装/升级当前电脑所需的 AI 开发基础设施依赖（ai-hook 为首项基础设施）
+ai:doctor() {
+  echo "🔍 正在检查当前电脑的 AI 依赖与安全拦截基座..."
+  if ! command -v ai-hook >/dev/null 2>&1; then
+    echo "⚠️  未检测到 ai-hook，正在自动下载并安装为全局命令..."
+    if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
+      powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe' -OutFile \"\$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\ai-hook.exe\""
+    else
+      local arch="$(uname -m)"
+      local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+      local target_bin="/usr/local/bin/ai-hook"
+      [[ ! -w "/usr/local/bin" ]] && target_bin="$HOME/.local/bin/ai-hook"
+      mkdir -p "$(dirname "$target_bin")"
+      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-${os}-${arch}" -o "$target_bin" && chmod +x "$target_bin"
+    fi
+    echo "✨ ai-hook 安装完成！"
+  else
+    echo "✓ ai-hook 已就绪: $(which ai-hook 2>/dev/null || command -v ai-hook) ($(ai-hook --version 2>/dev/null))"
+  fi
+  # 后续可在此函数中继续扩展其他 AI 基础设施或 Agent 插件依赖项...
+}
 ```
 
 ### 3. 在各大主流 AI Agent 中配置接入（支持传多个脚本）
@@ -184,6 +208,7 @@ alias ai:hook="ai-hook"
 | :--- | :--- | :--- |
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | 默认倒计时弹窗秒数（超时自动拒绝关闭） |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (开启) | 设置为 `0` 或 `false` 可完全静默关闭桌面弹窗 |
+| `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (关闭) | **强制弹出**：即使 Agent (如 Claude Code) 支持原生终端 ask，亦强制唤起系统弹窗确认（硬阻断 deny 场景除外） |
 
 ---
 
@@ -337,11 +362,15 @@ ai-hook test "git push origin master --force" ./examples/demo_all_features.js
 # 3. 压测规则性能（1,000 次循环评估）
 ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
-# 4. 安装为全局命令（自动复制到用户 bin 目录并提示/校验全局 PATH）
+# 4. 安装为全局命令（自动探测系统现有 PATH 目录，零额外环境变量污染）
 ai-hook install
 
 # 5. 一键自我更新至 GitHub 最新 Release（自动匹配系统架构并安全替换自身）
 ai-hook update
+
+# 6. 查看内置交互式使用教程与规则开发指南
+ai-hook tutorial
+ai-hook tutorial --lang en
 
 # 强制重新下载覆盖
 ai-hook update --force

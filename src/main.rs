@@ -50,6 +50,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Tutorial { ref lang }) => {
+            ai_hook::tutorial::print_tutorial(lang);
+        }
         None => handle_dispatch(&args),
     }
 }
@@ -129,12 +132,22 @@ fn handle_dispatch(args: &Cli) {
         ref title,
         gui,
         timeout: rule_timeout,
+        force_gui: rule_force_gui,
     } = decision
     {
         let gui_enabled = GuiDialog::is_enabled(args.no_gui);
         let timeout = rule_timeout.unwrap_or_else(|| GuiDialog::resolve_timeout(args.timeout));
 
-        let should_popup = if let Some(rule_gui) = gui {
+        let force_gui_flag = args.force_gui
+            || std::env::var("AI_HOOK_FORCE_GUI")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+        let is_forced = force_gui_flag || rule_force_gui.unwrap_or(false);
+
+        let should_popup = if is_forced {
+            !args.dry_run
+        } else if let Some(rule_gui) = gui {
             rule_gui && gui_enabled && !args.dry_run
         } else {
             // Default: popup if GUI is enabled and not dry-run
