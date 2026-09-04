@@ -1,4 +1,4 @@
-use super::input::{HookContext, Platform};
+use super::{HookContext, Platform};
 use crate::i18n::{Msg, t};
 use serde_json::json;
 
@@ -19,10 +19,10 @@ pub enum HookDecision {
 
 /// The offending command (or file when no command) of the current context.
 fn ctx_target(ctx: &HookContext) -> &str {
-    if let Some(cmd) = ctx.cmd.as_deref() {
-        if !cmd.is_empty() {
-            return cmd;
-        }
+    if let Some(cmd) = ctx.cmd.as_deref()
+        && !cmd.is_empty()
+    {
+        return cmd;
     }
     ctx.file
         .as_ref()

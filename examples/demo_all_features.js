@@ -3,7 +3,7 @@
  * 
  * ai-hook 全能力与上下文演示规则脚本 (Comprehensive Feature Demo)
  * 演示：
- * 1. 如何直接读取当前是什么类型 AI Agent (ctx.agent / ctx.agentType)
+ * 1. 如何直接读取当前是什么类型 AI Agent (ctx.agent)
  * 2. 如何获取 AI 原始输入 (ctx.raw, ctx.rawInput) 与参数 (ctx.args)
  * 3. 如何调用 sys 极速自治能力 (时间/Git/文件/环境变量)
  * 4. 如何控制：直接强制阻断(不弹窗) vs 唤起吸附倒计时弹窗 vs 命令行终端确认

@@ -70,19 +70,19 @@ fn parse_env_lang(value: &str) -> Option<Lang> {
 
 fn detect() -> Lang {
     // 1. Explicit override.
-    if let Ok(v) = std::env::var("AI_HOOK_LANG") {
-        if let Some(l) = parse_env_lang(&v) {
-            return l;
-        }
+    if let Ok(v) = std::env::var("AI_HOOK_LANG")
+        && let Some(l) = parse_env_lang(&v)
+    {
+        return l;
     }
 
     // 2. Host locale environment variables. Only an explicit Chinese locale
     //    forces Chinese; any other locale falls back to English defaults.
     for var in ["LC_ALL", "LANG", "LANGUAGE"] {
-        if let Ok(v) = std::env::var(var) {
-            if v.to_ascii_lowercase().starts_with("zh") {
-                return Lang::Zh;
-            }
+        if let Ok(v) = std::env::var(var)
+            && v.to_ascii_lowercase().starts_with("zh")
+        {
+            return Lang::Zh;
         }
     }
 
@@ -278,6 +278,38 @@ pub enum Msg {
     M131,
     M132,
     M133,
+    // -- Fail-closed / gate diagnostics --
+    /// Rule returned a value the engine cannot interpret.
+    M134,
+    /// stdin could not be read (broken pipe / invalid UTF-8) -> deny.
+    M135,
+    /// stdin was empty -> deny.
+    M136,
+    /// Explicit rule paths were given but none of them loaded.
+    M137,
+    /// A command was allowed by the fast path before any rule ran.
+    M138,
+    /// CLI help text for --no-fast-path.
+    M139,
+    // -- Self-update integrity --
+    /// Downloaded asset failed its SHA256 check.
+    M140,
+    /// SHA256SUMS.txt has no entry for the selected asset.
+    M141,
+    /// SHA256SUMS.txt could not be downloaded/parsed.
+    M142,
+    /// SHA256 verification succeeded.
+    M143,
+    /// Uncompressed archive entry exceeds the size cap.
+    M144,
+    /// Confirmation prompt before updating from a non-default repository.
+    M145,
+    /// User declined the non-default repository confirmation.
+    M146,
+    /// Notice printed when checksum verification is explicitly skipped.
+    M147,
+    /// Payload is not valid JSON: ask the operator instead of guessing.
+    M148,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -310,9 +342,9 @@ impl Msg {
                 }
             },
             Msg::M004 => match l {
-                Lang::Zh => "【规则引擎异常】规则 '{}' 执行失败,已按拒绝处理(不会静默放行):\\ n{}",
+                Lang::Zh => "【规则引擎异常】规则 '{}' 执行失败,已按拒绝处理(不会静默放行):\n{}",
                 Lang::En => {
-                    "[Rule engine failure] Rule '{}' failed and the operation was DENIED (fail-closed; a broken rule never silently allows):\\ n{}"
+                    "[Rule engine failure] Rule '{}' failed and the operation was DENIED (fail-closed; a broken rule never silently allows):\n{}"
                 }
             },
             Msg::M005 => match l {
@@ -881,6 +913,106 @@ impl Msg {
                 Lang::Zh => "教程语言:'zh' 中文或 'en' 英文(默认跟随系统语言)",
                 Lang::En => {
                     "Tutorial language: \"zh\" for Chinese or \"en\" for English (default: follow the system language)"
+                }
+            },
+            Msg::M134 => match l {
+                Lang::Zh => {
+                    "[ai-hook] 规则 '{}' 返回了引擎无法识别的值(期望 { action: \"allow\"|\"deny\"|\"confirm\" } 对象、false,或显式 return null 表示不表态)。已按拒绝处理,请检查规则是否漏写了 return。"
+                }
+                Lang::En => {
+                    "[ai-hook] Rule '{}' returned a value the engine cannot interpret (expected an object { action: \"allow\"|\"deny\"|\"confirm\" }, false, or an explicit `return null` for \"no opinion\"). Treated as DENIED - check whether the rule is missing a return statement."
+                }
+            },
+            Msg::M135 => match l {
+                Lang::Zh => "[ai-hook] 无法读取宿主输入(stdin),已按拒绝处理(不会静默放行)",
+                Lang::En => {
+                    "[ai-hook] Could not read the host payload from stdin; DENIED (never silently allowed)"
+                }
+            },
+            Msg::M136 => match l {
+                Lang::Zh => "[ai-hook] 宿主下发的输入为空,已按拒绝处理(不会静默放行)",
+                Lang::En => "[ai-hook] The host payload was empty; DENIED (never silently allowed)",
+            },
+            Msg::M137 => match l {
+                Lang::Zh => {
+                    "警告:显式指定了 {} 个规则路径,但实际加载到 0 条规则(路径是否存在、扩展名是否为 .js?)。当前所有命令都会被放行。"
+                }
+                Lang::En => {
+                    "Warning: {} rule path(s) were given explicitly but 0 rules were loaded (are the paths valid *.js files?). Every command will now be allowed."
+                }
+            },
+            Msg::M138 => match l {
+                Lang::Zh => {
+                    "命令被 fast path 在规则引擎之前放行(未执行任何规则)。用 --no-fast-path 或 AI_HOOK_FAST_PATH=0 可关闭该旁路。"
+                }
+                Lang::En => {
+                    "Command was allowed by the fast path before any rule ran. Disable this bypass with --no-fast-path or AI_HOOK_FAST_PATH=0."
+                }
+            },
+            Msg::M139 => match l {
+                Lang::Zh => "禁用 fast path 旁路(所有命令都交给规则引擎判断)",
+                Lang::En => {
+                    "Disable the fast-path bypass (send every command through the rule engine)"
+                }
+            },
+            Msg::M140 => match l {
+                Lang::Zh => {
+                    "下载的资产未通过 SHA256 校验(期望 {} 实际 {}),已中止更新。原始可执行文件未被改动。"
+                }
+                Lang::En => {
+                    "The downloaded asset failed its SHA256 check (expected {}, got {}). Update aborted; the installed binary was left untouched."
+                }
+            },
+            Msg::M141 => match l {
+                Lang::Zh => {
+                    "SHA256SUMS.txt 中没有资产 '{}' 的校验和,已中止更新。请确认该 release 的发布产物完整。"
+                }
+                Lang::En => {
+                    "SHA256SUMS.txt contains no checksum for asset '{}'. Update aborted; verify that the release published its artifacts completely."
+                }
+            },
+            Msg::M142 => match l {
+                Lang::Zh => {
+                    "无法获取 SHA256SUMS.txt({}),已中止更新。设置 AI_HOOK_SKIP_CHECKSUM=1 可跳过校验(不推荐)。"
+                }
+                Lang::En => {
+                    "Could not retrieve SHA256SUMS.txt ({}). Update aborted; set AI_HOOK_SKIP_CHECKSUM=1 to skip verification (not recommended)."
+                }
+            },
+            Msg::M143 => match l {
+                Lang::Zh => "✓ SHA256 校验通过",
+                Lang::En => "SHA256 checksum verified",
+            },
+            Msg::M144 => match l {
+                Lang::Zh => "解压后的体积超过上限 {} MB,已中止更新(疑似压缩包炸弹)。",
+                Lang::En => {
+                    "Uncompressed size exceeds the {} MB cap; update aborted (possible archive bomb)."
+                }
+            },
+            Msg::M145 => match l {
+                Lang::Zh => "即将从非默认仓库 '{}' 下载并执行二进制文件。确认信任该仓库?[y/N]",
+                Lang::En => {
+                    "About to download and execute a binary from the non-default repository '{}'. Do you trust it? [y/N]"
+                }
+            },
+            Msg::M146 => match l {
+                Lang::Zh => "已取消更新。",
+                Lang::En => "Update cancelled.",
+            },
+            Msg::M147 => match l {
+                Lang::Zh => {
+                    "⚠️  已跳过 SHA256 校验(AI_HOOK_SKIP_CHECKSUM=1),请自行确认下载来源可信。"
+                }
+                Lang::En => {
+                    "Skipping SHA256 verification (AI_HOOK_SKIP_CHECKSUM=1); make sure you trust the download source."
+                }
+            },
+            Msg::M148 => match l {
+                Lang::Zh => {
+                    "[ai-hook] 宿主下发的输入无法解析为有效的 JSON,无法判断其工具调用意图。请人工确认是否允许继续;如非预期,请检查宿主 hook 配置与数据流。"
+                }
+                Lang::En => {
+                    "[ai-hook] The host payload is not valid JSON, so its tool-call intent cannot be determined. Please decide manually whether to continue; if unexpected, check the host's hook configuration and data flow."
                 }
             },
             Msg::AllowWord => match l {

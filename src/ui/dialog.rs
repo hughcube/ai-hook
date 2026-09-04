@@ -58,24 +58,22 @@ impl GuiDialog {
 
     /// Resolves the GUI countdown timeout in seconds (default: 60).
     pub fn resolve_timeout(cli_timeout: Option<u32>) -> u32 {
-        if let Some(to) = cli_timeout {
-            if to > 0 {
-                return to;
-            }
+        if let Some(to) = cli_timeout
+            && to > 0
+        {
+            return to;
         }
-        if let Ok(val) = std::env::var("AI_HOOK_GUI_TIMEOUT") {
-            if let Ok(parsed) = val.trim().parse::<u32>() {
-                if parsed > 0 {
-                    return parsed;
-                }
-            }
+        if let Ok(val) = std::env::var("AI_HOOK_GUI_TIMEOUT")
+            && let Ok(parsed) = val.trim().parse::<u32>()
+            && parsed > 0
+        {
+            return parsed;
         }
-        if let Ok(val) = std::env::var("HOOK_GUI_TIMEOUT") {
-            if let Ok(parsed) = val.trim().parse::<u32>() {
-                if parsed > 0 {
-                    return parsed;
-                }
-            }
+        if let Ok(val) = std::env::var("HOOK_GUI_TIMEOUT")
+            && let Ok(parsed) = val.trim().parse::<u32>()
+            && parsed > 0
+        {
+            return parsed;
         }
         60
     }
@@ -479,14 +477,22 @@ impl GuiDialog {
     }
 
     #[cfg(target_os = "macos")]
-    #[cfg(target_os = "macos")]
     fn prompt_macos_native(title: &str, body: &str, timeout_sec: u32) -> bool {
         // Escape the text for embedding inside an AppleScript string literal.
         // Backslash MUST be escaped before quotes: a raw '\' followed by '"'
         // would otherwise close the string early and inject AppleScript code
         // (title/command originate from rules or the agent, not from us).
+        // Newlines/tabs must become the two-character escapes `\n`/`\t`:
+        // AppleScript string literals cannot span lines, so a raw newline
+        // (common in multi-line commands) would abort the script, the dialog
+        // would never appear and every confirm would silently degrade to deny.
         fn apple_escape(s: &str) -> String {
-            s.replace('\\', "\\\\").replace('"', "\\\"")
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace("\r\n", "\\n")
+                .replace('\n', "\\n")
+                .replace('\r', "\\n")
+                .replace('\t', "\\t")
         }
         let clean_title = apple_escape(title);
         let clean_body = apple_escape(body);

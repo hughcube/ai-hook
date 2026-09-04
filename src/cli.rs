@@ -46,6 +46,11 @@ pub struct Cli {
     /// command instead of silently allowing it.
     #[arg(long, global = true)]
     pub allow_on_error: bool,
+
+    /// Disable the fast-path bypass so whitelisted read-only commands
+    /// (git status, ls, cat, ...) are also evaluated by the rule engine
+    #[arg(long, global = true)]
+    pub no_fast_path: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,6 +190,7 @@ pub fn localized_command() -> Command {
             ("timeout", M111),
             ("dry_run", M112),
             ("allow_on_error", M113),
+            ("no_fast_path", M139),
         ]
     );
 
@@ -208,6 +214,5 @@ pub fn localized_command() -> Command {
     );
     let cmd = sub_help!(cmd, "install", M127, [("target_dir", M128)]);
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
-    let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
-    cmd
+    sub_help!(cmd, "tutorial", M132, [("lang", M133)])
 }

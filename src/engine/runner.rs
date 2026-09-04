@@ -1,5 +1,5 @@
-use super::loader::RuleSource;
-use super::sys::{RequestCache, SysContext, create_sys_object};
+use super::sys::create_sys_object;
+use super::{RequestCache, RuleSource, SysContext};
 use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision};
 use rquickjs::{Context, Function, Object, Runtime, Value};
@@ -46,7 +46,6 @@ pub struct RuleRunner {
     timeout: Duration,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RuleExecutionResult {
     pub rule_id: String,
@@ -133,13 +132,12 @@ fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: 
     };
 
     // Rotate once if oversized (checked at open time — cheap).
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > MAX_LOG_BYTES {
-            if let Some(name) = path.file_name() {
-                let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-                let _ = std::fs::rename(&path, &rotated);
-            }
-        }
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > MAX_LOG_BYTES
+        && let Some(name) = path.file_name()
+    {
+        let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
+        let _ = std::fs::rename(&path, &rotated);
     }
 
     let line = serde_json::json!({
@@ -389,12 +387,23 @@ impl RuleRunner {
                         _ => {}
                     }
                 }
-            } else if let Some(b) = raw_val.as_bool() {
-                if !b {
-                    decision = Some(HookDecision::Deny {
-                        reason: tf(Msg::M002, &[&rule.id]),
-                    });
-                }
+            } else if let Some(b) = raw_val.as_bool()
+                && !b
+            {
+                decision = Some(HookDecision::Deny {
+                    reason: tf(Msg::M002, &[&rule.id]),
+                });
+            }
+
+            // A rule that yielded neither a decision nor an error returned
+            // something the engine cannot interpret: a missing `return`, an
+            // unknown `action` string, a bare `true`, a number, ... Only an
+            // explicit null/undefined means "no opinion". Anything else is a
+            // broken rule and MUST be reported, otherwise the fail-closed
+            // check below sees (decision=None, error=None) and silently lets
+            // the command through.
+            if decision.is_none() && error.is_none() && !is_no_opinion(&raw_val) {
+                error = Some(tf(Msg::M134, &[&rule.id]));
             }
 
             Ok(())
@@ -405,10 +414,10 @@ impl RuleRunner {
 
         let elapsed = start.elapsed();
 
-        if let Err(e) = res {
-            if error.is_none() {
-                error = Some(normalize_rule_error(&e.to_string()));
-            }
+        if let Err(e) = res
+            && error.is_none()
+        {
+            error = Some(normalize_rule_error(&e.to_string()));
         }
 
         // The watchdog interrupt fires once the deadline passes, whether it
@@ -445,12 +454,13 @@ impl RuleRunner {
 
             // A rule that failed without producing a decision must not be
             // treated as "pass" when the gate is fail-closed.
-            if policy == ErrorPolicy::FailClosed && res.decision.is_none() {
-                if let Some(err) = res.error.clone() {
-                    results.push(res);
-                    let reason = tf(Msg::M004, &[&rule.id, &err]);
-                    return (HookDecision::Deny { reason }, results);
-                }
+            if policy == ErrorPolicy::FailClosed
+                && res.decision.is_none()
+                && let Some(err) = res.error.clone()
+            {
+                results.push(res);
+                let reason = tf(Msg::M004, &[&rule.id, &err]);
+                return (HookDecision::Deny { reason }, results);
             }
 
             let hit = res.decision.clone();
@@ -476,6 +486,17 @@ const EXPORT_DEFAULT_LEN: usize = "export default".len();
 /// Normalizes error text (rquickjs prefixes vary across versions).
 fn normalize_rule_error(err: &str) -> String {
     err.trim().to_string()
+}
+
+/// True when a rule explicitly declined to state an opinion (`return null`),
+/// the documented way to hand control to the next rule.
+///
+/// `undefined` deliberately does NOT count: a function that simply falls off
+/// the end is almost always a missing `return`, and a security gate must not
+/// treat that as "this rule is fine with the command". Rules that want to pass
+/// must say so with `return null`.
+fn is_no_opinion(val: &Value) -> bool {
+    val.is_null()
 }
 
 /// Locates the first top-level `export default` occurrence that is NOT inside a
@@ -531,12 +552,20 @@ fn find_export_default(code: &str) -> Option<usize> {
                         || !(bytes[i - 1].is_ascii_alphanumeric()
                             || bytes[i - 1] == b'_'
                             || bytes[i - 1] == b'$');
+                    // Boundary: neither may the next char continue the
+                    // identifier (`export defaultValue = 5` is not the default
+                    // export; rewriting it would silently change semantics).
+                    let next_idx = i + EXPORT_DEFAULT_LEN;
+                    let next_ok = next_idx >= n
+                        || !(bytes[next_idx].is_ascii_alphanumeric()
+                            || bytes[next_idx] == b'_'
+                            || bytes[next_idx] == b'$');
                     // Must be the first code on its line (only whitespace before).
                     let line_ok = code[..i]
                         .rfind('\n')
                         .map(|ls| code[ls + 1..i].chars().all(|c| c.is_whitespace()))
                         .unwrap_or_else(|| code[..i].chars().all(|c| c.is_whitespace()));
-                    if prev_ok && line_ok {
+                    if prev_ok && line_ok && next_ok {
                         return Some(i);
                     }
                     i += "export".len();

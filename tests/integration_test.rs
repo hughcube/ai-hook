@@ -274,7 +274,10 @@ fn test_file_action_normalization_across_hosts() {
     assert_eq!(vf.file.as_ref().map(|f| f.action), Some(FileAction::Read));
     // Real Antigravity view_file carries its target as AbsolutePath
     // (captured payloads); it must normalize to action=read with the path.
-    let vf_abs = parse_agy("view_file", serde_json::json!({ "AbsolutePath": "/p/secret.txt" }));
+    let vf_abs = parse_agy(
+        "view_file",
+        serde_json::json!({ "AbsolutePath": "/p/secret.txt" }),
+    );
     assert_eq!(
         vf_abs.file,
         Some(FileContext {
@@ -517,7 +520,11 @@ fn test_async_rule_is_reported_not_silently_allowed() {
     );
 
     // ...and the default fail-closed policy turns that into Deny.
-    let (dec, _) = runner.evaluate_all(&[async_rule.clone()], &ctx, ErrorPolicy::FailClosed);
+    let (dec, _) = runner.evaluate_all(
+        std::slice::from_ref(&async_rule),
+        &ctx,
+        ErrorPolicy::FailClosed,
+    );
     assert!(matches!(dec, HookDecision::Deny { .. }));
 
     // Only an explicit opt-out restores the old allow-on-error behaviour.
@@ -534,10 +541,18 @@ fn test_broken_rule_fails_closed_and_can_opt_out() {
     );
     let ctx = ctx_for("echo hi");
 
-    let (dec, _) = runner.evaluate_all(&[throwing.clone()], &ctx, ErrorPolicy::FailClosed);
+    let (dec, _) = runner.evaluate_all(
+        std::slice::from_ref(&throwing),
+        &ctx,
+        ErrorPolicy::FailClosed,
+    );
     assert!(matches!(dec, HookDecision::Deny { .. }), "{dec:?}");
 
-    let (dec2, _) = runner.evaluate_all(&[throwing.clone()], &ctx, ErrorPolicy::AllowOnError);
+    let (dec2, _) = runner.evaluate_all(
+        std::slice::from_ref(&throwing),
+        &ctx,
+        ErrorPolicy::AllowOnError,
+    );
     assert_eq!(dec2, HookDecision::Allow);
 
     // Syntax errors are just as fatal.
@@ -793,8 +808,8 @@ fn test_loader_directory_load_is_sorted_and_deterministic() {
 
     // Load twice; the order must be file-name sorted regardless of the order
     // the filesystem enumerates them.
-    let first = RuleLoader::load_rules(&[dir.clone()]);
-    let second = RuleLoader::load_rules(&[dir.clone()]);
+    let first = RuleLoader::load_rules(std::slice::from_ref(&dir));
+    let second = RuleLoader::load_rules(std::slice::from_ref(&dir));
     let ids = |rules: &[RuleSource]| rules.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
     assert_eq!(ids(&first), ["alpha", "mango", "zebra"]);
     assert_eq!(ids(&first), ids(&second));
@@ -825,5 +840,226 @@ fn test_tutorial_output() {
     assert!(
         zh.contains("tutorial"),
         "zh tutorial must contain tutorial cmd"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed regressions (the engine must never silently pass a command when
+// a rule is broken: a missing return, an unparsable value, an unknown action).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_missing_return_fails_closed_not_silently_allowed() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    // Author intended to deny the command but forgot the `return`: the
+    // function falls off the end and yields `undefined`. Under FailClosed
+    // this must be reported as an error and DENIED, like an exception.
+    let sloppy = rule(
+        "sloppy",
+        r#"export default function(ctx, sys) {
+            if (ctx.cmd && /rm\s+-rf/.test(ctx.cmd)) {
+                const d = { action: "deny", reason: "blocked" };
+            }
+        }"#,
+    );
+    let ctx = ctx_for("rm -rf /tmp/data");
+
+    let res = runner.execute_rule(&sloppy, &ctx);
+    assert!(
+        res.error.is_some(),
+        "missing return must set an error: {res:?}"
+    );
+
+    let (dec, _) =
+        runner.evaluate_all(std::slice::from_ref(&sloppy), &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::Deny { .. }), "{dec:?}");
+
+    // Explicit opt-out still restores the old pass-through behaviour.
+    let (dec2, _) = runner.evaluate_all(&[sloppy], &ctx, ErrorPolicy::AllowOnError);
+    assert_eq!(dec2, HookDecision::Allow);
+}
+
+#[test]
+fn test_unknown_action_object_fails_closed() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let unknown = rule(
+        "unknown-action",
+        r#"export default function(ctx, sys) {
+            if (ctx.cmd && ctx.cmd.includes("op17")) {
+                return { action: "no_such_action", reason: "typo" };
+            }
+            return null;
+        }"#,
+    );
+    let ctx = ctx_for("run op17");
+    let res = runner.execute_rule(&unknown, &ctx);
+    assert!(
+        res.error.is_some(),
+        "unknown action must be an error: {res:?}"
+    );
+    let (dec, _) = runner.evaluate_all(&[unknown], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::Deny { .. }), "{dec:?}");
+}
+
+#[test]
+fn test_return_null_remains_no_opinion() {
+    // `return null` is the documented "no opinion, move to the next rule" and
+    // must keep passing under FailClosed (not treated as a broken rule).
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let pass = rule("pass", "export default function(ctx, sys) { return null; }");
+    let ctx = ctx_for("echo hi");
+    let (dec, results) = runner.evaluate_all(&[pass], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(dec, HookDecision::Allow);
+    assert_eq!(results[0].error, None);
+}
+
+#[test]
+fn test_export_default_boundary_rejects_identifier_suffix() {
+    // `export defaultValue` is NOT the module default export. Without the
+    // trailing-boundary check it would be rewritten to `return Value = 5`,
+    // which is legal JS, silently changing semantics: the rule would "pass"
+    // (a number is not an actionable value) and the gate would open.
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let weird = rule("boundary", "export defaultValue = 5;");
+    let ctx = ctx_for("echo hi");
+    let res = runner.execute_rule(&weird, &ctx);
+    // The literal `export` keyword stays invalid inside `new Function`, so the
+    // rule must surface as an error and fail closed - never as a silent allow.
+    assert!(res.error.is_some(), "must be reported as broken: {res:?}");
+    assert!(res.decision.is_none());
+    let (dec, _) = runner.evaluate_all(&[weird], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::Deny { .. }), "{dec:?}");
+}
+
+// ---------------------------------------------------------------------------
+// CLI end-to-end regressions (exercise the real binary through std::process).
+// ---------------------------------------------------------------------------
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+fn write_temp_rule(dir: &std::path::Path, name: &str, code: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(code.as_bytes()).unwrap();
+    path
+}
+
+#[test]
+fn test_cli_test_subcommand_sees_ctx_cmd() {
+    // Regression: the `test` subcommand built a payload without `toolCall.name`,
+    // so ctx.cmd was always null and every command rule silently no-op'd.
+    let tmp = std::env::temp_dir().join(format!("ai-hook-cli-cmd-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let rule_file = write_temp_rule(
+        &tmp,
+        "cmd-guard.js",
+        r#"export default function(ctx, sys) {
+            if (ctx.cmd && ctx.cmd.includes("op17")) {
+                return { action: "deny", reason: "cli-blocked" };
+            }
+            return null;
+        }"#,
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["test", "run op17", &rule_file.to_string_lossy()])
+        .output()
+        .expect("run ai-hook test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("cli-blocked"),
+        "ctx.cmd must reach the rule; stdout: {stdout} stderr: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn test_cli_fast_path_can_be_disabled() {
+    let tmp = std::env::temp_dir().join(format!("ai-hook-cli-fp-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let rule_file = write_temp_rule(
+        &tmp,
+        "status-guard.js",
+        r#"export default function(ctx, sys) {
+            if (ctx.cmd && ctx.cmd.startsWith("git status")) {
+                return { action: "deny", reason: "status-blocked" };
+            }
+            return null;
+        }"#,
+    );
+    let rule_arg = rule_file.to_string_lossy().to_string();
+    let payload = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git status --short"}},"conversationId":"c"}"#;
+
+    // Fast path enabled (default): the rule never runs.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args([&rule_arg])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"allow\""),
+        "fast path should allow without running rules"
+    );
+
+    // --no-fast-path: the same command now reaches the rule and is denied.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["--no-fast-path", &rule_arg])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"deny\"") && stdout.contains("status-blocked"),
+        "--no-fast-path must let the rule deny: {stdout}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn test_cli_unparsable_payload_asks_not_silently_allows() {
+    // A payload that is not JSON carries no tool semantics. Silently running
+    // rules against an empty view would usually end in an accidental Allow,
+    // so ai-hook must emit an "ask" (or deny) instead of an empty stdout.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .env("HOOK_TEST_MODE", "1") // no GUI dialogs in CI/test processes
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}},"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "unparsable payload must never produce empty (allow) output"
+    );
+    assert!(
+        stdout.contains("\"ask\"") || stdout.contains("\"deny\""),
+        "unparsable payload must ask or deny: {stdout}"
     );
 }

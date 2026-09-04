@@ -90,6 +90,10 @@ pub struct HookContext {
     /// Raw payload as text and as parsed JSON (always available).
     pub raw_input: String,
     pub raw_value: serde_json::Value,
+    /// True when the raw payload could not be parsed as JSON at all. No tool
+    /// semantics are available in that case; callers should ask the operator
+    /// instead of silently running rules against an empty view.
+    pub parse_failed: bool,
 }
 
 /// Single source of truth for boolean environment flags, so CLI and env
@@ -128,6 +132,24 @@ fn permission_mode_is_yolo(mode: &str) -> bool {
 /// (`hook_event_name` + `tool_name` + `tool_input`).
 fn has_claude_envelope(val: &serde_json::Value) -> bool {
     val.get("tool_input").is_some() || val.get("tool_name").is_some()
+}
+
+/// Case-insensitive ASCII substring search that does not allocate a lowercased
+/// copy of the haystack (hook payloads can carry megabytes of transcript).
+fn contains_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| {
+        w.iter()
+            .zip(n.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 /// Classifies command/file tools and extracts the normalized payload for the
@@ -219,6 +241,7 @@ impl HookContext {
                     tool_args: serde_json::Value::Null,
                     raw_input: raw_json.to_string(),
                     raw_value: serde_json::Value::Null,
+                    parse_failed: true,
                 };
             }
         };
@@ -250,7 +273,15 @@ impl HookContext {
             return Self {
                 platform: Platform::Antigravity,
                 permission_mode: None,
-                is_yolo: env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS"),
+                // Prefer the documented AGY env switch, but also honor a
+                // permission mode carried in the payload: relying on the env
+                // var alone silently reports "not YOLO" when the host does not
+                // export it into the hook process, which would emit `force_ask`
+                // to a host that never asks.
+                is_yolo: env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS")
+                    || get_str(&val, &["permissionMode", "permission_mode"])
+                        .map(permission_mode_is_yolo)
+                        .unwrap_or(false),
                 conversation,
                 cwd: args
                     .and_then(|a| get_str(a, &["Cwd", "cwd"]))
@@ -263,6 +294,7 @@ impl HookContext {
                 tool_args,
                 raw_input: raw_json.to_string(),
                 raw_value: val,
+                parse_failed: false,
             };
         }
 
@@ -296,9 +328,12 @@ impl HookContext {
                     Some(conversation)
                 };
 
+            // Host identity fields sit near the start of the payload; cap the
+            // scan so a multi-megabyte transcript cannot slow every hook call.
+            let scan_end = raw_json.floor_char_boundary(raw_json.len().min(64 * 1024));
             let is_codebuddy = std::env::var("CODEBUDDY").is_ok()
                 || std::env::var("CODEBUDDY_CLI").is_ok()
-                || raw_json.to_lowercase().contains("codebuddy");
+                || contains_ascii_ignore_case(&raw_json[..scan_end], "codebuddy");
 
             let platform = if val.get("turn_id").is_some() {
                 // `turn_id` is documented as Codex-only.
@@ -324,6 +359,7 @@ impl HookContext {
                 tool_args,
                 raw_input: raw_json.to_string(),
                 raw_value: val,
+                parse_failed: false,
             };
         }
 
@@ -343,6 +379,7 @@ impl HookContext {
             tool_args: serde_json::Value::Null,
             raw_input: raw_json.to_string(),
             raw_value: val,
+            parse_failed: false,
         }
     }
 }

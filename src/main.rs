@@ -1,7 +1,7 @@
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
-use ai_hook::i18n::{Msg, t};
+use ai_hook::i18n::{Msg, t, tf};
 use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{HookContext, HookDecision};
 use ai_hook::ui::GuiDialog;
@@ -96,6 +96,27 @@ fn allow_on_error_requested(args: &Cli) -> bool {
     args.allow_on_error || env_flag_true("AI_HOOK_ALLOW_ON_ERROR")
 }
 
+/// The fast-path bypass can be disabled via CLI flag or environment so that
+/// whitelisted read-only commands still reach the rule engine. Off values
+/// follow the same convention as AI_HOOK_GUI / AI_HOOK_LOG.
+fn fast_path_disabled(args: &Cli) -> bool {
+    if args.no_fast_path {
+        return true;
+    }
+    std::env::var("AI_HOOK_FAST_PATH")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "0" || v == "false" || v == "no" || v == "off"
+        })
+        .unwrap_or(false)
+}
+
+/// True when the operator configured rule paths (CLI or env), used to decide
+/// whether a fast-path bypass is worth warning about.
+fn rules_configured(explicit_paths: &[PathBuf]) -> bool {
+    !explicit_paths.is_empty() || std::env::var("AI_HOOK_RULES").is_ok()
+}
+
 /// Main entry point for agent hook dispatching via stdin
 fn handle_dispatch(args: &Cli) {
     if std::io::stdin().is_terminal() {
@@ -112,28 +133,91 @@ fn handle_dispatch(args: &Cli) {
     let mut buffer = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buffer) {
         // Unreadable stdin (broken pipe / invalid UTF-8) yields no reliable
-        // payload; log instead of failing silently.
+        // payload. Empty output means "allow" to every host protocol, so an
+        // unreadable payload must deny rather than return silently.
         eprintln!("[ai-hook] {}: {}", t(Msg::M055), e);
+        let ctx = HookContext::parse("");
+        let reason = t(Msg::M135).to_string();
+        print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
         return;
     }
 
     if buffer.trim().is_empty() {
+        // Same reasoning: an empty hook payload is not a verified allow.
+        let ctx = HookContext::parse("");
+        let reason = t(Msg::M136).to_string();
+        print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
         return;
     }
 
     let ctx = HookContext::parse(&buffer);
 
+    // A payload that is not valid JSON carries no tool semantics at all.
+    // Failing silently (empty output would read as "allow") or running rules
+    // against an empty view would almost always end in an accidental Allow,
+    // so ask the operator instead: a GUI dialog when one is available, a
+    // terminal "ask" otherwise.
+    if ctx.parse_failed {
+        let reason = t(Msg::M148).to_string();
+        let gui_enabled = GuiDialog::is_enabled(args.no_gui) && !args.dry_run;
+        if gui_enabled {
+            let prompt_agent = ctx.platform.to_string();
+            let approved = GuiDialog::confirm(
+                t(Msg::M058),
+                &reason,
+                "",
+                &prompt_agent,
+                GuiDialog::resolve_timeout(args.timeout),
+            );
+            if approved {
+                print_output(&HookDecision::Allow.to_json_output(&ctx, None));
+            } else {
+                print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
+            }
+        } else {
+            // No dialog: emit a terminal "ask" so ask-capable hosts let the
+            // user decide. The plain Deny path would silently block a host
+            // that may simply use an envelope shape we have not seen yet.
+            print_output(
+                &HookDecision::Confirm {
+                    reason,
+                    title: None,
+                    gui: None,
+                    timeout: None,
+                    force_gui: None,
+                }
+                .to_json_output(&ctx, None),
+            );
+        }
+        return;
+    }
+
+    // 2. Collect explicit rule paths first: the fast path needs to know
+    //    whether any rules were configured at all (cheap, no file I/O).
+    let explicit_paths = collect_target_rules(args, None);
+
     // 1. Fast path check (< 0.01ms)
-    if let Some(decision) = check_fast_path(&ctx) {
+    if !fast_path_disabled(args)
+        && let Some(decision) = check_fast_path(&ctx)
+    {
+        // Rules exist but were skipped: say so, otherwise the bypass is
+        // invisible and rules appear to "not work" for these commands.
+        if rules_configured(&explicit_paths) {
+            eprintln!("[ai-hook] {}", t(Msg::M138));
+        }
         print_output(&decision.to_json_output(&ctx, None));
         return;
     }
 
-    // 2. Load explicit rules (no full-disk auto traversal)
-    let explicit_paths = collect_target_rules(args, None);
+    // 3. Load explicit rules (no full-disk auto traversal)
     let rules = RuleLoader::load_rules(&explicit_paths);
 
     if rules.is_empty() {
+        // No gate at all. If the operator pointed at paths that loaded nothing
+        // (typo, wrong extension), this is a silent full bypass - warn loudly.
+        if !explicit_paths.is_empty() {
+            eprintln!("[ai-hook] {}", tf(Msg::M137, &[&explicit_paths.len()]));
+        }
         print_output(&HookDecision::Allow.to_json_output(&ctx, None));
         return;
     }
@@ -253,9 +337,11 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    // `name` lives inside toolCall for the Antigravity envelope; omitting it
+    // made `ctx.cmd` always null and silently disabled every command rule.
     let raw_payload = serde_json::json!({
-        "toolName": tool,
         "toolCall": {
+            "name": tool,
             "args": {
                 "CommandLine": command,
                 "TargetFile": file,
@@ -268,12 +354,16 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
 
     let ctx = HookContext::parse(&raw_payload);
 
-    // Fast path check
-    let start_fast = Instant::now();
-    if let Some(decision) = check_fast_path(&ctx) {
-        println!("⚡ {} {:?}", t(Msg::M070), start_fast.elapsed());
-        println!("{}: {:?}", t(Msg::M071), decision);
-        return;
+    // Fast path check. Skipped when the bypass is disabled so whitelisted
+    // commands can still be traced through the rules with `test`.
+    if !fast_path_disabled(args) {
+        let start_fast = Instant::now();
+        if let Some(decision) = check_fast_path(&ctx) {
+            println!("⚡ {} {:?}", t(Msg::M070), start_fast.elapsed());
+            println!("{}: {:?}", t(Msg::M071), decision);
+            println!("ℹ️  {}", t(Msg::M138));
+            return;
+        }
     }
 
     let explicit_paths = collect_target_rules(args, Some(scripts));
@@ -321,6 +411,7 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
                 err,
                 res.duration
             );
+            println!("      {}", res.rule_path.display());
         } else {
             println!(
                 "  [{:<25}] {:<30} (in {:?})",
@@ -348,8 +439,8 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf
         .unwrap_or_default();
 
     let raw_payload = serde_json::json!({
-        "toolName": "run_command",
         "toolCall": {
+            "name": "run_command",
             "args": {
                 "CommandLine": command,
                 "Cwd": cwd,

@@ -14,6 +14,19 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// asset response exhausting memory.
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Absolute cap on one uncompressed archive entry. `MAX_DOWNLOAD_BYTES` bounds
+/// the wire size, but a small zip can expand to hundreds of GB, so the
+/// extracted stream needs its own budget (archive-bomb guard).
+const MAX_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The repository `--repo` defaults to. Anything else needs explicit
+/// confirmation: `update` downloads and overwrites the running executable.
+const DEFAULT_REPO: &str = "hughcube/ai-hook";
+
+/// Upper bound for the checksum file itself (it is tiny; the cap is pure
+/// paranoia against a hostile or hijacked release response).
+const MAX_CHECKSUM_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Opens `path` exclusively (fails if it exists). Any stale leftover from a
 /// previous run is removed first. `remove_file` never follows symlinks, so a
 /// pre-placed link cannot redirect the write to an arbitrary target.
@@ -112,6 +125,127 @@ fn get_target_candidates() -> Result<(&'static [&'static str], &'static str), St
     }
 }
 
+/// Case-insensitive "yes/1/true" test, matching the other env flag helpers.
+fn env_flag_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Asks the operator to confirm a non-default repository. `update` replaces the
+/// running executable with a downloaded binary, so silently trusting an
+/// arbitrary `owner/repo` would turn a mistyped flag into remote code
+/// execution.
+fn confirm_custom_repo(repo: &str) -> Result<(), String> {
+    if repo == DEFAULT_REPO || env_flag_true("AI_HOOK_ACCEPT_REPO") {
+        return Ok(());
+    }
+    println!("{}", tf(Msg::M145, &[&repo]));
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(_) => {
+            let a = answer.trim().to_ascii_lowercase();
+            if a == "y" || a == "yes" {
+                Ok(())
+            } else {
+                Err(t(Msg::M146).to_string())
+            }
+        }
+        // No usable stdin (CI, piped input): refuse rather than assume yes.
+        Err(_) => Err(t(Msg::M146).to_string()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Copies at most `cap` bytes from `reader` to `writer`, failing if the source
+/// turns out to be larger. Used to bound archive extraction.
+fn copy_capped<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cap: u64,
+) -> std::io::Result<u64> {
+    let mut limited = reader.take(cap + 1);
+    let written = std::io::copy(&mut limited, writer)?;
+    if written > cap {
+        return Err(std::io::Error::other("uncompressed size cap exceeded"));
+    }
+    Ok(written)
+}
+
+/// Formats the archive bomb error, or a generic I/O error if it was something
+/// else.
+fn extraction_error(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::Other {
+        tf(Msg::M144, &[&(MAX_UNCOMPRESSED_BYTES / (1024 * 1024))])
+    } else {
+        e.to_string()
+    }
+}
+
+/// Downloads `SHA256SUMS.txt` from the release and returns the expected digest
+/// for `asset_name`.
+///
+/// `self_replace` overwrites the running binary, and a version-string
+/// self-check proves nothing (any payload can print "ai-hook"), so the
+/// published checksum is the only thing standing between a hijacked release and
+/// arbitrary code execution on the user's machine.
+fn fetch_expected_checksum(
+    release: &serde_json::Value,
+    asset_name: &str,
+    current_version: &str,
+) -> Result<String, String> {
+    let url = release
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some("SHA256SUMS.txt"))
+        })
+        .and_then(|a| a.get("browser_download_url"))
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| tf(Msg::M142, &[&"no SHA256SUMS.txt asset in the release"]))?;
+
+    let mut req = ureq::get(url).timeout(API_TIMEOUT).set(
+        "User-Agent",
+        &format!("ai-hook-updater/{}", current_version),
+    );
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", trimmed));
+        }
+    }
+
+    let mut text = String::new();
+    req.call()
+        .map_err(|e| tf(Msg::M142, &[&e]))?
+        .into_reader()
+        .take(MAX_CHECKSUM_FILE_BYTES)
+        .read_to_string(&mut text)
+        .map_err(|e| tf(Msg::M142, &[&e]))?;
+
+    // sha256sum writes "<hash>  <name>"; a leading '*' marks binary mode.
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("").trim_start_matches('*');
+        if name == asset_name && hash.len() == 64 {
+            return Ok(hash.to_ascii_lowercase());
+        }
+    }
+    Err(tf(Msg::M141, &[&asset_name]))
+}
+
 /// Simple Semantic Versioning parser (e.g. "0.1.4" -> (0, 1, 4))
 fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
@@ -129,6 +263,10 @@ fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
 pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     let current_version = env!("CARGO_PKG_VERSION");
     let (candidate_assets, binary_name) = get_target_candidates()?;
+
+    // A non-default --repo means replacing the running executable with
+    // somebody else's binary. Require an explicit confirmation.
+    confirm_custom_repo(repo)?;
 
     println!("{} https://github.com/{} ...", t(Msg::M015), repo);
 
@@ -241,6 +379,21 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         return Err(tf(Msg::M030, &[&(MAX_DOWNLOAD_BYTES / (1024 * 1024))]));
     }
 
+    // Verify the payload against the checksum published with the release,
+    // before any archive entry is written or the binary is executed. The
+    // `--version` probe below cannot serve this purpose: it asks the
+    // downloaded file to identify itself, which any payload can fake.
+    if env_flag_true("AI_HOOK_SKIP_CHECKSUM") {
+        eprintln!("[ai-hook] {}", t(Msg::M147));
+    } else {
+        let expected = fetch_expected_checksum(&release_val, asset_name, current_version)?;
+        let actual = sha256_hex(&binary_bytes);
+        if actual != expected {
+            return Err(tf(Msg::M140, &[&expected, &actual]));
+        }
+        println!("{}", t(Msg::M143));
+    }
+
     let temp_dir = std::env::temp_dir();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -275,9 +428,12 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
                 // Exclusive creation: never follow a pre-existing symlink.
                 let mut out_file =
                     open_temp_exclusive(&temp_bin_path).map_err(|e| tf(Msg::M035, &[&e]))?;
-                std::io::copy(&mut file, &mut out_file).map_err(|e| {
+                // Bounded copy: a small zip entry can expand enormously.
+                let copied = copy_capped(&mut file, &mut out_file, MAX_UNCOMPRESSED_BYTES);
+                drop(out_file); // release the handle so cleanup can unlink
+                copied.map_err(|e| {
                     let _ = std::fs::remove_file(&temp_bin_path);
-                    tf(Msg::M036, &[&e])
+                    extraction_error(e)
                 })?;
                 found = true;
                 break;
@@ -305,12 +461,20 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
             let mut entry = entry_res.map_err(|e| tf(Msg::M039, &[&e]))?;
             let path = entry.path().map_err(|e| tf(Msg::M040, &[&e]))?;
             if path.file_name().and_then(|n| n.to_str()) == Some(binary_name) {
-                // `unpack` writes the entry to the exact destination file and
-                // replaces it if present (it never follows symlinks: it unlinks
-                // dst first), so exclusive creation is honored here too.
-                entry.unpack(&temp_bin_path).map_err(|e| {
+                // Regular files only: never materialize a symlink or hardlink
+                // entry under our temp path.
+                if !entry.header().entry_type().is_file() {
+                    continue;
+                }
+                // Bounded copy instead of `unpack`: a small tar.gz can expand
+                // to hundreds of GB, and the declared size may lie.
+                let mut out_file =
+                    open_temp_exclusive(&temp_bin_path).map_err(|e| tf(Msg::M041, &[&e]))?;
+                let copied = copy_capped(&mut entry, &mut out_file, MAX_UNCOMPRESSED_BYTES);
+                drop(out_file); // release the handle so cleanup can unlink
+                copied.map_err(|e| {
                     let _ = std::fs::remove_file(&temp_bin_path);
-                    tf(Msg::M041, &[&e])
+                    extraction_error(e)
                 })?;
                 found = true;
                 break;

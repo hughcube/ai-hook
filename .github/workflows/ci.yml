@@ -30,6 +30,9 @@ jobs:
       - name: Format Check
         run: cargo fmt --check
 
+      - name: Clippy Lints
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Run Unit & Integration Tests
         run: cargo test --verbose
 
@@ -40,9 +43,17 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ./target/release/ai-hook.exe --version
-            ./target/release/ai-hook.exe -r examples list
+            EXE=./target/release/ai-hook.exe
           else
-            ./target/release/ai-hook --version
-            ./target/release/ai-hook -r examples list
+            EXE=./target/release/ai-hook
           fi
+          "$EXE" --version
+          "$EXE" -r examples list
+          # End-to-end regression: the `test` subcommand must feed the command
+          # line to ctx.cmd. (A missing toolCall.name made ctx.cmd always null,
+          # silently disabling every command rule; see review + unit tests.)
+          OUT="$("$EXE" test 'rm -rf /' examples/01_basic_regex.js 2>&1)"
+          case "$OUT" in
+            *"Deny"*) echo "ok: test subcommand evaluates command rules" ;;
+            *) echo "FAIL: command rule not enforced"; echo "$OUT"; exit 1 ;;
+          esac

@@ -21,6 +21,10 @@ ureq = { version = "2.10", default-features = false, features = ["tls", "json"] 
 flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+# Used to verify the SHA256SUMS.txt published alongside each release before a
+# downloaded binary is allowed to replace the running executable.
+sha2 = "0.10"
+hex = "0.4"
 
 
 [features]

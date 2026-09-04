@@ -36,11 +36,18 @@ fn chinese_tutorial_body() -> String {
   · 规则能力边界:无网络、无外部子进程、无任意写文件;sys 只读自治。
     stdout 只能承载协议 JSON——任何规则日志都不得写入 stdout。
   · fast path 旁路:命令形如白名单只读命令(如 git status/ls/cat/head/pwd
-    且无元字符)时,在规则引擎之前被放行。任何含换行/`$(`/反引号/重定向/
-    管道/`&&`/`;`/危险词的命令一律进入规则引擎,规则不会被旁路。
+    且无元字符)时,在规则引擎之前被放行,并会向 stderr 提示"规则被旁路"。
+    任何含换行/`$(`/反引号/重定向/管道/`&&`/`;`/危险词的命令一律进入规则
+    引擎。需要让白名单命令也经过规则时,用 --no-fast-path(或
+    AI_HOOK_FAST_PATH=0)关闭旁路。
   · 引擎失效边界(fail-closed):规则语法错误、运行时异常、死循环超时、
-    返回 Promise —— 一律按“拒绝”处理并把错误作为原因返回;绝不静默放行。
-    显式传入 --allow-on-error(或 AI_HOOK_ALLOW_ON_ERROR=1)才恢复出错放行。
+    返回 Promise、漏写 return(返回 undefined)或返回无法识别的值 —— 一律
+    按"拒绝"处理并把错误作为原因返回;绝不静默放行。规则的"放行"必须
+    显式写 return null。显式传入 --allow-on-error(或
+    AI_HOOK_ALLOW_ON_ERROR=1)才恢复出错放行。
+  · 输入失效边界:stdin 为空或不可读时一律按"拒绝"处理(空输出会被宿主
+    解读为放行,因此不可静默返回);能读入但无法解析为 JSON 的 payload 会被
+    转为人机确认(桌面弹窗;禁用弹窗时输出 ask),绝不静默放行。
 
 二、ctx —— 一次工具调用的完整归一化视图(唯一 schema,无别名)
 --------------------------------------------------------------------------------
@@ -93,6 +100,8 @@ fn chinese_tutorial_body() -> String {
 四、决策协议(规则返回值)
 --------------------------------------------------------------------------------
   return null;                    → 通过,继续下一规则(等价未表态)
+  return undefined / 漏写 return  → 视为引擎错误,按"拒绝"处理;
+                                  想放行请显式 return null
   return { action: "allow" };     → 明确放行,继续下一规则
   return { action: "deny",  reason: "…" };   → 硬拒绝,绝对不弹窗
   return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
@@ -139,7 +148,8 @@ fn chinese_tutorial_body() -> String {
   ai-hook list [<rules…>]           列出实际加载的规则
   ai-hook tutorial --lang en        英文版本文档
   --dry-run 不弹窗;--no-gui 禁用弹窗;--force-gui 强制弹窗;
-  --allow-on-error 规则出错放行;AI_HOOK_LANG=zh|en 固定语言;
+  --allow-on-error 规则出错放行;--no-fast-path 关闭只读白名单旁路;
+  AI_HOOK_LANG=zh|en 固定语言;
   弹窗语言/日志语言跟随系统(Windows 区域或 LANG),可被 AI_HOOK_LANG 覆盖。
   console.log 与 sys.log 永远不进入 stdout,不会破坏协议。
 
@@ -179,13 +189,22 @@ I. What it is / when it runs / when it does not
     only — rule logging must never go to stdout.
   · Fast-path bypass: commands that are provably single read-only invocations
     (whitelist like git status/ls/cat/head/pwd and no shell metacharacters)
-    are allowed BEFORE the rule engine. Anything containing newlines, `$( )`,
-    backticks, redirections, pipes, `&&`, `;`, or dangerous words always goes
-    through the engine — rules are never bypassed for those.
+    are allowed BEFORE the rule engine, with a stderr notice. Anything
+    containing newlines, `$( )`, backticks, redirections, pipes, `&&`, `;`, or
+    dangerous words always goes through the engine. To route whitelisted
+    commands through the rules too, disable the bypass with --no-fast-path or
+    AI_HOOK_FAST_PATH=0.
   · Engine failure boundary (fail-closed): syntax errors, runtime exceptions,
-    watchdog timeouts, or returned Promises are DENIED with the error as the
-    reason; a broken gate never silently opens. Pass --allow-on-error
+    watchdog timeouts, returned Promises, a missing return (yielding
+    `undefined`) or any unparsable return value are DENIED with the error as
+    the reason; a broken gate never silently opens. To pass, a rule must say
+    `return null` explicitly. Pass --allow-on-error
     (or AI_HOOK_ALLOW_ON_ERROR=1) explicitly to restore allow-on-error.
+  · Input failure boundary: an empty or unreadable stdin is DENIED (empty
+    output would read as "allow", so ai-hook never returns silently); a
+    readable but non-JSON payload is routed to a human confirmation (a desktop
+    dialog, or a terminal "ask" when dialogs are disabled) — never silently
+    allowed.
 
 II. ctx — one normalized view of a tool call (single schema, no aliases)
 --------------------------------------------------------------------------------
@@ -239,6 +258,8 @@ III. sys — read-only autonomous SDK (microsecond, no external processes)
 IV. Decision protocol (rule return values)
 --------------------------------------------------------------------------------
   return null;                    → pass, continue to the next rule
+  return undefined / no return    → engine error, DENIED;
+                                   say `return null` to pass explicitly
   return { action: "allow" };     → allow explicitly, keep going
   return { action: "deny", reason: "…" };  → hard block, never a popup
   return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
@@ -290,7 +311,8 @@ VII. Debug & operations
   ai-hook list [<rules…>]            show actually loaded rules
   ai-hook tutorial --lang zh         this document in Chinese
   --dry-run no dialogs; --no-gui disable dialogs; --force-gui force dialogs;
-  --allow-on-error allow on rule failure; AI_HOOK_LANG=zh|en pins language.
+  --allow-on-error allow on rule failure; --no-fast-path disable the read-only
+  whitelist bypass; AI_HOOK_LANG=zh|en pins language.
   Dialog/log language follows the system (Windows locale or LANG), overridable
   with AI_HOOK_LANG. console.log/sys.log never touch stdout.
 
