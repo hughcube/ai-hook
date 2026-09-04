@@ -161,8 +161,19 @@ fn normalize_semantics(
     }
 
     // 2. File tools: normalize {path, action} from the tool name.
+    // Real Antigravity argument names (official tool schema): view_file /
+    // view_file_outline use AbsolutePath; write/replace use TargetFile;
+    // list_dir uses DirectoryPath.
     let path_keys: &[&str] = match platform {
-        Platform::Antigravity => &["file_path", "FilePath", "TargetFile", "path", "file"],
+        Platform::Antigravity => &[
+            "file_path",
+            "FilePath",
+            "TargetFile",
+            "AbsolutePath",
+            "DirectoryPath",
+            "path",
+            "file",
+        ],
         _ => &["file_path", "filePath", "path", "TargetFile", "file"],
     };
     let action = match lower.as_str() {

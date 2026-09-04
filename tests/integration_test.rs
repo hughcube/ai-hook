@@ -272,6 +272,25 @@ fn test_file_action_normalization_across_hosts() {
     };
     let vf = parse_agy("view_file", serde_json::json!({ "file_path": "/p/a.txt" }));
     assert_eq!(vf.file.as_ref().map(|f| f.action), Some(FileAction::Read));
+    // Real Antigravity view_file carries its target as AbsolutePath
+    // (captured payloads); it must normalize to action=read with the path.
+    let vf_abs = parse_agy("view_file", serde_json::json!({ "AbsolutePath": "/p/secret.txt" }));
+    assert_eq!(
+        vf_abs.file,
+        Some(FileContext {
+            path: Some("/p/secret.txt".into()),
+            action: FileAction::Read
+        })
+    );
+    // Antigravity list_dir carries its target as DirectoryPath.
+    let ld_dir = parse_agy("list_dir", serde_json::json!({ "DirectoryPath": "/p/dir" }));
+    assert_eq!(
+        ld_dir.file,
+        Some(FileContext {
+            path: Some("/p/dir".into()),
+            action: FileAction::List
+        })
+    );
     let wtf = parse_agy(
         "write_to_file",
         serde_json::json!({ "file_path": "/p/b.txt", "content": "y" }),
