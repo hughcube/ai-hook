@@ -2,7 +2,7 @@
 name = "ai-hook"
 version = "2.0.0"
 edition = "2024"
-authors = ["hugh.li <hugh.li0001@gmail.com>"]
+authors = ["hugh.li"]
 description = "High-performance, multi-agent unified hook dispatcher and autonomous rule engine"
 license = "MIT"
 readme = "README.md"

@@ -1,11 +1,11 @@
-use ai_hook::cli::{Cli, Commands};
+use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
 use ai_hook::i18n::{Msg, t};
 use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{HookContext, HookDecision};
 use ai_hook::ui::GuiDialog;
-use clap::{CommandFactory, FromArgMatches};
+use clap::FromArgMatches;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -29,7 +29,7 @@ fn get_binary_info_help() -> String {
 
 fn main() {
     let help_info = get_binary_info_help();
-    let cmd = Cli::command()
+    let cmd = localized_command()
         .after_help(help_info.clone())
         .after_long_help(help_info);
     let matches = cmd.get_matches();
@@ -101,7 +101,7 @@ fn handle_dispatch(args: &Cli) {
     if std::io::stdin().is_terminal() {
         // Invoked directly from terminal without piped input -> print help and exit
         let help_info = get_binary_info_help();
-        let _ = Cli::command()
+        let _ = localized_command()
             .after_help(help_info.clone())
             .after_long_help(help_info)
             .print_help();

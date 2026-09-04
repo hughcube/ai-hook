@@ -1,13 +1,17 @@
-use clap::{Parser, Subcommand};
+use crate::i18n::{Msg, t};
+use clap::{Command, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "ai-hook",
-    author = "hugh.li <hugh.li0001@gmail.com>",
+    author = "hugh.li",
     version = env!("CARGO_PKG_VERSION"),
-    about = "High-performance, multi-agent unified hook dispatcher and autonomous rule engine",
-    long_about = "A unified, nanosecond-latency security interceptor and governance dispatcher for AI Agents (Antigravity, Claude Code, CodeBuddy, Codex) powered by Rust and embedded QuickJS."
+    // clap's built-in -h/--help and -V/--version flags are not stored as
+    // regular args, so `mut_arg` cannot touch them; we disable them and
+    // register our own localized copies in `localized_command()`.
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -112,4 +116,98 @@ pub enum Commands {
         #[arg(short, long)]
         lang: Option<String>,
     },
+}
+
+/// Registers a localized `-h/--help` flag on `cmd`. Every command and
+/// subcommand's built-in help flag must be disabled first and re-registered
+/// here (it is the only way to localize the "Print help" row).
+fn with_localized_help_flag(cmd: Command) -> Command {
+    cmd.disable_help_flag(true).arg(
+        clap::Arg::new("help")
+            .short('h')
+            .long("help")
+            .action(clap::ArgAction::Help)
+            .help(t(Msg::M114)),
+    )
+}
+
+/// Registers a localized `-V/--version` flag on `cmd` (top level only).
+fn with_localized_version_flag(cmd: Command) -> Command {
+    cmd.disable_version_flag(true).arg(
+        clap::Arg::new("version")
+            .short('V')
+            .long("version")
+            .action(clap::ArgAction::Version)
+            .help(t(Msg::M115)),
+    )
+}
+
+/// Builds the clap command with help text from the language bundle.
+///
+/// Clap's own section headings ("Usage:", "Commands:", "Options:") and the
+/// built-in `help` subcommand line are hard-coded by clap and stay English;
+/// every other user-visible help string (about, command/argument/flag
+/// descriptions, -h/-V rows) is localized at runtime via `t(Msg)`.
+pub fn localized_command() -> Command {
+    let cmd = Cli::command().about(t(Msg::M105)).long_about(t(Msg::M106));
+
+    // Overwrite the help text of top-level arguments by their clap arg id.
+    macro_rules! args_help {
+        ($cmd:expr, [$(($id:literal, $msg:ident)),* $(,)?]) => {{
+            let mut c = $cmd;
+            $( c = c.mut_arg($id, |a| a.help(t(Msg::$msg))); )*
+            c
+        }};
+    }
+    // Overwrite a subcommand's about text plus its own arguments and give it
+    // a localized -h flag (derive subcommands carry the built-in one too).
+    macro_rules! sub_help {
+        ($cmd:expr, $name:literal, $about:ident, [$(($id:literal, $msg:ident)),* $(,)?]) => {{
+            let mut c = $cmd;
+            c = c.mut_subcommand($name, |sub| {
+                let mut s = sub.about(t(Msg::$about));
+                $( s = s.mut_arg($id, |a| a.help(t(Msg::$msg))); )*
+                with_localized_help_flag(s)
+            });
+            c
+        }};
+    }
+
+    let cmd = with_localized_version_flag(with_localized_help_flag(cmd));
+
+    let cmd = args_help!(
+        cmd,
+        [
+            ("scripts", M107),
+            ("rule", M108),
+            ("no_gui", M109),
+            ("force_gui", M110),
+            ("timeout", M111),
+            ("dry_run", M112),
+            ("allow_on_error", M113),
+        ]
+    );
+
+    let cmd = sub_help!(cmd, "list", M116, [("scripts", M117)]);
+    let cmd = sub_help!(
+        cmd,
+        "test",
+        M118,
+        [
+            ("command", M119),
+            ("tool", M120),
+            ("file", M121),
+            ("scripts", M122),
+        ]
+    );
+    let cmd = sub_help!(
+        cmd,
+        "bench",
+        M123,
+        [("iterations", M124), ("command", M125), ("scripts", M126),]
+    );
+    let cmd = sub_help!(cmd, "install", M127, [("target_dir", M128)]);
+    let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
+    let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
+    cmd
 }

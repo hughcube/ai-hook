@@ -248,6 +248,36 @@ pub enum Msg {
     M102,
     M103,
     M104,
+    // -- CLI help texts (about / command / argument descriptions) --
+    M105,
+    M106,
+    M107,
+    M108,
+    M109,
+    M110,
+    M111,
+    M112,
+    M113,
+    M114,
+    M115,
+    M116,
+    M117,
+    M118,
+    M119,
+    M120,
+    M121,
+    M122,
+    M123,
+    M124,
+    M125,
+    M126,
+    M127,
+    M128,
+    M129,
+    M130,
+    M131,
+    M132,
+    M133,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -716,6 +746,142 @@ impl Msg {
             Msg::M104 => match l {
                 Lang::Zh => "如需使用且不修改 PATH,可用绝对路径运行",
                 Lang::En => "To use without modifying PATH, you can run by absolute path",
+            },
+            Msg::M105 => match l {
+                Lang::Zh => "高性能多 Agent 统一 Hook 分发与自主规则引擎",
+                Lang::En => {
+                    "High-performance, multi-agent unified hook dispatcher and autonomous rule engine"
+                }
+            },
+            Msg::M106 => match l {
+                Lang::Zh => {
+                    "面向 AI Agent(Antigravity、Claude Code、CodeBuddy、Codex)的统一低延迟安全拦截与治理分发器,基于 Rust 与内嵌 QuickJS。"
+                }
+                Lang::En => {
+                    "A unified, nanosecond-latency security interceptor and governance dispatcher for AI Agents (Antigravity, Claude Code, CodeBuddy, Codex) powered by Rust and embedded QuickJS."
+                }
+            },
+            Msg::M107 => match l {
+                Lang::Zh => "要执行的规则脚本文件(支持多个)",
+                Lang::En => "Rule script files to execute (supports multiple scripts)",
+            },
+            Msg::M108 => match l {
+                Lang::Zh => "规则脚本文件或目录(可多次指定)",
+                Lang::En => "Rule script files or directories (can be specified multiple times)",
+            },
+            Msg::M109 => match l {
+                Lang::Zh => "显式禁用 GUI 弹窗(默认启用 GUI)",
+                Lang::En => "Explicitly disable GUI popup (defaults to GUI enabled)",
+            },
+            Msg::M110 => match l {
+                Lang::Zh => {
+                    "强制所有确认都走 GUI 弹窗(即使 agent 支持终端询问或规则指定 gui: false)"
+                }
+                Lang::En => {
+                    "Force GUI popup for all confirmations (even if agent supports terminal ask or rule specifies gui: false)"
+                }
+            },
+            Msg::M111 => match l {
+                Lang::Zh => "覆盖 GUI 倒计时超时秒数(默认: 60)",
+                Lang::En => "Override GUI countdown timeout in seconds (default: 60)",
+            },
+            Msg::M112 => match l {
+                Lang::Zh => "演练模式(不触发 GUI 弹窗)",
+                Lang::En => "Dry run mode (does not trigger GUI popups)",
+            },
+            Msg::M113 => match l {
+                Lang::Zh => {
+                    "规则脚本出错(语法/运行时错误、超时、async 规则)时允许命令执行。默认 fail-closed:规则任何错误都会拒绝命令,而非静默放行"
+                }
+                Lang::En => {
+                    "Allow command execution when a rule script fails (syntax/runtime error, timeout, async rule). Default is fail-closed: any rule error DENIES the command instead of silently allowing it"
+                }
+            },
+            Msg::M114 => match l {
+                Lang::Zh => "打印帮助信息(查看摘要用 '-h')",
+                Lang::En => "Print help (see a summary with '-h')",
+            },
+            Msg::M115 => match l {
+                Lang::Zh => "打印版本",
+                Lang::En => "Print version",
+            },
+            Msg::M116 => match l {
+                Lang::Zh => "列出指定或已配置的安全规则脚本",
+                Lang::En => "List specified or configured security rule scripts",
+            },
+            Msg::M117 => match l {
+                Lang::Zh => "要检查的显式规则脚本",
+                Lang::En => "Explicit rule scripts to inspect",
+            },
+            Msg::M118 => match l {
+                Lang::Zh => "用给定规则脚本测试一条命令",
+                Lang::En => "Test a specific command against given rule scripts",
+            },
+            Msg::M119 => match l {
+                Lang::Zh => "要模拟测试的命令行字符串",
+                Lang::En => "Command line string to simulate and test",
+            },
+            Msg::M120 => match l {
+                Lang::Zh => "模拟的工具名(默认: run_command)",
+                Lang::En => "Simulated tool name (default: run_command)",
+            },
+            Msg::M121 => match l {
+                Lang::Zh => "模拟的目标文件路径",
+                Lang::En => "Simulated target file path",
+            },
+            Msg::M122 => match l {
+                Lang::Zh => "用于测试的显式规则脚本",
+                Lang::En => "Explicit rule scripts to test against",
+            },
+            Msg::M123 => match l {
+                Lang::Zh => "对给定规则脚本运行基准测试",
+                Lang::En => "Run benchmark over given rule scripts",
+            },
+            Msg::M124 => match l {
+                Lang::Zh => "评估迭代次数(默认: 1000)",
+                Lang::En => "Number of iterations to evaluate (default: 1000)",
+            },
+            Msg::M125 => match l {
+                Lang::Zh => "用于基准测试的命令字符串",
+                Lang::En => "Command string to benchmark against",
+            },
+            Msg::M126 => match l {
+                Lang::Zh => "用于基准测试的显式规则脚本",
+                Lang::En => "Explicit rule scripts to benchmark",
+            },
+            Msg::M127 => match l {
+                Lang::Zh => "安装二进制到系统 PATH 目录(自动探测已存在的 PATH 目录,零新增环境变量)",
+                Lang::En => {
+                    "Install binary to system PATH directory (auto-detects existing PATH directory with zero new env variables)"
+                }
+            },
+            Msg::M128 => match l {
+                Lang::Zh => "目标 bin 目录(默认: 自动探测已存在的 PATH 目录)",
+                Lang::En => "Target bin directory (default: auto-detected existing PATH directory)",
+            },
+            Msg::M129 => match l {
+                Lang::Zh => "从 GitHub 将 ai-hook 更新到最新版",
+                Lang::En => "Update ai-hook to the latest release from GitHub",
+            },
+            Msg::M130 => match l {
+                Lang::Zh => "即使已是最新版也强制重新安装",
+                Lang::En => "Force re-installation even if already at latest version",
+            },
+            Msg::M131 => match l {
+                Lang::Zh => "GitHub 仓库(格式 owner/repo,默认: hughcube/ai-hook)",
+                Lang::En => {
+                    "Custom GitHub repository in format owner/repo (default: hughcube/ai-hook)"
+                }
+            },
+            Msg::M132 => match l {
+                Lang::Zh => "显示完整教程与规则编写指南",
+                Lang::En => "Display comprehensive tutorial and rule authoring guide",
+            },
+            Msg::M133 => match l {
+                Lang::Zh => "教程语言:'zh' 中文或 'en' 英文(默认跟随系统语言)",
+                Lang::En => {
+                    "Tutorial language: \"zh\" for Chinese or \"en\" for English (default: follow the system language)"
+                }
             },
             Msg::AllowWord => match l {
                 Lang::Zh => "允许",
