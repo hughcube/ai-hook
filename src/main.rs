@@ -540,15 +540,51 @@ fn is_dir_writable(dir: &std::path::Path) -> bool {
     }
 }
 
+/// Parses $PATH into entries, tolerating the MSYS/Git-Bash shape that is
+/// injected into native Windows children: ':'-separated entries with '/c/…'
+/// drive-mount prefixes. std::env::split_paths() alone mis-parses that shape
+/// on Windows (it splits on ';'), which used to silently defeat automatic
+/// install placement (2026-09-05: an `install` from Git Bash fell back to
+/// ~/bin instead of honoring the first writable PATH entry).
+fn path_entries_from_env() -> Vec<PathBuf> {
+    let Some(raw) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let raw = raw.to_string_lossy();
+
+    #[cfg(windows)]
+    if !raw.contains(';') && raw.contains(':') {
+        return raw
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                // '/c/Users/…' -> 'C:\Users\…'; non-drive entries (e.g. /usr/bin)
+                // stay as-is and are skipped later by exists()/writability probes.
+                let b = p.as_bytes();
+                if p.starts_with('/')
+                    && b.len() >= 3
+                    && b[1].is_ascii_alphabetic()
+                    && b[2] == b'/'
+                {
+                    let drive = (b[1] as char).to_ascii_uppercase();
+                    PathBuf::from(format!("{}:\\{}", drive, &p[3..]).replace('/', "\\"))
+                } else {
+                    PathBuf::from(p)
+                }
+            })
+            .collect();
+    }
+
+    std::env::split_paths(raw.as_ref()).collect()
+}
+
 /// Automatically detects an existing directory already in PATH to avoid adding any new environment variables.
 fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
     if let Some(explicit) = target_dir {
         return explicit;
     }
 
-    let existing_paths: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
+    let existing_paths = path_entries_from_env();
 
     // PATH entries keep their declared order; on Windows the %PATH% entries
     // live in the registry and split_paths reproduces that order.
@@ -604,13 +640,10 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
         }
     }
 
-    // 4. Fallback default
+    // 4. Fallback default: ~/.local/bin (Unix convention, also honored on
+    //    Windows since 2026-09-05 — mirrors what automatic placement picks)
     if let Some(home) = dirs::home_dir() {
-        if cfg!(windows) {
-            home.join("bin")
-        } else {
-            home.join(".local").join("bin")
-        }
+        home.join(".local").join("bin")
     } else {
         PathBuf::from("/usr/local/bin")
     }
@@ -678,20 +711,18 @@ fn handle_install(target_dir: Option<PathBuf>) {
     println!();
 
     // Check if the destination is already in PATH (no environment variables modified)
-    let in_path = std::env::var_os("PATH")
-        .map(|paths| {
-            let norm_dest = dest_dir
-                .to_string_lossy()
+    let norm_dest = dest_dir
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase();
+    let in_path = path_entries_from_env()
+        .iter()
+        .any(|p| {
+            p.to_string_lossy()
                 .trim_end_matches(['\\', '/'])
-                .to_lowercase();
-            std::env::split_paths(&paths).any(|p| {
-                p.to_string_lossy()
-                    .trim_end_matches(['\\', '/'])
-                    .to_lowercase()
-                    == norm_dest
-            })
-        })
-        .unwrap_or(false);
+                .to_lowercase()
+                == norm_dest
+        });
 
     if in_path {
         println!("✓ {}", t(Msg::M099));
