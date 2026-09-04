@@ -67,6 +67,19 @@ fn get_target_candidates() -> Result<(&'static [&'static str], &'static str), St
     }
 }
 
+/// Simple Semantic Versioning parser (e.g. "0.1.4" -> (0, 1, 4))
+fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
+    if parts.len() >= 3 {
+        let major = parts[0].parse().ok()?;
+        let minor = parts[1].parse().ok()?;
+        let patch = parts[2].split('-').next()?.parse().ok()?;
+        Some((major, minor, patch))
+    } else {
+        None
+    }
+}
+
 /// Self-update command handler
 pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     let current_version = env!("CARGO_PKG_VERSION");
@@ -111,7 +124,12 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     println!("Current version: v{}", current_version);
     println!("Latest  version: {}", tag_name);
 
-    if !force && latest_version == current_version {
+    let is_newer = match (parse_semver(latest_version), parse_semver(current_version)) {
+        (Some(l), Some(c)) => l > c,
+        _ => latest_version != current_version,
+    };
+
+    if !force && !is_newer {
         println!("✓ ai-hook is already up to date (v{}).", current_version);
         return Ok(());
     }
