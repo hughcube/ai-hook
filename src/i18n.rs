@@ -1018,7 +1018,9 @@ impl Msg {
                 }
             },
             Msg::M149 => match l {
-                Lang::Zh => "当前宿主不支持终端交互 ask,且 GUI 弹窗不可用或已被规则禁用(gui: false),操作已自动拒绝。如需执行请由你本人在终端手动运行",
+                Lang::Zh => {
+                    "当前宿主不支持终端交互 ask,且 GUI 弹窗不可用或已被规则禁用(gui: false),操作已自动拒绝。如需执行请由你本人在终端手动运行"
+                }
                 Lang::En => {
                     "The host does not support terminal ask, and no GUI dialog is available or the rule disables it (gui: false); the operation was auto-denied. Run it manually if intended"
                 }

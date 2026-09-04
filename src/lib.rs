@@ -1,8 +1,8 @@
 pub mod cli;
-pub mod paths;
 pub mod engine;
 pub mod fast_path;
 pub mod i18n;
+pub mod paths;
 pub mod protocol;
 pub mod tutorial;
 pub mod ui;

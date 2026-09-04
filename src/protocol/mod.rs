@@ -67,34 +67,79 @@ mod tests {
     #[test]
     fn test_confirm_path_gui_true_is_forced_popup() {
         // gui:true 强制弹窗:能 ask 也弹、穿透 gui_enabled=false
-        assert_eq!(confirm_path(Some(true), false, true, true, false), ConfirmPath::Popup);
-        assert_eq!(confirm_path(Some(true), false, false, false, false), ConfirmPath::Popup);
+        assert_eq!(
+            confirm_path(Some(true), false, true, true, false),
+            ConfirmPath::Popup
+        );
+        assert_eq!(
+            confirm_path(Some(true), false, false, false, false),
+            ConfirmPath::Popup
+        );
         // force_gui / CLI force 与 gui:true 同级
-        assert_eq!(confirm_path(Some(false), true, false, false, false), ConfirmPath::Popup);
-        assert_eq!(confirm_path(None, true, true, false, false), ConfirmPath::Popup);
+        assert_eq!(
+            confirm_path(Some(false), true, false, false, false),
+            ConfirmPath::Popup
+        );
+        assert_eq!(
+            confirm_path(None, true, true, false, false),
+            ConfirmPath::Popup
+        );
         // dry-run 演练不真弹 → 降级 Ask(输出层按宿主协议演练)
-        assert_eq!(confirm_path(Some(true), false, true, true, true), ConfirmPath::Ask);
-        assert_eq!(confirm_path(Some(true), true, false, false, true), ConfirmPath::Ask);
+        assert_eq!(
+            confirm_path(Some(true), false, true, true, true),
+            ConfirmPath::Ask
+        );
+        assert_eq!(
+            confirm_path(Some(true), true, false, false, true),
+            ConfirmPath::Ask
+        );
     }
 
     #[test]
     fn test_confirm_path_default_ask_first_gui_fallback() {
         // 缺省 + 能 ask:一律 Ask(不弹窗)
-        assert_eq!(confirm_path(None, false, true, true, false), ConfirmPath::Ask);
-        assert_eq!(confirm_path(None, false, true, false, false), ConfirmPath::Ask);
+        assert_eq!(
+            confirm_path(None, false, true, true, false),
+            ConfirmPath::Ask
+        );
+        assert_eq!(
+            confirm_path(None, false, true, false, false),
+            ConfirmPath::Ask
+        );
         // 缺省 + 不能 ask:GUI 可用 → Popup 兜底;不可用 → AutoDeny
-        assert_eq!(confirm_path(None, false, false, true, false), ConfirmPath::Popup);
-        assert_eq!(confirm_path(None, false, false, false, false), ConfirmPath::AutoDeny);
-        assert_eq!(confirm_path(None, false, false, true, true), ConfirmPath::AutoDeny);
+        assert_eq!(
+            confirm_path(None, false, false, true, false),
+            ConfirmPath::Popup
+        );
+        assert_eq!(
+            confirm_path(None, false, false, false, false),
+            ConfirmPath::AutoDeny
+        );
+        assert_eq!(
+            confirm_path(None, false, false, true, true),
+            ConfirmPath::AutoDeny
+        );
     }
 
     #[test]
     fn test_confirm_path_gui_false_deny_when_no_ask() {
         // gui:false + 能 ask → Ask
-        assert_eq!(confirm_path(Some(false), false, true, true, false), ConfirmPath::Ask);
-        assert_eq!(confirm_path(Some(false), false, true, false, false), ConfirmPath::Ask);
+        assert_eq!(
+            confirm_path(Some(false), false, true, true, false),
+            ConfirmPath::Ask
+        );
+        assert_eq!(
+            confirm_path(Some(false), false, true, false, false),
+            ConfirmPath::Ask
+        );
         // gui:false + 不能 ask → AutoDeny(禁弹窗 fail-closed),无论 GUI 是否可用
-        assert_eq!(confirm_path(Some(false), false, false, true, false), ConfirmPath::AutoDeny);
-        assert_eq!(confirm_path(Some(false), false, false, false, false), ConfirmPath::AutoDeny);
+        assert_eq!(
+            confirm_path(Some(false), false, false, true, false),
+            ConfirmPath::AutoDeny
+        );
+        assert_eq!(
+            confirm_path(Some(false), false, false, false, false),
+            ConfirmPath::AutoDeny
+        );
     }
 }

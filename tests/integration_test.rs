@@ -1078,7 +1078,10 @@ fn test_can_ask_host_matrix() {
     let cc_yolo = HookContext::parse(
         &serde_json::json!({"hook_event_name":"PreToolUse","permission_mode":"bypassPermissions","tool_input":{"command":"ls"}}).to_string(),
     );
-    assert!(cc_yolo.can_ask(), "CC bypass 模式也应可 ask(hook ask 最高优先)");
+    assert!(
+        cc_yolo.can_ask(),
+        "CC bypass 模式也应可 ask(hook ask 最高优先)"
+    );
 
     // Codex:0.152+ 普通可 ask;bypass(yolo)不可
     let codex = HookContext::parse(
@@ -1123,7 +1126,10 @@ fn test_codex_confirm_outputs_ask_when_can_ask() {
         out.contains("\"permissionDecision\":\"ask\""),
         "Codex 普通模式应输出 ask: {out}"
     );
-    assert!(out.contains("redis-cli flushall"), "ask reason 应含完整命令: {out}");
+    assert!(
+        out.contains("redis-cli flushall"),
+        "ask reason 应含完整命令: {out}"
+    );
 }
 
 /// Codex bypass(yolo)输出层:Confirm + 未弹窗(防御路径)→ deny
@@ -1198,7 +1204,11 @@ fn test_sys_exec_script_file_auto_resolve() {
     let tmp = std::env::temp_dir().join(format!("ai-hook-script-resolve-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let script_path = tmp.join("test_run.bat");
-    std::fs::write(&script_path, "@echo off\r\necho script-auto-resolve-ok %1\r\n").expect("write bat");
+    std::fs::write(
+        &script_path,
+        "@echo off\r\necho script-auto-resolve-ok %1\r\n",
+    )
+    .expect("write bat");
     let script_str = script_path.to_string_lossy().replace('\\', "/");
 
     let rule_content = format!(
@@ -1252,7 +1262,8 @@ fn test_sys_exec_env_shebang_auto_resolve() {
     let tmp = std::env::temp_dir().join(format!("ai-hook-env-shebang-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let script_path = tmp.join("test_env.sh");
-    std::fs::write(&script_path, "#!/usr/bin/env sh\necho env-shebang-ok $1\n").expect("write env sh");
+    std::fs::write(&script_path, "#!/usr/bin/env sh\necho env-shebang-ok $1\n")
+        .expect("write env sh");
     let script_str = script_path.to_string_lossy().replace('\\', "/");
 
     let rule_content = format!(
@@ -1279,7 +1290,11 @@ fn test_sys_exec_complex_env_s_shebang() {
     let tmp = std::env::temp_dir().join(format!("ai-hook-env-s-shebang-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let script_path = tmp.join("test_env_s.sh");
-    std::fs::write(&script_path, "#!/usr/bin/env -S sh\necho env-s-shebang-ok $1\n").expect("write env -S sh");
+    std::fs::write(
+        &script_path,
+        "#!/usr/bin/env -S sh\necho env-s-shebang-ok $1\n",
+    )
+    .expect("write env -S sh");
     let script_str = script_path.to_string_lossy().replace('\\', "/");
 
     let rule_content = format!(
@@ -1299,7 +1314,6 @@ fn test_sys_exec_complex_env_s_shebang() {
     assert_eq!(dec, HookDecision::Allow);
     let _ = std::fs::remove_dir_all(&tmp);
 }
-
 
 #[test]
 fn test_sys_http_api_exposed() {
@@ -1334,7 +1348,8 @@ fn test_user_prompt_submit_intercept_block() {
         "hook_event_name": "UserPromptSubmit",
         "prompt": "/ai:balance",
         "cwd": "C:\\"
-    }).to_string();
+    })
+    .to_string();
     let ctx = HookContext::parse(&raw_payload);
     assert_eq!(ctx.prompt.as_deref(), Some("/ai:balance"));
     assert_eq!(ctx.event.as_deref(), Some("UserPromptSubmit"));
@@ -1343,10 +1358,14 @@ fn test_user_prompt_submit_intercept_block() {
     assert!(matches!(dec, HookDecision::Block { ref reason } if reason == "余额为 100 元"));
 
     let out = dec.to_json_output(&ctx, None);
-    assert_eq!(out, serde_json::json!({
-        "decision": "block",
-        "reason": "余额为 100 元"
-    }).to_string());
+    assert_eq!(
+        out,
+        serde_json::json!({
+            "decision": "block",
+            "reason": "余额为 100 元"
+        })
+        .to_string()
+    );
 }
 
 #[test]
@@ -1364,20 +1383,27 @@ fn test_post_tool_use_additional_context() {
         "hook_event_name": "PostToolUse",
         "tool_name": "edit_file",
         "cwd": "C:\\"
-    }).to_string();
+    })
+    .to_string();
     let ctx = HookContext::parse(&raw_payload);
     assert_eq!(ctx.event.as_deref(), Some("PostToolUse"));
 
     let (dec, _) = runner.evaluate_all(&[post_rule], &ctx, ErrorPolicy::FailClosed);
-    assert!(matches!(dec, HookDecision::PostContext { ref additional_context } if additional_context == "请注意迁移规范"));
+    assert!(
+        matches!(dec, HookDecision::PostContext { ref additional_context } if additional_context == "请注意迁移规范")
+    );
 
     let out = dec.to_json_output(&ctx, None);
-    assert_eq!(out, serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": "请注意迁移规范"
-        }
-    }).to_string());
+    assert_eq!(
+        out,
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": "请注意迁移规范"
+            }
+        })
+        .to_string()
+    );
 }
 
 #[test]
@@ -1390,7 +1416,8 @@ fn test_codex_dangerously_skip_permissions_env_detection() {
         "permission_mode": "default",
         "tool_name": "Bash",
         "tool_input": { "command": "rm -rf /" }
-    }).to_string();
+    })
+    .to_string();
 
     let tmp = std::env::temp_dir().join(format!("ai-hook-codex-yolo-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
@@ -1410,10 +1437,18 @@ fn test_codex_dangerously_skip_permissions_env_detection() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("\"ask\""), "Codex normal should ask: {stdout}");
+    assert!(
+        stdout.contains("\"ask\""),
+        "Codex normal should ask: {stdout}"
+    );
 
     // 2. With CODEX_DANGEROUSLY_SKIP_PERMISSIONS=1: should output "deny"
     let mut child_yolo = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
@@ -1423,10 +1458,16 @@ fn test_codex_dangerously_skip_permissions_env_detection() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child_yolo.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    child_yolo
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
     let out_yolo = child_yolo.wait_with_output().unwrap();
     let stdout_yolo = String::from_utf8_lossy(&out_yolo.stdout);
-    assert!(stdout_yolo.contains("\"deny\""), "Codex yolo env should deny: {stdout_yolo}");
+    assert!(
+        stdout_yolo.contains("\"deny\""),
+        "Codex yolo env should deny: {stdout_yolo}"
+    );
 }
-
-

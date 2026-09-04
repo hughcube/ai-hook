@@ -214,7 +214,8 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
         move |ctx: Ctx<'js>,
               cmd: String,
               args: rquickjs::function::Opt<Vec<String>>,
-              options: rquickjs::function::Opt<Object<'js>>| -> Result<Object<'js>> {
+              options: rquickjs::function::Opt<Object<'js>>|
+              -> Result<Object<'js>> {
             let raw_args = args.0.unwrap_or_default();
             let mut opt_input = None;
             let mut target_cwd = sys_for_exec.cwd.clone();
@@ -386,17 +387,19 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
 
     let get_fn = Function::new(
         js_ctx.clone(),
-        |ctx: Ctx<'js>, url: String, options: rquickjs::function::Opt<Object<'js>>| -> Result<Object<'js>> {
-            execute_http_request(ctx, "GET", url, options)
-        },
+        |ctx: Ctx<'js>,
+         url: String,
+         options: rquickjs::function::Opt<Object<'js>>|
+         -> Result<Object<'js>> { execute_http_request(ctx, "GET", url, options) },
     )?;
     http_obj.set("get", get_fn)?;
 
     let post_fn = Function::new(
         js_ctx.clone(),
-        |ctx: Ctx<'js>, url: String, options: rquickjs::function::Opt<Object<'js>>| -> Result<Object<'js>> {
-            execute_http_request(ctx, "POST", url, options)
-        },
+        |ctx: Ctx<'js>,
+         url: String,
+         options: rquickjs::function::Opt<Object<'js>>|
+         -> Result<Object<'js>> { execute_http_request(ctx, "POST", url, options) },
     )?;
     http_obj.set("post", post_fn)?;
 
@@ -527,7 +530,9 @@ fn find_executable_in_path(cmd_name: &str, cwd: &Path) -> Option<String> {
         #[cfg(windows)]
         {
             if cmd_name.eq_ignore_ascii_case("bash")
-                && p.to_string_lossy().to_ascii_lowercase().contains("system32")
+                && p.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("system32")
             {
                 // 跳过 WSL System32 存根
             } else {
@@ -551,7 +556,11 @@ fn find_executable_in_path(cmd_name: &str, cwd: &Path) -> Option<String> {
         if let Ok(p) = which::which_in("bash", std::env::var_os("PATH"), cwd) {
             #[cfg(windows)]
             {
-                if !p.to_string_lossy().to_ascii_lowercase().contains("system32") {
+                if !p
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("system32")
+                {
                     return Some(p.to_string_lossy().to_string());
                 }
             }
@@ -763,4 +772,3 @@ fn find_windows_posix_shell(preferred: &str, cwd: &Path) -> String {
 
     preferred.to_string()
 }
-

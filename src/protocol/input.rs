@@ -252,7 +252,8 @@ impl HookContext {
             }
         };
 
-        let event = get_str(&val, &["hook_event_name", "hookEventName", "event"]).map(str::to_string);
+        let event =
+            get_str(&val, &["hook_event_name", "hookEventName", "event"]).map(str::to_string);
         let prompt = get_str(&val, &["prompt", "user_prompt", "userPrompt"]).map(str::to_string);
 
         // ---- 1. Google Antigravity: `toolCall` envelope ----
@@ -406,8 +407,10 @@ impl HookContext {
             return Self {
                 platform,
                 permission_mode: get_str(&val, &["permission_mode"]).map(str::to_string),
-                is_yolo: (platform == Platform::Codex && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
-                    || (platform == Platform::Antigravity && env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS"))
+                is_yolo: (platform == Platform::Codex
+                    && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
+                    || (platform == Platform::Antigravity
+                        && env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS"))
                     || get_str(&val, &["permission_mode"])
                         .map(permission_mode_is_yolo)
                         .unwrap_or(false),

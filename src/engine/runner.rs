@@ -201,11 +201,13 @@ pub fn log_inbound_payload(raw: &str) {
     let cut = raw.floor_char_boundary(MAX_RAW_BYTES);
     let stored = if truncated { &raw[..cut] } else { raw };
 
-    let Some(home) = crate::paths::home_dir() else { return };
-    let path = home.join(".ai-hook").join("logs").join(format!(
-        "ai-hook-inbound-{}.log",
-        utc_date_ymd()
-    ));
+    let Some(home) = crate::paths::home_dir() else {
+        return;
+    };
+    let path = home
+        .join(".ai-hook")
+        .join("logs")
+        .join(format!("ai-hook-inbound-{}.log", utc_date_ymd()));
 
     // Rotate once if oversized (checked at open time — cheap).
     if let Ok(meta) = std::fs::metadata(&path)

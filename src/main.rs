@@ -496,7 +496,9 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
             Some(HookDecision::Block { ref reason }) => {
                 format!("BLOCK ({})", reason)
             }
-            Some(HookDecision::PostContext { ref additional_context }) => {
+            Some(HookDecision::PostContext {
+                ref additional_context,
+            }) => {
                 format!("POST_CONTEXT ({})", additional_context)
             }
             Some(HookDecision::Allow) => t(Msg::M077).to_string(),
@@ -624,10 +626,7 @@ fn path_entries_from_env() -> Vec<PathBuf> {
                 // '/c/Users/…' -> 'C:\Users\…'; non-drive entries (e.g. /usr/bin)
                 // stay as-is and are skipped later by exists()/writability probes.
                 let b = p.as_bytes();
-                if p.starts_with('/')
-                    && b.len() >= 3
-                    && b[1].is_ascii_alphabetic()
-                    && b[2] == b'/'
+                if p.starts_with('/') && b.len() >= 3 && b[1].is_ascii_alphabetic() && b[2] == b'/'
                 {
                     let drive = (b[1] as char).to_ascii_uppercase();
                     PathBuf::from(format!("{}:\\{}", drive, &p[3..]).replace('/', "\\"))
@@ -752,14 +751,12 @@ fn handle_install(target_dir: Option<PathBuf>) {
         .to_string_lossy()
         .trim_end_matches(['\\', '/'])
         .to_lowercase();
-    let in_path = path_entries_from_env()
-        .iter()
-        .any(|p| {
-            p.to_string_lossy()
-                .trim_end_matches(['\\', '/'])
-                .to_lowercase()
-                == norm_dest
-        });
+    let in_path = path_entries_from_env().iter().any(|p| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+            == norm_dest
+    });
 
     if in_path {
         println!("✓ {}", t(Msg::M099));
