@@ -62,22 +62,37 @@ impl HookContext {
         if val.get("toolCall").is_some() || val.get("conversationId").is_some() {
             let tool_name = val
                 .get("toolName")
+                .or_else(|| val.get("tool_name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let args = val.get("toolCall").and_then(|t| t.get("args"));
+            let args = val
+                .get("toolCall")
+                .and_then(|t| t.get("args").or_else(|| t.get("parameters")))
+                .or_else(|| val.get("args"))
+                .or_else(|| val.get("parameters"));
             let cmd = args
-                .and_then(|a| a.get("CommandLine"))
+                .and_then(|a| {
+                    a.get("CommandLine")
+                        .or_else(|| a.get("command"))
+                        .or_else(|| a.get("cmd"))
+                })
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let target_file = args
-                .and_then(|a| a.get("TargetFile").or_else(|| a.get("file_path")))
+                .and_then(|a| {
+                    a.get("TargetFile")
+                        .or_else(|| a.get("file_path"))
+                        .or_else(|| a.get("targetFile"))
+                        .or_else(|| a.get("path"))
+                })
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let conversation_id = val
                 .get("conversationId")
+                .or_else(|| val.get("conversation_id"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
@@ -86,7 +101,7 @@ impl HookContext {
                 .unwrap_or(false);
 
             let cwd = args
-                .and_then(|a| a.get("Cwd"))
+                .and_then(|a| a.get("Cwd").or_else(|| a.get("cwd")))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
