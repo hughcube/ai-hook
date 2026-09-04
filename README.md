@@ -240,13 +240,13 @@ export default function(ctx, sys) {
 
 Through the `ctx` object, your rule can inspect the AI Agent type, the full raw payload, and the tool name/arguments:
 
-| Property | Type | Description |
-| :--- | :--- | :--- |
 | Property | Type | Semantics (full contract: `ai-hook tutorial`) |
 | :--- | :--- | :--- |
 | `ctx.agent` | `string` | Detected host: `"antigravity"` / `"claude_code"` / `"codebuddy"` / `"codex"` / `"generic"` |
 | `ctx.mode` | `string?` | Host permission mode: `default`/`plan`/`acceptEdits`/`dontAsk`/`bypassPermissions` |
-| `ctx.isYolo` | `boolean` | No-confirm (mode bypassPermissions/dontAsk, or AGY skip flag) |
+| `ctx.isYolo` | `boolean` | No-confirm mode (auto-detects `AGY_DANGEROUSLY_SKIP_PERMISSIONS` and `CODEX_DANGEROUSLY_SKIP_PERMISSIONS`, or mode bypassPermissions/dontAsk) |
+| `ctx.event` | `string?` | Lifecycle event name: `"PreToolUse"` / `"PostToolUse"` / `"UserPromptSubmit"` |
+| `ctx.prompt` | `string?` | User raw prompt text (provided in `UserPromptSubmit` prompt intercept events) |
 | `ctx.session` | `{id, transcriptPath}?` | Session id + full transcript path (read with `sys.fs.readText`) |
 | `ctx.cwd` | `string` | Session/command working directory |
 | `ctx.model` | `string?` | Host model id (e.g. Antigravity `modelName`) |
@@ -258,11 +258,11 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 | `ctx.rawInput` | `string` | Raw payload text |
 > Design rule: one semantic per property, no aliases; `cmd`/`file` are `null` when not applicable — guard rules with truthiness checks.
 
-### 2. `sys` Native Microsecond Primitives
+### 2. `sys` Native Microsecond Primitives & Safe Extensions
 
-Subprocess spawning (`git.exe`) is eliminated. All prerequisite data is resolved in microseconds via native Rust memory APIs:
+Subprocess spawning is eliminated for standard reads. In addition, controlled command execution and synchronous HTTP requests are provided for zero-token intercepts and integrations:
 
-| Method | Return Type | Description & Latency |
+| Method / Property | Return Type | Description & Latency |
 | :--- | :--- | :--- |
 | `sys.git.branch()` | `string?` | **0.02ms** memory parse of `.git/HEAD` for current branch (e.g. `"master"`) |
 | `sys.git.root()` | `string?` | Root directory path of current Git repository |
@@ -272,11 +272,16 @@ Subprocess spawning (`git.exe`) is eliminated. All prerequisite data is resolved
 | `sys.fs.list([dir])` | `string[]` | List files and directories in path |
 | `sys.env("KEY")` | `string?` | **< 1 µs** get environment variable (or `sys.env.get("KEY")`) |
 | `sys.cwd()` | `string` | Current working directory |
+| `sys.ruleDir` / `sys.__dirname` | `string` | Absolute directory path of the executing rule script |
+| `sys.rulePath` / `sys.__filename` | `string` | Absolute file path of the executing rule script |
+| `sys.exec(cmd, args?, opt?)` | `object` | **Command Execution**: execute external command/script (powers 0-token intercepts). Bypasses Windows WSL stub to target Git Bash. Returns `{ code, status, exitCode, stdout, stderr, success }` |
+| `sys.http.get(url, opt?)` | `object` | **Lightweight HTTP GET**: supports `headers`/`timeout`, returns `{ status, ok, headers, body }` |
+| `sys.http.post(url, opt?)` | `object` | **Lightweight HTTP POST**: supports `headers`/`body`/`timeout`, returns `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | Debug logging to stderr (never corrupts decision JSON) |
 | `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; disable `AI_HOOK_LOG=0`, override `AI_HOOK_LOG_FILE`) |
 | **Standard JS Clock** | - | `new Date()` for days, hours, freeze windows |
 
-### 3. Controlling Decisions: Hard Block vs GUI Prompt vs Terminal Ask
+### 3. Controlling Decisions: Hard Block vs GUI Prompt vs Zero-Token Intercept
 
 Your rule's return object determines the exact action:
 
@@ -313,7 +318,26 @@ return {
 };
 ```
 
-#### Scenario D: Safe Pass
+#### Scenario D: Zero-Token Local Intercept (UserPromptSubmit)
+For user prompts that can be answered immediately locally (e.g. `/ai:balance`, `/ai:usage`):
+```javascript
+return {
+  action: "block",
+  reason: "Balance: $100.00" // Displayed directly to user without LLM inference
+};
+```
+> **Behavior**: Outputs `{"decision":"block","reason":"..."}` to halt LLM invocation and return local results directly.
+
+#### Scenario E: PostToolUse Context & Guideline Injection
+Inject guidelines or reminders after a tool finishes (e.g. after editing migration files):
+```javascript
+return {
+  additionalContext: "Migration file was edited. Ensure models and test suites are updated!"
+};
+```
+> **Behavior**: Outputs `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}`.
+
+#### Scenario F: Safe Pass
 ```javascript
 return null; // or return { action: "allow" };
 ```

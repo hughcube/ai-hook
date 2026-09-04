@@ -33,13 +33,16 @@ export default function(ctx, sys) {
   // ctx.mode     : 宿主权限模式 default|plan|acceptEdits|dontAsk|bypassPermissions
   // ctx.cwd      : 当前工作目录
   // ctx.args     : 工具调用的完整参数对象（如 ctx.args.CommandLine, ctx.args.TargetFile）
-  // ctx.isYolo   : 是否处于免确认/自动授权模式 (YOLO mode)
-  console.log(`[Demo] 工具: ${ctx.tool}, 目录: ${ctx.cwd}`);
+  // ctx.isYolo   : 是否处于免确认/自动授权模式 (YOLO mode，支持 AGY/Codex 环境变量感知)
+  // ctx.event    : 生命周期事件名 ("PreToolUse" | "PostToolUse" | "UserPromptSubmit")
+  // ctx.prompt   : 用户的原始 Prompt（仅在 UserPromptSubmit 等 Prompt 拦截事件中可用）
+  console.log(`[Demo] 事件: ${ctx.event}, 工具: ${ctx.tool}, 目录: ${ctx.cwd}`);
+  if (ctx.prompt) console.log(`[Demo] 用户 Prompt: ${ctx.prompt}`);
   if (ctx.cmd) console.log(`[Demo] 命令: ${ctx.cmd}`);
   if (ctx.raw) console.log(`[Demo] 原始 Payload Keys: ${Object.keys(ctx.raw).join(", ")}`);
 
   // =========================================================================
-  // 3. 极速规则自治数据获取能力 (sys 原生内存级 API)
+  // 3. 极速规则自治数据获取能力 (sys 原生内存级 API 与安全扩展)
   // =========================================================================
   // 3.1 时间自治判断 (原生 JS new Date()，毫秒级获取周几、时段、封网期)
   const now = new Date();
@@ -54,10 +57,21 @@ export default function(ctx, sys) {
   const hasEnv = sys.fs.exists(".env");
   const envContent = hasEnv ? sys.fs.readText(".env") : "";
 
-  // 3.4 环境变量获取
+  // 3.4 环境变量获取与规则自身路径元数据
   const appEnv = sys.env("APP_ENV") || "local";
+  const ruleDir = sys.ruleDir || sys.__dirname;   // 规则自身所在目录
+  const rulePath = sys.rulePath || sys.__filename; // 规则脚本自身完整路径
 
-  // 3.5 文件操作语义化防护 (ctx.file.action)：写敏感文件直接拒绝
+  // 3.5 外部命令/脚本执行调度 (sys.exec: 为 0 Token 拦截与工具扩展服务)
+  // const echoRes = sys.exec("cmd", ["/c", "echo ok"], { cwd: sys.cwd() });
+  // 返回结构: { code, status, exitCode, stdout, stderr, success }
+  // Windows 下自动防止 WSL 存根劫持，原生指向 Git Bash
+
+  // 3.6 轻量同步 HTTP 通信 (sys.http)
+  // const resp = sys.http.get("https://httpbin.org/get", { timeout: 3000 });
+  // 返回结构: { status, ok, headers, body }
+
+  // 3.7 文件操作语义化防护 (ctx.file.action)：写敏感文件直接拒绝
   if (ctx.file && ctx.file.action === "write") {
     const fp = ctx.file.path || "";
     if (/\.env$|\.pem$|id_rsa|credentials\.json$/i.test(fp)) {
@@ -68,12 +82,12 @@ export default function(ctx, sys) {
     }
   }
 
-  // 3.6 结构化日志 (sys.log)：默认进 stderr 与 ~/.ai-hook/logs/ 当日文件
+  // 3.8 结构化日志 (sys.log)：默认进 stderr 与 ~/.ai-hook/logs/ 当日文件
   if (ctx.file) sys.log("info", `file op: ${ctx.file.action} ${ctx.file.path || ""}`);
   if (ctx.cmd) sys.log("debug", `cmd: ${ctx.cmd}`);
 
   // =========================================================================
-  // 4. 决策控制：直接强制不通过 vs 弹窗确认 vs 终端确认 vs 放行
+  // 4. 决策控制：直接强制不通过 vs 弹窗确认 vs 终端确认 vs 零 Token 阻断 vs 上下文注入
   // =========================================================================
 
   // 场景 A: 【直接强制不通过，绝对不弹窗】 (Direct Hard Block)
@@ -109,6 +123,23 @@ export default function(ctx, sys) {
     };
   }
 
-  // 场景 D: 【放行】 (Pass / Allow)
+  // 场景 D: 【零 Token 本地命令拦截阻断】 (UserPromptSubmit Zero-Token Intercept)
+  // 拦截特定本地执行型命令（如 /ai:balance），阻断大模型推理，reason 直接回显给用户：
+  if (ctx.event === "UserPromptSubmit" && ctx.prompt && ctx.prompt.startsWith("/demo:intercept")) {
+    return {
+      action: "block",
+      reason: "已命中本地拦截命令，免大模型推理，当前账户状态良好！"
+    };
+  }
+
+  // 场景 E: 【工具调用后规范注入与上下文提示】 (PostToolUse Context Injection)
+  // 编辑或写入迁移文件后，向大模型注入额外规范提示：
+  if (ctx.event === "PostToolUse" && ctx.file && /[/\\]migrations[/\\]/i.test(ctx.file.path || "")) {
+    return {
+      additionalContext: "刚编辑了数据库迁移文件，请确认是否补充了配套业务代码与往返测试！"
+    };
+  }
+
+  // 场景 F: 【放行】 (Pass / Allow)
   return null;
 }

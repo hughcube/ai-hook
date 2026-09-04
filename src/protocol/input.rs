@@ -282,10 +282,14 @@ impl HookContext {
             return Self {
                 platform: Platform::Antigravity,
                 permission_mode: None,
-                is_yolo: env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS")
-                    || get_str(&val, &["permissionMode", "permission_mode"])
-                        .map(permission_mode_is_yolo)
-                        .unwrap_or(false),
+                is_yolo: if let Some(flag) = val.get("is_yolo").and_then(|v| v.as_bool()) {
+                    flag
+                } else {
+                    env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS")
+                        || get_str(&val, &["permissionMode", "permission_mode"])
+                            .map(permission_mode_is_yolo)
+                            .unwrap_or(false)
+                },
                 conversation,
                 cwd: args
                     .and_then(|a| get_str(a, &["Cwd", "cwd"]))
@@ -319,11 +323,15 @@ impl HookContext {
 
             let permission_mode = get_str(&val, &["permission_mode"]).map(str::to_string);
             let is_codex = val.get("turn_id").is_some();
-            let is_yolo = (is_codex && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
-                || permission_mode
-                    .as_deref()
-                    .map(permission_mode_is_yolo)
-                    .unwrap_or(false);
+            let is_yolo = if let Some(flag) = val.get("is_yolo").and_then(|v| v.as_bool()) {
+                flag
+            } else {
+                (is_codex && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
+                    || permission_mode
+                        .as_deref()
+                        .map(permission_mode_is_yolo)
+                        .unwrap_or(false)
+            };
 
             let conversation = ConversationInfo {
                 id: get_str(&val, &["session_id"]).map(str::to_string),

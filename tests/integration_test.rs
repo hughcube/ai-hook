@@ -416,6 +416,7 @@ fn test_v2_context_shapes_inside_js() {
     let agy_ctx = HookContext::parse(
         &serde_json::json!({
             "toolCall": { "name": "run_command", "args": { "CommandLine": "run deploy", "Cwd": "/w" } },
+            "is_yolo": false,
             "conversationId": "conv-9",
             "transcriptPath": "/t/x.jsonl",
             "modelName": "gemini-x"
@@ -1091,7 +1092,7 @@ fn test_can_ask_host_matrix() {
 
     // AGY:普通交互 force_ask 可;YOLO 不可
     let agy = HookContext::parse(
-        &serde_json::json!({"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}}}).to_string(),
+        &serde_json::json!({"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}},"is_yolo":false}).to_string(),
     );
     assert!(agy.can_ask(), "AGY 普通交互模式可 ask(force_ask)");
     let agy_yolo = HookContext::parse(

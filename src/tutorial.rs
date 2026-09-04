@@ -19,22 +19,24 @@ pub fn print_tutorial(lang: &str) {
 
 fn chinese_tutorial_body() -> String {
     let tutorial = r#"================================================================================
-  ai-hook —— AI Agent 安全门禁:能力与边界契约 (v@@VERSION@@)
+  ai-hook —— AI Agent 安全门禁与生命周期基座:能力与边界契约 (v@@VERSION@@)
   阅读对象:接入的 AI Agent、规则脚本作者、安全审计者
 ================================================================================
 
 一、它是什么 / 何时运行 / 何时不运行
 --------------------------------------------------------------------------------
-  ai-hook 是 PreToolUse 同步拦截门禁:在宿主(Claude Code / OpenAI Codex /
-  Google Antigravity / 腾讯 CodeBuddy)每次调用工具之前,宿主把一次工具调用
-  以单行 JSON 从 stdin 传入;ai-hook 依次执行你的 JavaScript 规则,并把决策
-  以该宿主的协议 JSON 写回 stdout;宿主据此 allow / ask / deny。
+  ai-hook 是跨客户端统一的生命周期与门禁基座:在宿主(Claude Code / OpenAI
+  Codex / Google Antigravity / 腾讯 CodeBuddy)的生命周期节点(PreToolUse、
+  PostToolUse、UserPromptSubmit)拦截调用或用户输入。宿主把单次上下文以单行
+  JSON 从 stdin 传入;ai-hook 依次执行你的 JavaScript 规则,并把决策以该宿主
+  的协议 JSON 写回 stdout;宿主据此 allow / ask / deny / block / 注入上下文。
 
   运行模型(必须理解,规则都建立在这之上):
-  · 每次工具调用 = 一个全新进程、全新 QuickJS 沙箱;规则文件之间零状态共享。
+  · 每次调用 = 一个全新进程、全新 QuickJS 沙箱;规则文件之间零状态共享。
     唯一例外:同一进程内多个规则共享 sys.fs / sys.git 的只读内存缓存。
-  · 规则能力边界:无网络、无外部子进程、无任意写文件;sys 只读自治。
-    stdout 只能承载协议 JSON——任何规则日志都不得写入 stdout。
+  · 规则能力:内置 sys 增强 SDK,包括 git/fs/env 内存查询,以及为 0-Token 命令
+    拦截和自动化联动提供的同步外部进程执行 sys.exec() 与轻量 HTTP 请求
+    sys.http。stdout 严格保留承载协议 JSON——任何规则日志都不得写入 stdout。
   · fast path 旁路:命令形如白名单只读命令(如 git status/ls/cat/head/pwd
     且无元字符)时,在规则引擎之前被放行,并会向 stderr 提示"规则被旁路"。
     任何含换行/`$(`/反引号/重定向/管道/`&&`/`;`/危险词的命令一律进入规则
@@ -49,13 +51,16 @@ fn chinese_tutorial_body() -> String {
     解读为放行,因此不可静默返回);能读入但无法解析为 JSON 的 payload 会被
     转为人机确认(桌面弹窗;禁用弹窗时输出 ask),绝不静默放行。
 
-二、ctx —— 一次工具调用的完整归一化视图(唯一 schema,无别名)
+二、ctx —— 一次调用的完整归一化视图(唯一 schema,无别名)
 --------------------------------------------------------------------------------
   {
     agent:  "claude_code"|"codex"|"antigravity"|"codebuddy"|"generic", // 检测到的宿主
+    event:  "PreToolUse"|"PostToolUse"|"UserPromptSubmit"|string, // 生命周期事件
+    prompt: string|null, // 仅在 UserPromptSubmit 时存在用户输入的 Prompt 文本
     mode:   "default"|"plan"|"acceptEdits"|"dontAsk"|"bypassPermissions"|null,
             // 宿主权限模式(仅提供该字段的宿主)
-    isYolo: bool,      // 免确认 = mode 为 bypassPermissions/dontAsk(或 AGY 免确认标志)
+    isYolo: bool,      // 免确认 = mode 为 bypassPermissions/dontAsk,或宿主配置了
+                       // AGY_DANGEROUSLY_SKIP_PERMISSIONS / CODEX_DANGEROUSLY_SKIP_PERMISSIONS
     session:{ id, transcriptPath } | null,
             // 会话 id;transcriptPath = 全量对话记录(JSONL),可用
             // sys.fs.readText() 读取以获得完整上下文做精准拦截
@@ -70,14 +75,13 @@ fn chinese_tutorial_body() -> String {
     raw:    object,    // 宿主下发完整 payload(字段以宿主文档为准,永远可用)
     rawInput: string,  // payload 原始文本
   }
-  规则判空惯例:命令规则先 `if (ctx.cmd && …)`;文件规则先
+  规则判空惯例:
+  - 拦截 Prompt 命令先 `if (ctx.prompt && ...)` 或 `if (ctx.event === "UserPromptSubmit")`;
+  - 命令规则先 `if (ctx.cmd && …)`;文件规则先
   `if (ctx.file && ctx.file.action === "write" …)`——因为 cmd/file 对非适用
   工具恒为 null。
-  宿主差异:Antigravity 工具名在 toolCall.name;Claude Code/Codex/CodeBuddy
-  使用同一 envelope(tool_name+tool_input);Codex 特有 turn_id;antigravity
-  特有 modelName/workspacePaths。
 
-三、sys —— 只读自治 SDK(微秒级,禁止外部进程)
+三、sys —— 自治增强 SDK(只读内存缓存 + 受控执行与网络)
 --------------------------------------------------------------------------------
   sys.git.branch()      string|null   当前分支名(.git/HEAD 纯内存解析)
   sys.git.root()        string|null   仓库根目录
@@ -87,6 +91,12 @@ fn chinese_tutorial_body() -> String {
   sys.fs.list([dir])    string[]      目录条目
   sys.env("KEY")        string|null   进程环境变量(亦可 sys.env.get("KEY"))
   sys.cwd()             string        当前工作目录(与 ctx.cwd 一致)
+  sys.ruleDir / sys.__dirname   string 当前正在执行的规则脚本所在目录绝对路径
+  sys.rulePath / sys.__filename string 当前正在执行的规则脚本文件绝对路径
+  sys.exec(cmd, args?, opts?)   object 同步执行外部命令/脚本,支持 Git Bash 智能定锚:
+                                       返回 { code: number, stdout: string, stderr: string }
+  sys.http.get(url, opts?)      object 同步 HTTP GET,返回 { status, body, headers }
+  sys.http.post(url, body?, opt)object 同步 HTTP POST,返回 { status, body, headers }
   new Date()            标准 JS 时钟(周五封网、夜间窗口等)
   console.log(...)      stderr + 文件;错误也走 console.error(同通道)
   sys.log(level, ...)   结构化日志;level 自定(warn/info/debug…)
@@ -95,7 +105,6 @@ fn chinese_tutorial_body() -> String {
   grep '"sessionId":"…"' 还原。仅当规则真的产生日志时才写盘(零日志零 IO)。
   覆盖/关闭:AI_HOOK_LOG_FILE=自定义路径;AI_HOOK_LOG=0|false 完全关闭;
   超过 20MB 自动轮转为同文件 .1。
-  权限边界:sys 全部只读且不产生副作用;规则无法发起网络或执行程序。
 
 四、决策协议(规则返回值)
 --------------------------------------------------------------------------------
@@ -104,6 +113,9 @@ fn chinese_tutorial_body() -> String {
                                   想放行请显式 return null
   return { action: "allow" };     → 明确放行,继续下一规则
   return { action: "deny",  reason: "…" };   → 硬拒绝,绝对不弹窗
+  return { action: "block", reason: "…" };   → 拦截大模型推理,在终端直接向用户输出
+                                              reason 文本(UserPromptSubmit 零 Token 拦截)
+  return { additionalContext: "…" };         → 向宿主注入上下文规范提示(PostToolUse 提示注入)
   return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
       · gui 三态(2026-09-05 约定,默认不配置):
           gui: true    → 强制桌面置顶弹窗(穿透 --no-gui,不可禁;仅 --dry-run
@@ -116,8 +128,8 @@ fn chinese_tutorial_body() -> String {
       · force_gui: true / action: "force_gui" → 强制桌面弹窗(与 gui:true 同级)
   return false;                   → 拒绝(reason 自动生成)
   引擎级硬边界:规则必须为同步函数;5 秒执行看门狗;64MB 内存上限;
-  不支持 async/Promise、import、require、fetch;文件必须是单文件 ES 语法。
-  规则顺序:按文件名字典序执行;首个 confirm 或 deny 立即短路;
+  不支持 async/Promise、import、require;文件必须是单文件 ES 语法。
+  规则顺序:按文件名字典序执行;首个 confirm、deny 或 block 立即短路;
   allow/无表态不短路。目录加载顺序已保证确定性。
 
 五、宿主决策差异矩阵(can_ask × 模式;输出由 ai-hook 自动映射)
@@ -141,7 +153,10 @@ fn chinese_tutorial_body() -> String {
   Claude Code / CodeBuddy(~/.claude/hooks.json 或 settings.json):
     { "hooks": { "PreToolUse": [
         { "matcher": "Bash|Write|Edit|Read",
-          "hooks": [{ "type": "command", "command": "ai-hook ./rules/protect.js" }] } ] } }
+          "hooks": [{ "type": "command", "command": "ai-hook ./rules/protect.js" }] } ],
+      "UserPromptSubmit": [
+        { "matcher": ".*",
+          "hooks": [{ "type": "command", "command": "ai-hook ./rules/intercept.js" }] } ] } }
   Antigravity(~/.gemini/config/hooks.json):
     { "PreToolUse": [ { "matcher": "run_command|write_to_file|view_file",
         "hooks": [ { "command": "ai-hook ./rules/protect.js", "timeout": 70 } ] } ] }
@@ -170,7 +185,8 @@ fn chinese_tutorial_body() -> String {
   1) 白名单 fast path 只放行“无任何元字符的单条只读命令”,其余全走规则;
   2) 规则失败默认关闭(fail-closed),错误即拒绝并附原因;
   3) 每条规则 5s 看门狗 + 64MB 沙箱,死循环/超内存被中断;
-  4) 规则仅能读取(sys.fs/env/git),无网络无执行能力;
+  4) 规则提供受控同步只读 SDK、外部执行(sys.exec)与 HTTP 接口(sys.http),
+     专供 0-Token 拦截与自动化注入;
   5) 协议输出仅 JSON;日志双通道(stderr+文件)不污染 stdout;
   6) deny 的 reason 会回传给宿主与用户,便于审计与追溯。
 ================================================================================
@@ -180,25 +196,28 @@ fn chinese_tutorial_body() -> String {
 
 fn english_tutorial_body() -> String {
     let tutorial = r#"================================================================================
-  ai-hook — AI Agent Security Gate: Capability & Boundary Contract (v@@VERSION@@)
+  ai-hook — AI Agent Security Gate & Lifecycle Base: Capability & Boundary Contract (v@@VERSION@@)
   Audience: integrating AI agents, rule authors, security reviewers
 ================================================================================
 
 I. What it is / when it runs / when it does not
 --------------------------------------------------------------------------------
-  ai-hook is a synchronous PreToolUse gate: before the host (Claude Code,
-  OpenAI Codex, Google Antigravity, Tencent CodeBuddy) invokes a tool, the host
-  feeds one tool call as a single JSON line on stdin; ai-hook runs your
-  JavaScript rules in order and writes the decision back to stdout in that
-  host's protocol; the host then allows / asks / denies.
+  ai-hook is a cross-client unified lifecycle and security gate: at host lifecycle
+  hook points (PreToolUse, PostToolUse, UserPromptSubmit in Claude Code,
+  OpenAI Codex, Google Antigravity, Tencent CodeBuddy), the host feeds single-call
+  context as a single JSON line on stdin; ai-hook runs your JavaScript rules in
+  order and writes the decision back to stdout in that host's protocol; the host
+  then allows / asks / denies / blocks / injects additional context.
 
   Execution model (rules build on this):
-  · One tool call = one fresh process and one fresh QuickJS sandbox; rule
+  · One invocation = one fresh process and one fresh QuickJS sandbox; rule
     files share zero state. Only exception: rules in the same process share
     the read-only in-memory caches of sys.fs / sys.git.
-  · Rule capability boundary: no network, no subprocesses, no arbitrary file
-    writes; sys is a read-only autonomous SDK. stdout carries protocol JSON
-    only — rule logging must never go to stdout.
+  · Rule capability: built-in sys enhanced SDK, including in-memory git/fs/env
+    queries, plus synchronous external process execution via sys.exec() and
+    lightweight HTTP requests via sys.http for 0-Token prompt interception and
+    automated workflows. stdout strictly carries protocol JSON only — rule logging
+    must never touch stdout.
   · Fast-path bypass: commands that are provably single read-only invocations
     (whitelist like git status/ls/cat/head/pwd and no shell metacharacters)
     are allowed BEFORE the rule engine, with a stderr notice. Anything
@@ -218,13 +237,16 @@ I. What it is / when it runs / when it does not
     dialog, or a terminal "ask" when dialogs are disabled) — never silently
     allowed.
 
-II. ctx — one normalized view of a tool call (single schema, no aliases)
+II. ctx — one normalized view of an invocation (single schema, no aliases)
 --------------------------------------------------------------------------------
   {
     agent:  "claude_code"|"codex"|"antigravity"|"codebuddy"|"generic", // detected host
+    event:  "PreToolUse"|"PostToolUse"|"UserPromptSubmit"|string, // lifecycle event
+    prompt: string|null, // user input prompt string (UserPromptSubmit only)
     mode:   "default"|"plan"|"acceptEdits"|"dontAsk"|"bypassPermissions"|null,
             // host permission mode (hosts that provide it)
-    isYolo: bool,       // no-confirm = mode bypassPermissions/dontAsk (or AGY flag)
+    isYolo: bool,       // no-confirm = mode bypassPermissions/dontAsk, or host configured
+                        // AGY_DANGEROUSLY_SKIP_PERMISSIONS / CODEX_DANGEROUSLY_SKIP_PERMISSIONS
     session:{ id, transcriptPath } | null,
             // session id; transcriptPath = full conversation log (JSONL);
             // read it with sys.fs.readText() for context-aware decisions
@@ -239,14 +261,13 @@ II. ctx — one normalized view of a tool call (single schema, no aliases)
     raw:    object,     // full host payload (host fields win; always available)
     rawInput: string,   // raw payload text
   }
-  Rule idiom: guard command rules with `if (ctx.cmd && …)` and file rules with
-  `if (ctx.file && ctx.file.action === "write" …)` — cmd/file are null for
-  tools they do not describe.
-  Host differences: Antigravity names its tool in toolCall.name; Claude Code /
-  Codex / CodeBuddy share one envelope (tool_name + tool_input); turn_id is
-  Codex-only; modelName/workspacePaths are Antigravity-only.
+  Rule idiom:
+  - Guard prompt interception with `if (ctx.prompt && ...)` or `if (ctx.event === "UserPromptSubmit")`;
+  - Guard command rules with `if (ctx.cmd && …)` and file rules with
+    `if (ctx.file && ctx.file.action === "write" …)` — cmd/file are null for
+    tools they do not describe.
 
-III. sys — read-only autonomous SDK (microsecond, no external processes)
+III. sys — autonomous SDK (in-memory cached + controlled execution & network)
 --------------------------------------------------------------------------------
   sys.git.branch()      string|null   current branch (pure .git/HEAD parse)
   sys.git.root()        string|null   repository root
@@ -256,6 +277,12 @@ III. sys — read-only autonomous SDK (microsecond, no external processes)
   sys.fs.list([dir])    string[]      directory entries
   sys.env("KEY")        string|null   process environment (or sys.env.get)
   sys.cwd()             string        current working directory (= ctx.cwd)
+  sys.ruleDir / sys.__dirname   string absolute directory path of running rule file
+  sys.rulePath / sys.__filename string absolute file path of running rule file
+  sys.exec(cmd, args?, opts?)   object synchronous command execution (Git Bash aware):
+                                       returns { code: number, stdout: string, stderr: string }
+  sys.http.get(url, opts?)      object synchronous HTTP GET, returns { status, body, headers }
+  sys.http.post(url, body?, opt)object synchronous HTTP POST, returns { status, body, headers }
   new Date()            standard JS clock (freeze windows, night rules…)
   console.log(...)      stderr + file; console.error shares the channel
   sys.log(level, ...)   structured log; level is free-form (warn/info/debug…)
@@ -264,8 +291,6 @@ III. sys — read-only autonomous SDK (microsecond, no external processes)
   session's story with grep '"sessionId":"…"'. Disk I/O happens only when a
   rule actually logs (zero logs = zero I/O). Overrides: AI_HOOK_LOG_FILE=<path>;
   disable with AI_HOOK_LOG=0|false; >20MB auto-rotates to <name>.1.
-  Permission boundary: sys is read-only with no side effects; rules cannot
-  reach the network or spawn programs.
 
 IV. Decision protocol (rule return values)
 --------------------------------------------------------------------------------
@@ -274,6 +299,9 @@ IV. Decision protocol (rule return values)
                                    say `return null` to pass explicitly
   return { action: "allow" };     → allow explicitly, keep going
   return { action: "deny", reason: "…" };  → hard block, never a popup
+  return { action: "block", reason: "…" }; → block LLM inference, output reason directly
+                                             to user in terminal (UserPromptSubmit 0-Token)
+  return { additionalContext: "…" };       → inject guidance context to host (PostToolUse)
   return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
       · gui tri-state (2026-09-05 contract; by default NOT set):
           gui: true    → force the topmost desktop dialog (pierces --no-gui;
@@ -288,8 +316,8 @@ IV. Decision protocol (rule return values)
         (same strength as gui: true)
   return false;                   → deny (auto-generated reason)
   Engine hard limits: rules MUST be synchronous; 5s watchdog; 64MB heap cap;
-  no async/Promise, no import/require/fetch; single-file ES syntax only.
-  Order: rules run in file-name lexicographic order; the first confirm or deny
+  no async/Promise, no import/require; single-file ES syntax only.
+  Order: rules run in file-name lexicographic order; the first confirm, deny, or block
   short-circuits; allow / no-opinion never short-circuit. Directory loading
   order is deterministic.
 
@@ -317,7 +345,10 @@ VI. Minimal integration
   Claude Code / CodeBuddy (~/.claude/hooks.json or settings.json):
     { "hooks": { "PreToolUse": [
         { "matcher": "Bash|Write|Edit|Read",
-          "hooks": [{ "type": "command", "command": "ai-hook ./rules/protect.js" }] } ] } }
+          "hooks": [{ "type": "command", "command": "ai-hook ./rules/protect.js" }] } ],
+      "UserPromptSubmit": [
+        { "matcher": ".*",
+          "hooks": [{ "type": "command", "command": "ai-hook ./rules/intercept.js" }] } ] } }
   Antigravity (~/.gemini/config/hooks.json):
     { "PreToolUse": [ { "matcher": "run_command|write_to_file|view_file",
         "hooks": [ { "command": "ai-hook ./rules/protect.js", "timeout": 70 } ] } ] }
@@ -350,7 +381,8 @@ VIII. Security model summary (for reviewers)
   2) Rule failure is fail-closed by default: an error denies with its reason.
   3) Each rule has a 5s watchdog and a 64MB sandbox; runaway loops are
      interrupted, over-memory is bounded.
-  4) Rules can only read (sys.fs/env/git); no network, no execution.
+  4) Rules provide controlled synchronous read SDK, external execution (sys.exec)
+     and HTTP (sys.http) strictly for 0-Token interception and automation.
   5) Protocol output is JSON only; logs go to stderr + file, never stdout.
   6) Deny reasons are returned to the host and user for auditability.
 ================================================================================

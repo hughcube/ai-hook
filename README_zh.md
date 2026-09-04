@@ -244,7 +244,9 @@ export default function(ctx, sys) {
 | :--- | :--- | :--- |
 | `ctx.agent` | `string` | 检测到的宿主:`"antigravity"` / `"claude_code"` / `"codebuddy"` / `"codex"` / `"generic"` |
 | `ctx.mode` | `string?` | 宿主权限模式:`default`/`plan`/`acceptEdits`/`dontAsk`/`bypassPermissions` |
-| `ctx.isYolo` | `boolean` | 免确认(mode 含 bypassPermissions/dontAsk,或 AGY 免确认标志) |
+| `ctx.isYolo` | `boolean` | 免确认模式（自动感知 `AGY_DANGEROUSLY_SKIP_PERMISSIONS` 与 `CODEX_DANGEROUSLY_SKIP_PERMISSIONS` 环境变量，或 mode 含 bypassPermissions/dontAsk） |
+| `ctx.event` | `string?` | 生命周期事件名:`"PreToolUse"` / `"PostToolUse"` / `"UserPromptSubmit"` |
+| `ctx.prompt` | `string?` | 用户原始 Prompt 文本（仅在 `UserPromptSubmit` 等 Prompt 拦截事件中提供） |
 | `ctx.session` | `{id, transcriptPath}?` | 会话 id 与全量对话记录路径(可用 `sys.fs.readText` 读取上下文) |
 | `ctx.cwd` | `string` | 会话/命令工作目录 |
 | `ctx.model` | `string?` | 宿主模型标识(如 Antigravity `modelName`) |
@@ -257,11 +259,11 @@ export default function(ctx, sys) {
 > 设计原则:一语义一属性,无别名;非适用工具时 `cmd`/`file` 为 `null`(规则请先判空)。
 
 
-### 2. `sys` 原生极速自治能力（微秒级原生数据获取）
+### 2. `sys` 原生极速自治能力（微秒级原生数据获取与安全扩展）
 
-`ai-hook` 严禁在规则中启动低效的外部子进程（如 `git.exe`），所有前置数据均由 Rust 原生微秒级 API 提供：
+`ai-hook` 提供丰富的原生微秒级 API，前置只读数据全部内存级解析；同时开放受控的进程调度与 HTTP 通信能力：
 
-| 方法 | 返回类型 | 说明与性能 |
+| 方法 / 属性 | 返回类型 | 说明与性能 |
 | :--- | :--- | :--- |
 | `sys.git.branch()` | `string?` | **0.02ms** 内存直读 `.git/HEAD` 获取当前 Git 分支名（如 `"master"`, `"main"`） |
 | `sys.git.root()` | `string?` | 获取当前 Git 仓库根目录绝对路径 |
@@ -271,11 +273,16 @@ export default function(ctx, sys) {
 | `sys.fs.list([dir])` | `string[]` | 列出目标目录下的所有文件名 |
 | `sys.env("KEY")` | `string?` | **< 1 µs** 获取宿主环境变量，亦可使用 `sys.env.get("KEY")` |
 | `sys.cwd()` | `string` | 获取当前工作目录 |
+| `sys.ruleDir` / `sys.__dirname` | `string` | 当前规则脚本所在目录的绝对路径 |
+| `sys.rulePath` / `sys.__filename` | `string` | 当前规则脚本文件的绝对路径 |
+| `sys.exec(cmd, args?, opt?)` | `object` | **进程调度**：执行外部命令/脚本（专为 0 Token 拦截加速），支持 `cwd`/`env`/`input`，Windows 自动防 WSL 存根劫持定位 Git Bash；返回 `{ code, status, exitCode, stdout, stderr, success }` |
+| `sys.http.get(url, opt?)` | `object` | **轻量同步 HTTP**：支持 `headers`/`timeout`，返回 `{ status, ok, headers, body }` |
+| `sys.http.post(url, opt?)` | `object` | **轻量同步 HTTP POST**：支持 `headers`/`body`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | 调试日志到 stderr(绝不污染决策 JSON) |
 | `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义) |
 | **标准 JS 原生时钟** | - | 使用原生 `new Date()` 即可做星期几、小时、日期、封网期计算 |
 
-### 3. 决策返回值：精确控制是强制阻断、还是弹窗确认
+### 3. 决策返回值：精确控制是强制阻断、弹窗确认还是提示注入
 
 JS 规则文件通过返回值精确控制拦截行为：
 
@@ -312,7 +319,26 @@ return {
 };
 ```
 
-#### 场景 D: 【安全放行】
+#### 场景 D: 【零 Token 本地命令拦截阻断】 (UserPromptSubmit Zero-Token Intercept)
+针对可直接在本地完成的查询或执行型命令（如 `/ai:balance`、`/ai:usage`、`/ai:sync`、`/ai:cache`）：
+```javascript
+return {
+  action: "block",
+  reason: "余额信息为: ¥100.00" // 直接呈现给用户，免除大模型推理消耗
+};
+```
+> **效果**：输出标准 `{"decision":"block","reason":"..."}`，阻断大模型推理调用，零 Token 消耗，直接在终端回显结果。
+
+#### 场景 E: 【工具调用后规范注入与上下文提示】 (PostToolUse Context Injection)
+针对工具执行完毕后的规范指引（如编辑数据库迁移文件后的应用层增改查联动提示）：
+```javascript
+return {
+  additionalContext: "刚编辑了 migration 文件，请遵循模型/应用层全链路规范补充往返测试！"
+};
+```
+> **效果**：输出标准 `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}`，向大模型注入额外上下文提示。
+
+#### 场景 F: 【安全放行】
 ```javascript
 return null; // 或 return { action: "allow" };
 ```
