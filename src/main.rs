@@ -3,8 +3,8 @@ use ai_hook::engine::{RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
 use ai_hook::protocol::{HookContext, HookDecision};
 use ai_hook::ui::GuiDialog;
-use clap::Parser;
-use std::io::Read;
+use clap::{CommandFactory, Parser};
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -47,6 +47,13 @@ fn collect_target_rules(args: &Cli, extra_scripts: Option<&[PathBuf]>) -> Vec<Pa
 
 /// Main entry point for agent hook dispatching via stdin
 fn handle_dispatch(args: &Cli) {
+    if std::io::stdin().is_terminal() {
+        // Invoked directly from terminal without piped input -> print help and exit
+        let _ = Cli::command().print_help();
+        println!();
+        return;
+    }
+
     let mut buffer = String::new();
     let _ = std::io::stdin().read_to_string(&mut buffer);
 
