@@ -318,10 +318,12 @@ impl HookContext {
             let tool_args = tool_input.cloned().unwrap_or(serde_json::Value::Null);
 
             let permission_mode = get_str(&val, &["permission_mode"]).map(str::to_string);
-            let is_yolo = permission_mode
-                .as_deref()
-                .map(permission_mode_is_yolo)
-                .unwrap_or(false);
+            let is_codex = val.get("turn_id").is_some();
+            let is_yolo = (is_codex && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
+                || permission_mode
+                    .as_deref()
+                    .map(permission_mode_is_yolo)
+                    .unwrap_or(false);
 
             let conversation = ConversationInfo {
                 id: get_str(&val, &["session_id"]).map(str::to_string),
@@ -396,7 +398,11 @@ impl HookContext {
             return Self {
                 platform,
                 permission_mode: get_str(&val, &["permission_mode"]).map(str::to_string),
-                is_yolo: false,
+                is_yolo: (platform == Platform::Codex && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
+                    || (platform == Platform::Antigravity && env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS"))
+                    || get_str(&val, &["permission_mode"])
+                        .map(permission_mode_is_yolo)
+                        .unwrap_or(false),
                 conversation,
                 cwd: get_str(&val, &["cwd"])
                     .map(str::to_string)

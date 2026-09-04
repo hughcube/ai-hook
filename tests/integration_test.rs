@@ -1270,3 +1270,53 @@ fn test_post_tool_use_additional_context() {
     }).to_string());
 }
 
+#[test]
+fn test_codex_dangerously_skip_permissions_env_detection() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let payload = serde_json::json!({
+        "turn_id": "codex-turn-1",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" }
+    }).to_string();
+
+    let tmp = std::env::temp_dir().join(format!("ai-hook-codex-yolo-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let rule_file = write_temp_rule(
+        &tmp,
+        "codex-guard.js",
+        r#"export default function(ctx, sys) {
+            return { action: "confirm", reason: "confirm-danger" };
+        }"#,
+    );
+
+    // 1. Without CODEX_DANGEROUSLY_SKIP_PERMISSIONS: should output "ask"
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["--no-gui", rule_file.to_string_lossy().as_ref()])
+        .env_remove("CODEX_DANGEROUSLY_SKIP_PERMISSIONS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"ask\""), "Codex normal should ask: {stdout}");
+
+    // 2. With CODEX_DANGEROUSLY_SKIP_PERMISSIONS=1: should output "deny"
+    let mut child_yolo = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["--no-gui", rule_file.to_string_lossy().as_ref()])
+        .env("CODEX_DANGEROUSLY_SKIP_PERMISSIONS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child_yolo.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    let out_yolo = child_yolo.wait_with_output().unwrap();
+    let stdout_yolo = String::from_utf8_lossy(&out_yolo.stdout);
+    assert!(stdout_yolo.contains("\"deny\""), "Codex yolo env should deny: {stdout_yolo}");
+}
+
+
