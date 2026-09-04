@@ -61,14 +61,36 @@ impl RuleRunner {
         let res = js_context.with(|js_ctx| -> rquickjs::Result<()> {
             // 1. Build ctx object
             let ctx_obj = Object::new(js_ctx.clone())?;
+
+            let agent_str = ctx.platform.to_string();
+            ctx_obj.set("agent", agent_str.clone())?;
+            ctx_obj.set("agentType", agent_str.clone())?;
+            ctx_obj.set("platform", agent_str)?;
+
             ctx_obj.set("cmd", ctx.cmd.clone())?;
+            ctx_obj.set("tool", ctx.tool_name.clone())?;
             ctx_obj.set("toolName", ctx.tool_name.clone())?;
+            ctx_obj.set("file", ctx.target_file.clone())?;
             ctx_obj.set("targetFile", ctx.target_file.clone())?;
             ctx_obj.set("cwd", ctx.cwd.clone())?;
-            ctx_obj.set("platform", ctx.platform.to_string())?;
+            ctx_obj.set("rawInput", ctx.raw_input.clone())?;
             ctx_obj.set("isYolo", ctx.is_yolo)?;
+
             if let Some(ref cid) = ctx.conversation_id {
                 ctx_obj.set("conversationId", cid.clone())?;
+            }
+
+            // Injected parsed raw payload
+            if let Ok(raw_val) = js_ctx.json_parse(ctx.raw_input.as_bytes()) {
+                ctx_obj.set("raw", raw_val)?;
+            } else {
+                ctx_obj.set("raw", ctx.raw_input.clone())?;
+            }
+
+            // Injected tool arguments
+            let args_json_str = ctx.tool_args.to_string();
+            if let Ok(args_val) = js_ctx.json_parse(args_json_str.as_bytes()) {
+                ctx_obj.set("args", args_val)?;
             }
 
             // 1.5 Setup console.log
@@ -117,14 +139,23 @@ impl RuleRunner {
 
                 if let Ok(action) = obj.get::<_, String>("action") {
                     let reason = obj.get::<_, String>("reason").unwrap_or_default();
+                    let title = obj.get::<_, String>("title").ok();
+                    let gui = obj.get::<_, bool>("gui").ok();
+                    let timeout = obj.get::<_, u32>("timeout").ok();
+
                     match action.to_lowercase().as_str() {
-                        "confirm" | "ask" => {
-                            decision = Some(HookDecision::Confirm { reason });
+                        "confirm" | "ask" | "prompt" => {
+                            decision = Some(HookDecision::Confirm {
+                                reason,
+                                title,
+                                gui,
+                                timeout,
+                            });
                         }
-                        "deny" | "block" => {
+                        "deny" | "block" | "reject" => {
                             decision = Some(HookDecision::Deny { reason });
                         }
-                        "allow" => {
+                        "allow" | "pass" => {
                             decision = Some(HookDecision::Allow);
                         }
                         _ => {}

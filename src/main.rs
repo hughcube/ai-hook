@@ -86,19 +86,40 @@ fn handle_dispatch(args: &Cli) {
 
     let (decision, _) = runner.evaluate_all(&rules, &ctx);
 
-    // 4. Handle GUI confirmation if in YOLO/skip-permissions mode
+    // 4. Handle confirmation & GUI prompt
     let mut gui_approved = None;
-    if let HookDecision::Confirm { ref reason } = decision {
+    if let HookDecision::Confirm {
+        ref reason,
+        ref title,
+        gui,
+        timeout: rule_timeout,
+    } = decision
+    {
         let gui_enabled = GuiDialog::is_enabled(args.no_gui);
-        let timeout = GuiDialog::resolve_timeout(args.timeout);
+        let timeout = rule_timeout.unwrap_or_else(|| GuiDialog::resolve_timeout(args.timeout));
 
-        if ctx.is_yolo && gui_enabled && !args.dry_run {
+        let should_popup = if let Some(rule_gui) = gui {
+            rule_gui && gui_enabled && !args.dry_run
+        } else {
+            // Default: popup if GUI is enabled and not dry-run
+            gui_enabled && !args.dry_run
+        };
+
+        if should_popup {
             let prompt_target = if ctx.cmd.is_empty() {
                 &ctx.target_file
             } else {
                 &ctx.cmd
             };
-            let approved = GuiDialog::confirm(reason, prompt_target, timeout);
+            let prompt_title = title.as_deref().unwrap_or("操作安全授权确认");
+            let prompt_agent = ctx.platform.to_string();
+            let approved = GuiDialog::confirm(
+                prompt_title,
+                reason,
+                prompt_target,
+                &prompt_agent,
+                timeout,
+            );
             gui_approved = Some(approved);
         } else if ctx.is_yolo && !gui_enabled {
             // If GUI is explicitly disabled in YOLO mode, reject for safety
@@ -196,7 +217,7 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
 
     for res in results {
         let status = match res.decision {
-            Some(HookDecision::Confirm { ref reason }) => format!("⚠️ CONFIRM ({})", reason),
+            Some(HookDecision::Confirm { ref reason, .. }) => format!("⚠️ CONFIRM ({})", reason),
             Some(HookDecision::Deny { ref reason }) => format!("🛑 DENY ({})", reason),
             Some(HookDecision::Allow) => "✅ ALLOW".to_string(),
             None => "◽ PASS".to_string(),

@@ -107,7 +107,10 @@ fn test_autonomous_js_rule_execution() {
     assert_eq!(
         res_confirm.decision,
         Some(HookDecision::Confirm {
-            reason: "Needs restart approval".to_string()
+            reason: "Needs restart approval".to_string(),
+            title: None,
+            gui: None,
+            timeout: None,
         })
     );
 
@@ -157,4 +160,60 @@ fn test_sys_autonomous_git_branch() {
     } else {
         panic!("Expected Deny decision");
     }
+}
+
+#[test]
+fn test_ctx_agent_and_raw_input() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let rule_code = r#"
+        export default function(ctx, sys) {
+            // Verify agent type detection
+            if (ctx.agent !== "antigravity" && ctx.agentType !== "antigravity") {
+                return { action: "deny", reason: "Agent detection failed" };
+            }
+            // Verify raw input access
+            if (!ctx.raw || ctx.raw.customFlag !== "secret_value") {
+                return { action: "deny", reason: "Raw payload access failed" };
+            }
+            // Verify args access
+            if (!ctx.args || ctx.args.CommandLine !== "echo hello") {
+                return { action: "deny", reason: "Args access failed" };
+            }
+            // Verify GUI control return
+            return {
+                action: "confirm",
+                reason: "Confirmed with GUI control",
+                title: "Custom Auth Title",
+                gui: false,
+                timeout: 45
+            };
+        }
+    "#;
+
+    let rule = RuleSource {
+        id: "raw-agent-test".to_string(),
+        path: PathBuf::from("raw-agent-test.js"),
+        code: rule_code.to_string(),
+    };
+
+    let ctx = HookContext::parse(&serde_json::json!({
+        "toolName": "run_command",
+        "customFlag": "secret_value",
+        "toolCall": {
+            "args": {
+                "CommandLine": "echo hello"
+            }
+        }
+    }).to_string());
+
+    let res = runner.execute_rule(&rule, &ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Confirm {
+            reason: "Confirmed with GUI control".to_string(),
+            title: Some("Custom Auth Title".to_string()),
+            gui: Some(false),
+            timeout: Some(45),
+        })
+    );
 }

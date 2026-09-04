@@ -5,6 +5,7 @@ pub enum Platform {
     Antigravity,
     Codex,
     ClaudeCode,
+    CodeBuddy,
     Generic,
 }
 
@@ -14,6 +15,7 @@ impl std::fmt::Display for Platform {
             Platform::Antigravity => write!(f, "antigravity"),
             Platform::Codex => write!(f, "codex"),
             Platform::ClaudeCode => write!(f, "claude_code"),
+            Platform::CodeBuddy => write!(f, "codebuddy"),
             Platform::Generic => write!(f, "generic"),
         }
     }
@@ -26,6 +28,8 @@ pub struct HookContext {
     pub cmd: String,
     pub target_file: String,
     pub raw_input: String,
+    pub raw_value: serde_json::Value,
+    pub tool_args: serde_json::Value,
     pub is_yolo: bool,
     pub cwd: String,
     pub conversation_id: Option<String>,
@@ -43,6 +47,8 @@ impl HookContext {
                     cmd: String::new(),
                     target_file: String::new(),
                     raw_input: raw_json.to_string(),
+                    raw_value: serde_json::Value::Null,
+                    tool_args: serde_json::Value::Null,
                     is_yolo: false,
                     cwd: std::env::current_dir()
                         .map(|p| p.to_string_lossy().to_string())
@@ -89,12 +95,16 @@ impl HookContext {
                         .unwrap_or_default()
                 });
 
+            let tool_args = args.cloned().unwrap_or(serde_json::Value::Null);
+
             return Self {
                 platform: Platform::Antigravity,
                 tool_name,
                 cmd,
                 target_file,
                 raw_input: raw_json.to_string(),
+                raw_value: val,
+                tool_args,
                 is_yolo,
                 cwd,
                 conversation_id,
@@ -126,12 +136,16 @@ impl HookContext {
                 .map(|s| s.contains("bypass"))
                 .unwrap_or(false);
 
+            let tool_args = tool_input.cloned().unwrap_or(serde_json::Value::Null);
+
             return Self {
                 platform: Platform::Codex,
                 tool_name,
                 cmd,
                 target_file,
                 raw_input: raw_json.to_string(),
+                raw_value: val,
+                tool_args,
                 is_yolo,
                 cwd: std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
@@ -164,12 +178,26 @@ impl HookContext {
             .map(|s| s.contains("bypass"))
             .unwrap_or(false);
 
+        let is_codebuddy = std::env::var("CODEBUDDY").is_ok()
+            || std::env::var("CODEBUDDY_CLI").is_ok()
+            || raw_json.to_lowercase().contains("codebuddy");
+
+        let platform = if is_codebuddy {
+            Platform::CodeBuddy
+        } else {
+            Platform::ClaudeCode
+        };
+
+        let tool_args = tool_input.cloned().unwrap_or(serde_json::Value::Null);
+
         Self {
-            platform: Platform::ClaudeCode,
+            platform,
             tool_name,
             cmd,
             target_file,
             raw_input: raw_json.to_string(),
+            raw_value: val,
+            tool_args,
             is_yolo,
             cwd: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())

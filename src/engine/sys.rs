@@ -125,12 +125,15 @@ pub fn create_sys_object<'js>(
     let sys = Object::new(js_ctx.clone())?;
 
     // 1. sys.env: Pure memory environment lookup (< 1 µs)
-    let env_obj = Object::new(js_ctx.clone())?;
+    // Supports both sys.env("KEY") and sys.env.get("KEY")
+    let env_fn = Function::new(js_ctx.clone(), |name: Option<String>| -> Option<String> {
+        name.and_then(|n| std::env::var(n).ok())
+    })?;
     let env_get = Function::new(js_ctx.clone(), |name: String| -> Option<String> {
         std::env::var(name).ok()
     })?;
-    env_obj.set("get", env_get)?;
-    sys.set("env", env_obj)?;
+    env_fn.set("get", env_get)?;
+    sys.set("env", env_fn)?;
 
     // 2. sys.cwd(): Current working directory
     let sys_for_cwd = sys_ctx.clone();
@@ -153,6 +156,23 @@ pub fn create_sys_object<'js>(
     })?;
     fs_obj.set("read", read_fn.clone())?;
     fs_obj.set("readText", read_fn)?;
+
+    let sys_for_list = sys_ctx.clone();
+    let list_fn = Function::new(js_ctx.clone(), move |dir_path: Option<String>| -> Vec<String> {
+        let target = match dir_path {
+            Some(p) => sys_for_list.resolve_path(&p),
+            None => sys_for_list.cwd.clone(),
+        };
+        if let Ok(entries) = std::fs::read_dir(target) {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    })?;
+    fs_obj.set("list", list_fn)?;
     sys.set("fs", fs_obj)?;
 
     // 4. sys.git: Pure-memory .git/HEAD parser (~ 0.02 ms, 0 git.exe processes)
@@ -162,6 +182,29 @@ pub fn create_sys_object<'js>(
         sys_for_branch.git_branch()
     })?;
     git_obj.set("branch", branch_fn)?;
+
+    let sys_for_root = sys_ctx.clone();
+    let root_fn = Function::new(js_ctx.clone(), move || -> Option<String> {
+        let mut curr = Some(sys_for_root.cwd.as_path());
+        while let Some(dir) = curr {
+            if dir.join(".git").exists() {
+                return Some(dir.to_string_lossy().to_string());
+            }
+            curr = dir.parent();
+        }
+        None
+    })?;
+    git_obj.set("root", root_fn)?;
+
+    let sys_for_git_status = sys_ctx.clone();
+    let status_fn = Function::new(js_ctx.clone(), move || -> String {
+        if let Some(b) = sys_for_git_status.git_branch() {
+            format!("branch: {}", b)
+        } else {
+            "not a git repository".to_string()
+        }
+    })?;
+    git_obj.set("status", status_fn)?;
     sys.set("git", git_obj)?;
 
     Ok(sys)

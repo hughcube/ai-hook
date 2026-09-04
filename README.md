@@ -129,8 +129,10 @@ alias ai:hook="ai-hook"
 
 ### 3. Register in Agent Configurations (Supports Multiple Scripts)
 
-In your agent configuration (e.g. Antigravity `~/.gemini/config/hooks.json`), specify `ai-hook` along with one or more rule script paths:
+`ai-hook` is designed as a universal, zero-dependency safety gate. Pass one or more rule script paths directly as positional CLI arguments:
 
+#### (1) Google Antigravity
+Configure in `~/.gemini/config/hooks.json`:
 ```json
 {
   "PreToolUse": [
@@ -148,66 +150,169 @@ In your agent configuration (e.g. Antigravity `~/.gemini/config/hooks.json`), sp
 }
 ```
 
-> **Note**: `ai-hook` strictly executes the explicit scripts provided, without blind whole-disk traversal. Full evaluation takes only ~2ms.
+#### (2) Anthropic Claude Code / CodeBuddy
+Configure in your hooks configuration:
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "command": "ai-hook ./rules/protect-prod.js ./rules/protect-publish.js"
+      }
+    ]
+  }
+}
+```
 
-### 4. GUI Prompt & Timeout Configuration
+> **Performance Guarantee**: `ai-hook` strictly evaluates only the explicit scripts provided, with zero disk traversal. Full evaluation across 10 rules takes only ~2ms.
+
+### 4. Modern Adaptive Dialog & Timeout Configuration
+
+`ai-hook` ditches clunky legacy dialogs in favor of an adaptive floating card design (rendered via native WPF XAML on Windows):
+- **Intelligent Auto-Collapsing**: When there is no command to display, **the code box is completely collapsed**, eliminating awkward blank areas!
+- **Dark Mode Code Card**: When a command is present, it is rendered in a sleek `#0F172A` dark container with syntax-friendly styling and auto-scrollbars;
+- **Full Keyboard Navigation**: Press `Enter` to Allow, press `Esc` to Deny;
+- **Topmost & Draggable**: Smooth mouse drag & drop anywhere on the card.
 
 | Env Variable / CLI Option | Default | Description |
 | :--- | :--- | :--- |
-| `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Countdown seconds for the approval window (auto-denies on timeout) |
+| `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Default countdown timeout in seconds (auto-denies on expiration) |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (enabled) | Set to `0` or `false` to disable the GUI dialog completely |
 
 ---
 
-## 📝 Writing Autonomous Rules
+## 📝 Rule Authoring Guide
 
-Rules are written in standard JavaScript (ES6+) and can be passed directly as arguments to `ai-hook`.
+Rules are written in standard JavaScript (ES6+) with zero npm dependencies:
 
-### Contract & Example
+```javascript
+export default function(ctx, sys) {
+  // Your autonomous safety logic...
+  return null; // Pass
+}
+```
+
+### 1. `ctx` Context Object Reference
+
+Through the `ctx` object, your rule can inspect the AI Agent type, the full raw payload, and the tool name/arguments:
+
+| Property | Type | Description |
+| :--- | :--- | :--- |
+| `ctx.agent` / `ctx.agentType` | `string` | **Current AI Agent**: `"antigravity"` (Google AGY), `"claude_code"` (Claude Code), `"codebuddy"` (CodeBuddy), `"codex"` (OpenAI Codex), `"generic"` (other) |
+| `ctx.raw` | `object` | **Full raw payload** deserialized into a JS object (access any agent-specific nested properties) |
+| `ctx.rawInput` | `string` | Raw unprocessed JSON payload string |
+| `ctx.args` | `object` | **Tool arguments object** (e.g. `ctx.args.CommandLine`, `ctx.args.TargetFile`, `ctx.args.CodeContent`) |
+| `ctx.tool` / `ctx.toolName` | `string` | Tool name being executed (e.g. `"run_command"`, `"write_to_file"`) |
+| `ctx.cmd` | `string` | Command line string (for command execution tools; empty for others) |
+| `ctx.file` / `ctx.targetFile` | `string` | Target file path (for file operations) |
+| `ctx.cwd` | `string` | Current workspace absolute directory |
+| `ctx.isYolo` | `boolean` | Whether skip-permissions/YOLO mode is active |
+| `ctx.conversationId` | `string?` | Session conversation ID (if provided by agent) |
+
+### 2. `sys` Native Microsecond Primitives
+
+Subprocess spawning (`git.exe`) is eliminated. All prerequisite data is resolved in microseconds via native Rust memory APIs:
+
+| Method | Return Type | Description & Latency |
+| :--- | :--- | :--- |
+| `sys.git.branch()` | `string?` | **0.02ms** memory parse of `.git/HEAD` for current branch (e.g. `"master"`) |
+| `sys.git.root()` | `string?` | Root directory path of current Git repository |
+| `sys.git.status()` | `string` | Quick status summary |
+| `sys.fs.exists(path)` | `boolean` | **0.01ms** check if file or directory exists (request-scoped cached) |
+| `sys.fs.readText(path)` | `string?` | **0.01ms** read file text (cached in request-scoped memory) |
+| `sys.fs.list([dir])` | `string[]` | List files and directories in path |
+| `sys.env("KEY")` | `string?` | **< 1 µs** get environment variable (or `sys.env.get("KEY")`) |
+| `sys.cwd()` | `string` | Current working directory |
+| `console.log(...)` | `void` | Debug logging redirected to stderr (does not corrupt decision JSON) |
+| **Standard JS Clock** | - | `new Date()` for days, hours, freeze windows |
+
+### 3. Controlling Decisions: Hard Block vs GUI Prompt vs Terminal Ask
+
+Your rule's return object determines the exact action:
+
+#### Scenario A: Direct Hard Block (No Popup)
+For destructive actions that should **never be executed without question**:
+```javascript
+return {
+  action: "deny", // or "block", "reject"
+  reason: "【Hard Block】Force-pushing to production branch is strictly forbidden!"
+};
+```
+> **Behavior**: `ai-hook` immediately outputs a rejection to the agent with the reason. **No dialog is ever displayed.**
+
+#### Scenario B: Modern Fluent Card GUI Popup
+For sensitive operations that require human review:
+```javascript
+return {
+  action: "confirm",             // Trigger confirmation gate
+  title: "Database Reset Authorization", // Custom dialog title
+  reason: "Database reset command detected. Existing tables will be wiped!",
+  gui: true,                     // Pop up modern floating card dialog (default: true)
+  timeout: 45                    // Custom countdown in seconds (auto-denies on timeout)
+};
+```
+> **Behavior**: A sleek floating card pops up. Clicking "Allow" or pressing `Enter` permits execution. Clicking "Deny", pressing `Esc`, or timing out aborts the command.
+
+#### Scenario C: Terminal-Only Confirmation (No GUI)
+Delegate confirmation to the Agent CLI interface (e.g. Claude Code `(y/n)` prompt):
+```javascript
+return {
+  action: "confirm",
+  reason: "Release publishing detected. Proceed?",
+  gui: false // Disables GUI dialog, falls back to terminal prompt
+};
+```
+
+#### Scenario D: Safe Pass
+```javascript
+return null; // or return { action: "allow" };
+```
+
+---
+
+## 💡 Comprehensive Feature Demo
+
+See [`examples/demo_all_features.js`](examples/demo_all_features.js) for an end-to-end example:
 
 ```javascript
 /**
- * protect-deploy.js - Comprehensive production deployment & safety guard
+ * demo_all_features.js - Comprehensive ai-hook rule showcase
  */
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  // 1. Inspect agent & tool
+  console.log(`[Demo] Agent: ${ctx.agent}, Tool: ${ctx.tool}`);
 
-  // 1. Autonomous time logic: Friday afternoon freeze
-  const now = new Date();
-  if (now.getDay() === 5 && now.getHours() >= 16) {
-    if (/migrate:(fresh|reset)|production/i.test(cmd)) {
-      return {
-        action: "deny",
-        reason: "【Deployment Freeze】Friday afternoon change freeze in effect. Destructive migrations prohibited!"
-      };
-    }
-  }
-
-  // 2. Autonomous Git branch awareness: Protect master branch from force push
-  if (/git\s+push\b/i.test(cmd)) {
+  // 2. Fatal command: Hard block without popup
+  if (ctx.cmd && /git\s+push\b.*(-f|--force)\b/.test(ctx.cmd)) {
     const branch = sys.git.branch();
-    if ((branch === "master" || branch === "main") && /\s+(-f|--force)\b/.test(cmd)) {
+    if (branch === "master" || branch === "main") {
       return {
         action: "deny",
-        reason: `【Branch Protection】Force-pushing to production branch '${branch}' is strictly prohibited!`
+        reason: `【Hard Block】Force-push to '${branch}' forbidden!`
       };
     }
   }
 
-  // 3. Autonomous configuration check: Protect production databases
-  if (sys.fs.exists(".env")) {
-    const envText = sys.fs.readText(".env") || "";
-    if (envText.includes("DB_DATABASE=prod_db")) {
-      if (/\b(db:wipe|migrate:fresh)\b/i.test(cmd)) {
-        return {
-          action: "confirm",
-          reason: "Local workspace connects to production database! Database wipe requires manual confirmation."
-        };
-      }
-    }
+  // 3. Sensitive operation: Pop up modern Fluent card
+  if (ctx.cmd && /\b(migrate|wipe|reset)\b/i.test(ctx.cmd)) {
+    return {
+      action: "confirm",
+      title: "Database Modification Authorization",
+      reason: "Destructive migration detected. Existing data may be lost!",
+      gui: true,
+      timeout: 45
+    };
   }
 
-  // Pass by returning null or undefined
+  // 4. Terminal confirmation (no GUI)
+  if (ctx.cmd && /\b(npm\s+publish)\b/i.test(ctx.cmd)) {
+    return {
+      action: "confirm",
+      reason: "npm publish detected. Confirm release?",
+      gui: false
+    };
+  }
+
   return null;
 }
 ```
@@ -217,17 +322,17 @@ export default function(ctx, sys) {
 ## 🛠️ CLI Reference
 
 ```bash
-# List all discovered active rule scripts
-ai-hook list
+# 1. Inspect specified rule scripts
+ai-hook list ./rules/rule1.js ./rules/rule2.js
 
-# Test a simulated command against all active rules and print microsecond profiling
-ai-hook test "git push origin master --force"
+# 2. Test a simulated command against rules with microsecond profiling
+ai-hook test "git push origin master --force" ./examples/demo_all_features.js
 
-# Run high-iteration benchmark across all active rules
-ai-hook bench -i 1000 -c "git status"
+# 3. Run high-iteration benchmark across specified rules
+ai-hook bench -i 1000 -c "git status" ./examples/demo_all_features.js
 
-# Specify custom rule directory
-ai-hook -r ./custom-rules list
+# 4. Install binary to system bin directory (e.g. ~/bin/ai-hook.exe)
+ai-hook install
 ```
 
 ---

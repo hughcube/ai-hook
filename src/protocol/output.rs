@@ -4,8 +4,15 @@ use serde_json::json;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookDecision {
     Allow,
-    Confirm { reason: String },
-    Deny { reason: String },
+    Confirm {
+        reason: String,
+        title: Option<String>,
+        gui: Option<bool>,
+        timeout: Option<u32>,
+    },
+    Deny {
+        reason: String,
+    },
 }
 
 impl HookDecision {
@@ -13,24 +20,35 @@ impl HookDecision {
         match ctx.platform {
             Platform::Antigravity => match self {
                 HookDecision::Allow => json!({ "decision": "allow" }).to_string(),
-                HookDecision::Confirm { reason } => {
-                    if ctx.is_yolo {
-                        // In YOLO / skip-permissions mode, check GUI prompt result
-                        if gui_approved == Some(true) {
+                HookDecision::Confirm { reason, .. } => {
+                    if let Some(approved) = gui_approved {
+                        if approved {
                             json!({ "decision": "allow" }).to_string()
                         } else {
-                            let manual_reason = format!(
-                                "【硬阻断】Agent 不会自动执行该高危操作。请在独立终端手动执行：\n{}",
+                            let deny_reason = format!(
+                                "【安全门禁已拒绝】用户在弹窗中选择拒绝或倒计时超时：\n{}\n命令：{}",
+                                reason,
                                 if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
                             );
                             json!({
                                 "decision": "deny",
-                                "reason": manual_reason
+                                "reason": deny_reason
                             })
                             .to_string()
                         }
+                    } else if ctx.is_yolo {
+                        // In YOLO mode with GUI disabled, reject for safety
+                        let manual_reason = format!(
+                            "【硬阻断】免确认模式下未获得授权。请在终端手动执行：\n{}",
+                            if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
+                        );
+                        json!({
+                            "decision": "deny",
+                            "reason": manual_reason
+                        })
+                        .to_string()
                     } else {
-                        // Interactive mode: force_ask
+                        // Interactive terminal ask
                         let ask_msg = format!(
                             "{}\n即将执行：\n{}",
                             reason,
@@ -66,7 +84,7 @@ impl HookDecision {
                     })
                     .to_string()
                 }
-                HookDecision::Confirm { reason } => {
+                HookDecision::Confirm { reason, .. } => {
                     if gui_approved == Some(true) {
                         json!({
                             "hookSpecificOutput": {
@@ -77,7 +95,7 @@ impl HookDecision {
                         .to_string()
                     } else {
                         let manual_reason = format!(
-                            "【硬阻断】Codex PreToolUse 不支持 ask 确认。请在终端手动执行：\n{}\n原因: {}",
+                            "【硬阻断】用户拒绝或 Codex PreToolUse 不支持交互式确认。命令：\n{}\n原因: {}",
                             if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd },
                             reason
                         );
@@ -107,22 +125,42 @@ impl HookDecision {
                     .to_string()
                 }
             },
-            Platform::ClaudeCode | Platform::Generic => match self {
+            Platform::ClaudeCode | Platform::CodeBuddy | Platform::Generic => match self {
                 HookDecision::Allow => String::new(),
-                HookDecision::Confirm { reason } => {
-                    let ask_msg = format!(
-                        "{}\n即将执行：\n{}",
-                        reason,
-                        if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
-                    );
-                    json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "ask",
-                            "permissionDecisionReason": ask_msg
+                HookDecision::Confirm { reason, .. } => {
+                    if let Some(approved) = gui_approved {
+                        if approved {
+                            String::new()
+                        } else {
+                            let deny_reason = format!(
+                                "【安全门禁已拒绝】用户在弹窗中选择拒绝或倒计时超时：\n{}\n命令：{}",
+                                reason,
+                                if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
+                            );
+                            json!({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PreToolUse",
+                                    "permissionDecision": "deny",
+                                    "permissionDecisionReason": deny_reason
+                                }
+                            })
+                            .to_string()
                         }
-                    })
-                    .to_string()
+                    } else {
+                        let ask_msg = format!(
+                            "{}\n即将执行：\n{}",
+                            reason,
+                            if ctx.cmd.is_empty() { &ctx.target_file } else { &ctx.cmd }
+                        );
+                        json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "ask",
+                                "permissionDecisionReason": ask_msg
+                            }
+                        })
+                        .to_string()
+                    }
                 }
                 HookDecision::Deny { reason } => {
                     let msg = format!(

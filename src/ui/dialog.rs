@@ -58,20 +58,36 @@ impl GuiDialog {
 
     /// Prompts the user with a modern, high-aesthetic system-level GUI dialog.
     /// Returns true if the user clicks "Allow", false on "Deny" or timeout.
-    pub fn confirm(title: &str, body: &str, timeout_sec: u32) -> bool {
+    pub fn confirm(
+        title: &str,
+        reason: &str,
+        command: &str,
+        agent: &str,
+        timeout_sec: u32,
+    ) -> bool {
         #[cfg(target_os = "windows")]
         {
-            return Self::prompt_windows_fluent(title, body, timeout_sec);
+            return Self::prompt_windows_wpf(title, reason, command, agent, timeout_sec);
         }
 
         #[cfg(target_os = "macos")]
         {
-            return Self::prompt_macos_native(title, body, timeout_sec);
+            let body = if command.is_empty() {
+                reason.to_string()
+            } else {
+                format!("{}\n\n即将执行：\n{}", reason, command)
+            };
+            return Self::prompt_macos_native(title, &body, timeout_sec);
         }
 
         #[cfg(target_os = "linux")]
         {
-            return Self::prompt_linux_native(title, body, timeout_sec);
+            let body = if command.is_empty() {
+                reason.to_string()
+            } else {
+                format!("{}\n\n即将执行：\n{}", reason, command)
+            };
+            return Self::prompt_linux_native(title, &body, timeout_sec);
         }
 
         #[allow(unreachable_code)]
@@ -79,153 +95,265 @@ impl GuiDialog {
     }
 
     #[cfg(target_os = "windows")]
-    fn prompt_windows_fluent(title: &str, body: &str, timeout_sec: u32) -> bool {
-        let ps_script = r#"
-            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-            [System.Windows.Forms.Application]::EnableVisualStyles()
+    fn prompt_windows_wpf(
+        title: &str,
+        reason: &str,
+        command: &str,
+        agent: &str,
+        timeout_sec: u32,
+    ) -> bool {
+        let ps_script = r###"
+            param()
+            Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-            $title = if ($env:HOOK_GUI_TITLE) { $env:HOOK_GUI_TITLE } else { "安全门禁权限确认" }
-            $body = if ($env:HOOK_GUI_BODY) { $env:HOOK_GUI_BODY } else { "未知操作" }
-            $to = if ($env:HOOK_GUI_TIMEOUT) { [int]$env:HOOK_GUI_TIMEOUT } else { 60 }
+            # 1. System Theme Adaptive Detection (Windows Dark/Light mode)
+            $isDark = $false
+            $themeEnv = if ($env:AI_HOOK_THEME) { $env:AI_HOOK_THEME.Trim().ToLower() } else { "auto" }
+            if ($themeEnv -eq "dark") {
+                $isDark = $true
+            } elseif ($themeEnv -eq "light") {
+                $isDark = $false
+            } else {
+                try {
+                    $themeVal = Get-ItemPropertyValue -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction SilentlyContinue
+                    if ($themeVal -eq 0) { $isDark = $true }
+                } catch {}
+            }
 
-            $form = New-Object System.Windows.Forms.Form
-            $form.Text = "Antigravity 安全门禁授权 (Security Confirmation)"
-            $form.Size = New-Object System.Drawing.Size(680, 480)
-            $form.MinimumSize = New-Object System.Drawing.Size(540, 360)
-            $form.StartPosition = "CenterScreen"
-            $form.TopMost = $true
-            $form.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
-            $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $form.ShowIcon = $false
+            # 2. Modern Fluent Color Palettes
+            if ($isDark) {
+                $cardBg     = "#181825"
+                $cardBorder = "#313244"
+                $titleFg    = "#CDD6F4"
+                $reasonFg   = "#BAC2DE"
+                $badgeBg    = "#3A1A1A"
+                $badgeFg    = "#F38BA8"
+                $agentBg    = "#252636"
+                $agentFg    = "#A6ADC8"
+                $codeBg     = "#11111B"
+                $codeBorder = "#313244"
+                $codeFg     = "#89DCEB"
+                $timerFg    = "#A6ADC8"
+                $denyBg     = "#313244"
+                $denyFg     = "#CDD6F4"
+                $allowBg    = "#10B981"
+                $allowFg    = "#FFFFFF"
+                $shadowCol  = "#000000"
+                $shadowOpa  = "0.45"
+            } else {
+                $cardBg     = "#FFFFFF"
+                $cardBorder = "#E2E8F0"
+                $titleFg    = "#0F172A"
+                $reasonFg   = "#334155"
+                $badgeBg    = "#FEF2F2"
+                $badgeFg    = "#DC2626"
+                $agentBg    = "#F1F5F9"
+                $agentFg    = "#475569"
+                $codeBg     = "#0F172A"
+                $codeBorder = "#1E293B"
+                $codeFg     = "#38BDF8"
+                $timerFg    = "#64748B"
+                $denyBg     = "#F1F5F9"
+                $denyFg     = "#475569"
+                $allowBg    = "#10B981"
+                $allowFg    = "#FFFFFF"
+                $shadowCol  = "#0F172A"
+                $shadowOpa  = "0.18"
+            }
 
-            # 1. 顶部现代化警示卡片 (Header Alert Card)
-            $pnlTop = New-Object System.Windows.Forms.Panel
-            $pnlTop.Dock = [System.Windows.Forms.DockStyle]::Top
-            $pnlTop.Height = 70
-            $pnlTop.Padding = New-Object System.Windows.Forms.Padding(18, 12, 18, 8)
-            $form.Controls.Add($pnlTop)
+            # 3. Parameters & Smart Empty-Reason Fallback
+            $Title = if ($env:AI_HOOK_DLG_TITLE) { $env:AI_HOOK_DLG_TITLE } else { "操作安全授权确认" }
+            $RawReason = if ($env:AI_HOOK_DLG_REASON) { $env:AI_HOOK_DLG_REASON.Trim() } else { "" }
+            $Command = if ($env:AI_HOOK_DLG_CMD) { $env:AI_HOOK_DLG_CMD } else { "" }
+            $Agent = if ($env:AI_HOOK_DLG_AGENT) { $env:AI_HOOK_DLG_AGENT } else { "AI Agent" }
+            $Timeout = if ($env:AI_HOOK_DLG_TIMEOUT) { [int]$env:AI_HOOK_DLG_TIMEOUT } else { 60 }
 
-            $cardAlert = New-Object System.Windows.Forms.Panel
-            $cardAlert.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $cardAlert.BackColor = [System.Drawing.Color]::FromArgb(254, 242, 242)
-            $cardAlert.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 8)
-            $pnlTop.Controls.Add($cardAlert)
+            $hasCommand = [bool]($Command -and $Command.Trim().Length -gt 0)
+            $cmdVisibility = if ($hasCommand) { "Visible" } else { "Collapsed" }
 
-            $lblAlertTitle = New-Object System.Windows.Forms.Label
-            $lblAlertTitle.Dock = [System.Windows.Forms.DockStyle]::Top
-            $lblAlertTitle.Height = 22
-            $lblAlertTitle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-            $lblAlertTitle.ForeColor = [System.Drawing.Color]::FromArgb(153, 27, 27)
-            $lblAlertTitle.Text = "🛡️ " + $title
-            $cardAlert.Controls.Add($lblAlertTitle)
+            $effectiveReason = if ($RawReason.Length -gt 0) {
+                $RawReason
+            } elseif ($hasCommand) {
+                "AI Agent 准备在当前工作区执行以下操作，请确认是否允许继续："
+            } else {
+                "AI Agent 发起了一项安全敏感操作，请确认是否授权继续执行。"
+            }
 
-            $lblAlertSub = New-Object System.Windows.Forms.Label
-            $lblAlertSub.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $lblAlertSub.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
-            $lblAlertSub.ForeColor = [System.Drawing.Color]::FromArgb(185, 28, 28)
-            $lblAlertSub.Text = "操作命中安全防护规则。请仔细检查下方即将执行的代码与命令参数。"
-            $cardAlert.Controls.Add($lblAlertSub)
-            $lblAlertTitle.BringToFront()
+            $safeTitle = [System.Security.SecurityElement]::Escape($Title)
+            $safeReason = [System.Security.SecurityElement]::Escape($effectiveReason)
+            $safeCmd = [System.Security.SecurityElement]::Escape($Command)
+            $safeAgent = [System.Security.SecurityElement]::Escape($Agent)
 
-            # 2. 底部现代化状态栏与吸附按钮 (Dock = Bottom)
-            $pnlBottom = New-Object System.Windows.Forms.Panel
-            $pnlBottom.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $pnlBottom.Height = 68
-            $pnlBottom.Padding = New-Object System.Windows.Forms.Padding(18, 10, 18, 14)
-            $form.Controls.Add($pnlBottom)
+            # 4. Adaptive Modern Card XAML
+            $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$safeTitle"
+        Width="620"
+        SizeToContent="Height"
+        WindowStartupLocation="CenterScreen"
+        Topmost="True"
+        ResizeMode="NoResize"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        FontFamily="Segoe UI, Microsoft YaHei UI, -apple-system, sans-serif">
+    <Border Background="$cardBg"
+            BorderBrush="$cardBorder"
+            BorderThickness="1"
+            CornerRadius="16"
+            Margin="24">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="26" ShadowDepth="4" Opacity="$shadowOpa" Color="$shadowCol"/>
+        </Border.Effect>
+        <Grid Margin="26,22,26,24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
 
-            # 底部右侧现代化大按钮容器
-            $pnlButtons = New-Object System.Windows.Forms.Panel
-            $pnlButtons.Dock = [System.Windows.Forms.DockStyle]::Right
-            $pnlButtons.Width = 250
-            $pnlBottom.Controls.Add($pnlButtons)
+            <!-- Row 0: Header with Vector Shield -->
+            <Grid Grid.Row="0" Margin="0,0,0,16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                
+                <Border Background="$badgeBg" CornerRadius="7" Padding="8,5" Margin="0,0,10,0">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Viewbox Width="13" Height="13" Margin="0,0,5,0">
+                            <Path Fill="$badgeFg" Data="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 2.18l7 3.12v4.7c0 4.67-3.13 8.94-7 10.08-3.87-1.14-7-5.41-7-10.08V6.3l7-3.12z"/>
+                        </Viewbox>
+                        <TextBlock Text="安全门禁" FontWeight="Bold" Foreground="$badgeFg" FontSize="12"/>
+                    </StackPanel>
+                </Border>
 
-            # 【允许执行】按钮 - 现代翠绿扁平风格
-            $btnAllow = New-Object System.Windows.Forms.Button
-            $btnAllow.Location = New-Object System.Drawing.Point(10, 4)
-            $btnAllow.Size = New-Object System.Drawing.Size(110, 38)
-            $btnAllow.Text = "允许执行"
-            $btnAllow.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
-            $btnAllow.ForeColor = [System.Drawing.Color]::White
-            $btnAllow.BackColor = [System.Drawing.Color]::FromArgb(16, 185, 129)
-            $btnAllow.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btnAllow.FlatAppearance.BorderSize = 0
-            $btnAllow.Cursor = [System.Windows.Forms.Cursors]::Hand
-            $btnAllow.DialogResult = [System.Windows.Forms.DialogResult]::Yes
-            $pnlButtons.Controls.Add($btnAllow)
+                <TextBlock Grid.Column="1" Text="$safeTitle" FontSize="15" FontWeight="Bold" VerticalAlignment="Center" Foreground="$titleFg"/>
 
-            # 【拒绝执行】按钮 - 现代柔红扁平风格
-            $btnDeny = New-Object System.Windows.Forms.Button
-            $btnDeny.Location = New-Object System.Drawing.Point(130, 4)
-            $btnDeny.Size = New-Object System.Drawing.Size(110, 38)
-            $btnDeny.Text = "拒绝执行"
-            $btnDeny.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
-            $btnDeny.ForeColor = [System.Drawing.Color]::White
-            $btnDeny.BackColor = [System.Drawing.Color]::FromArgb(239, 68, 68)
-            $btnDeny.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btnDeny.FlatAppearance.BorderSize = 0
-            $btnDeny.Cursor = [System.Windows.Forms.Cursors]::Hand
-            $btnDeny.DialogResult = [System.Windows.Forms.DialogResult]::No
-            $pnlButtons.Controls.Add($btnDeny)
-            $form.CancelButton = $btnDeny
+                <Border Grid.Column="2" Background="$agentBg" CornerRadius="7" Padding="9,4">
+                    <TextBlock Text="$safeAgent" FontSize="11.5" FontWeight="SemiBold" Foreground="$agentFg"/>
+                </Border>
+            </Grid>
 
-            # 底部左侧倒计时胶囊标签
-            $lblCountdown = New-Object System.Windows.Forms.Label
-            $lblCountdown.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $lblCountdown.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-            $lblCountdown.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
-            $lblCountdown.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
-            $lblCountdown.Text = "⏱️ 剩余确认时间：" + $to + " 秒（超时自动拒绝）"
-            $pnlBottom.Controls.Add($lblCountdown)
-            $pnlButtons.BringToFront()
+            <!-- Row 1: Reason Text -->
+            <TextBlock Grid.Row="1" Text="$safeReason" TextWrapping="Wrap" FontSize="13.5" LineHeight="20" Foreground="$reasonFg" Margin="0,0,0,16"/>
 
-            # 3. 中间代码展示卡片 (VS Code 暗色风格，支持水平和垂直滚动条)
-            $pnlMiddle = New-Object System.Windows.Forms.Panel
-            $pnlMiddle.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $pnlMiddle.Padding = New-Object System.Windows.Forms.Padding(18, 0, 18, 0)
-            $form.Controls.Add($pnlMiddle)
+            <!-- Row 2: Code block (collapsed completely if empty) -->
+            <Border Grid.Row="2" Visibility="$cmdVisibility" Background="$codeBg" BorderBrush="$codeBorder" BorderThickness="1" CornerRadius="9" Padding="14,12" Margin="0,0,0,20">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" MaxHeight="150">
+                    <TextBlock Text="$safeCmd" FontFamily="Consolas, Cascadia Code, Courier New" FontSize="12.5" Foreground="$codeFg"/>
+                </ScrollViewer>
+            </Border>
 
-            $txtCode = New-Object System.Windows.Forms.TextBox
-            $txtCode.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $txtCode.Multiline = $true
-            $txtCode.ReadOnly = $true
-            $txtCode.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
-            $txtCode.WordWrap = $false
-            $txtCode.Font = New-Object System.Drawing.Font("Consolas", 10)
-            $txtCode.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 46)
-            $txtCode.ForeColor = [System.Drawing.Color]::FromArgb(205, 214, 244)
-            $txtCode.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-            $txtCode.Text = $body
-            $pnlMiddle.Controls.Add($txtCode)
+            <!-- Row 3: Action Bar with Vector Clock -->
+            <Grid Grid.Row="3">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
 
-            # 4. 实时动态秒级倒计时与自动销毁
-            $script:timeLeft = $to
-            $timer = New-Object System.Windows.Forms.Timer
-            $timer.Interval = 1000
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Viewbox Width="14" Height="14" Margin="0,0,6,0">
+                        <Path Fill="$timerFg" Data="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8zm.5-13h-1.2v6l5.2 3.1.6-1.1-4.6-2.7z"/>
+                    </Viewbox>
+                    <TextBlock Name="TxtCountdown" Text="剩余 $Timeout 秒自动拒绝" FontSize="12.5" Foreground="$timerFg" FontWeight="Medium" VerticalAlignment="Center"/>
+                </StackPanel>
+
+                <Button Name="BtnDeny" Grid.Column="1" Content="拒绝 (Esc)" Margin="0,0,10,0" Width="105" Height="36"
+                        Background="$denyBg" Foreground="$denyFg" FontWeight="SemiBold" FontSize="13"
+                        BorderThickness="0" Cursor="Hand">
+                    <Button.Resources>
+                        <Style TargetType="Border">
+                            <Setter Property="CornerRadius" Value="8"/>
+                        </Style>
+                    </Button.Resources>
+                </Button>
+
+                <Button Name="BtnAllow" Grid.Column="2" Content="允许执行 (Enter)" Width="125" Height="36"
+                        Background="$allowBg" Foreground="$allowFg" FontWeight="Bold" FontSize="13"
+                        BorderThickness="0" Cursor="Hand">
+                    <Button.Resources>
+                        <Style TargetType="Border">
+                            <Setter Property="CornerRadius" Value="8"/>
+                        </Style>
+                    </Button.Resources>
+                </Button>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+            $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+            $win = [System.Windows.Markup.XamlReader]::Load($reader)
+
+            $btnAllow = $win.FindName("BtnAllow")
+            $btnDeny = $win.FindName("BtnDeny")
+            $txtCountdown = $win.FindName("TxtCountdown")
+
+            $result = 1
+
+            $btnAllow.Add_Click({
+                $script:result = 0
+                $win.Close()
+            })
+
+            $btnDeny.Add_Click({
+                $script:result = 1
+                $win.Close()
+            })
+
+            $win.Add_KeyDown({
+                param($s, $e)
+                if ($e.Key -eq [System.Windows.Input.Key]::Escape) {
+                    $script:result = 1
+                    $win.Close()
+                } elseif ($e.Key -eq [System.Windows.Input.Key]::Enter) {
+                    $script:result = 0
+                    $win.Close()
+                }
+            })
+
+            $win.Add_MouseLeftButtonDown({
+                param($s, $e)
+                $win.DragMove()
+            })
+
+            $script:remaining = $Timeout
+            $timer = New-Object System.Windows.Threading.DispatcherTimer
+            $timer.Interval = [TimeSpan]::FromSeconds(1)
             $timer.Add_Tick({
-                $script:timeLeft--
-                $lblCountdown.Text = "⏱️ 剩余确认时间：" + $script:timeLeft + " 秒（超时自动拒绝）"
-                if ($script:timeLeft -le 0) {
+                $script:remaining--
+                $txtCountdown.Text = "剩余 $script:remaining 秒自动拒绝"
+                if ($script:remaining -le 0) {
                     $timer.Stop()
-                    $form.DialogResult = [System.Windows.Forms.DialogResult]::No
-                    $form.Close()
+                    $script:result = 1
+                    $win.Close()
                 }
             })
             $timer.Start()
 
-            $res = $form.ShowDialog()
+            $win.ShowDialog() | Out-Null
             $timer.Stop()
-            if ($res -eq [System.Windows.Forms.DialogResult]::Yes) { exit 0 } else { exit 1 }
-        "#;
+            exit $result
+        "###;
 
         let status = Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
             .arg("-Command")
             .arg(ps_script)
-            .env("HOOK_GUI_TITLE", title)
-            .env("HOOK_GUI_BODY", body)
-            .env("HOOK_GUI_TIMEOUT", timeout_sec.to_string())
+            .env("AI_HOOK_DLG_TITLE", title)
+            .env("AI_HOOK_DLG_REASON", reason)
+            .env("AI_HOOK_DLG_CMD", command)
+            .env("AI_HOOK_DLG_AGENT", agent)
+            .env("AI_HOOK_DLG_TIMEOUT", timeout_sec.to_string())
             .status();
 
         match status {
