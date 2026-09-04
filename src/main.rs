@@ -298,6 +298,77 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf
     println!("============================================================");
 }
 
+/// Checks whether a directory is writable by attempting a quick probe file
+fn is_dir_writable(dir: &std::path::Path) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    let test_file = dir.join(format!(".ai_hook_perm_test_{}", std::process::id()));
+    if std::fs::write(&test_file, b"").is_ok() {
+        let _ = std::fs::remove_file(&test_file);
+        true
+    } else {
+        false
+    }
+}
+
+/// Automatically detects an existing directory already in PATH to avoid adding any new environment variables.
+fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(explicit) = target_dir {
+        return explicit;
+    }
+
+    let existing_paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+
+    // 1. Windows: Use official default app alias path which is already in user PATH by default
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = dirs::data_local_dir() {
+            let win_apps = local_app_data.join("Microsoft").join("WindowsApps");
+            if win_apps.exists() && is_dir_writable(&win_apps) {
+                let norm_target = win_apps.to_string_lossy().trim_end_matches('\\').to_lowercase();
+                let in_path = existing_paths.iter().any(|p| {
+                    p.to_string_lossy().trim_end_matches('\\').to_lowercase() == norm_target
+                });
+                if in_path {
+                    return win_apps;
+                }
+            }
+        }
+    }
+
+    // 2. Linux / macOS: Prefer standard system-wide /usr/local/bin if writable
+    #[cfg(not(windows))]
+    {
+        let usr_local_bin = PathBuf::from("/usr/local/bin");
+        if existing_paths.contains(&usr_local_bin) && is_dir_writable(&usr_local_bin) {
+            return usr_local_bin;
+        }
+    }
+
+    // 3. Search existing PATH entries for a directory under home with write permission
+    if let Some(home) = dirs::home_dir() {
+        for path in &existing_paths {
+            if path.starts_with(&home) && path.exists() && is_dir_writable(path) {
+                return path.clone();
+            }
+        }
+    }
+
+    // 4. Fallback default
+    if let Some(home) = dirs::home_dir() {
+        if cfg!(windows) {
+            home.join("bin")
+        } else {
+            home.join(".local").join("bin")
+        }
+    } else {
+        PathBuf::from("/usr/local/bin")
+    }
+}
+
 fn handle_install(target_dir: Option<PathBuf>) {
     let current_exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -307,21 +378,7 @@ fn handle_install(target_dir: Option<PathBuf>) {
         }
     };
 
-    let dest_dir = target_dir.unwrap_or_else(|| {
-        if let Some(home) = dirs::home_dir() {
-            let user_bin = home.join("bin");
-            if user_bin.exists() {
-                return user_bin;
-            }
-            let local_bin = home.join(".local").join("bin");
-            if local_bin.exists() {
-                return local_bin;
-            }
-            user_bin
-        } else {
-            PathBuf::from("/usr/local/bin")
-        }
-    });
+    let dest_dir = resolve_global_install_dir(target_dir);
 
     if !dest_dir.exists() {
         let _ = std::fs::create_dir_all(&dest_dir);
@@ -356,66 +413,23 @@ fn handle_install(target_dir: Option<PathBuf>) {
     }
     println!();
 
-    #[cfg(windows)]
-    {
-        let norm_dir = dest_dir.to_string_lossy().trim_end_matches('\\').to_lowercase();
-        let in_path = std::env::var_os("PATH")
-            .map(|paths| {
-                std::env::split_paths(&paths).any(|p| {
-                    p.to_string_lossy().trim_end_matches('\\').to_lowercase() == norm_dir
-                })
+    // Check if the destination is already in PATH (no environment variables modified)
+    let in_path = std::env::var_os("PATH")
+        .map(|paths| {
+            let norm_dest = dest_dir.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+            std::env::split_paths(&paths).any(|p| {
+                p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase() == norm_dest
             })
-            .unwrap_or(false);
+        })
+        .unwrap_or(false);
 
-        if in_path {
-            println!("✓ Global command ready! '{}' is already in your PATH.", dest_dir.display());
-            println!("  You can run 'ai-hook --version' directly from any terminal.");
-        } else {
-            let script = format!(
-                "$current = [Environment]::GetEnvironmentVariable('Path', 'User'); \
-                 $target = '{}'; \
-                 $normTarget = $target.TrimEnd('\\').ToLower(); \
-                 $exists = ($current -split ';') | Where-Object {{ $_.TrimEnd('\\').ToLower() -eq $normTarget }}; \
-                 if (-not $exists) {{ \
-                     $newPath = if ([string]::IsNullOrEmpty($current)) {{ $target }} else {{ $current.TrimEnd(';') + ';' + $target }}; \
-                     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User'); \
-                     Write-Output 'ADDED'; \
-                 }} else {{ \
-                     Write-Output 'EXISTS'; \
-                 }}",
-                dest_dir.display()
-            );
-
-            let output = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &script])
-                .output();
-
-            let added = output
-                .as_ref()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("ADDED"))
-                .unwrap_or(false);
-
-            if added {
-                println!("✓ Successfully configured Windows User PATH to include '{}'!", dest_dir.display());
-                println!("  • To use 'ai-hook' immediately in this PowerShell session, run:");
-                println!("      $env:Path += \";{}\"", dest_dir.display());
-                println!("  • All newly opened terminals will recognize 'ai-hook' globally.");
-            } else {
-                println!("✓ Global command configured! '{}' is in your User PATH registry.", dest_dir.display());
-                println!("  • To use 'ai-hook' immediately in this PowerShell session, run:");
-                println!("      $env:Path += \";{}\"", dest_dir.display());
-                println!("  • Or simply open a new terminal window.");
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        println!("Quick Setup Recommendations:");
-        println!("  1. Ensure '{}' is in your PATH environment variable (e.g. in ~/.zshrc or ~/.bashrc).", dest_dir.display());
-        println!("  2. Add optional alias to ~/.zshrc or ~/.bashrc:");
-        println!("     alias ai:hook=\"ai-hook\"");
-        println!("  3. Verify by running:");
-        println!("     ai-hook --version");
+    if in_path {
+        println!("✓ Global command ready!");
+        println!("  '{}' is already in your PATH.", dest_dir.display());
+        println!("  Zero extra environment variables added. You can run 'ai-hook' directly from any terminal.");
+    } else {
+        println!("ℹ️  Notice: '{}' is not currently present in your PATH.", dest_dir.display());
+        println!("   To use without modifying PATH, you can run by absolute path:");
+        println!("     {}", dest_file.display());
     }
 }

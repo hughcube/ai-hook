@@ -102,9 +102,8 @@
 从 [GitHub Releases](https://github.com/hughcube/ai-hook/releases) 直接下载对应系统的独立可执行文件（开箱即用，无需解压）：
 
 ```bash
-# Windows (PowerShell): 直接下载并存入用户 bin
-New-Item -ItemType Directory -Force -Path "$HOME\bin"
-Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$HOME\bin\ai-hook.exe"
+# Windows (PowerShell): 下载至原生应用路径（无需解压，零环境变量修改，全终端立即全局可用）
+Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\ai-hook.exe"
 
 # Linux: 直接下载到系统全局路径
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64

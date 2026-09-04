@@ -102,9 +102,8 @@ In multi-agent collaborative development ecosystems, preventing destructive oper
 Download standalone precompiled executables directly from [GitHub Releases](https://github.com/hughcube/ai-hook/releases) (ready to run, no extraction needed):
 
 ```bash
-# Windows (PowerShell): Download directly into user bin directory
-New-Item -ItemType Directory -Force -Path "$HOME\bin"
-Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$HOME\bin\ai-hook.exe"
+# Windows (PowerShell): Download directly into official native app directory (Zero PATH setup needed)
+Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\ai-hook.exe"
 
 # Linux: Download directly to system bin path
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
