@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod paths;
 pub mod engine;
 pub mod fast_path;
 pub mod i18n;

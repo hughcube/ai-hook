@@ -686,7 +686,7 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
     //    writable.
     #[cfg(windows)]
     {
-        if let Some(local_app_data) = dirs::data_local_dir() {
+        if let Some(local_app_data) = ai_hook::paths::data_local_dir() {
             let win_apps = local_app_data.join("Microsoft").join("WindowsApps");
             if win_apps.exists() && is_dir_writable(&win_apps) {
                 let norm_target = win_apps
@@ -705,7 +705,7 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
 
     // 4. Fallback default: ~/.local/bin (Unix convention, also honored on
     //    Windows since 2026-09-05 — mirrors what automatic placement picks)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = ai_hook::paths::home_dir() {
         home.join(".local").join("bin")
     } else {
         PathBuf::from("/usr/local/bin")

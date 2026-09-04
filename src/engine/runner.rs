@@ -87,7 +87,7 @@ fn resolve_log_path(agent: &str) -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(custom));
         }
     }
-    let home = dirs::home_dir()?;
+    let home = crate::paths::home_dir()?;
     Some(home.join(".ai-hook").join("logs").join(format!(
         "ai-hook-{}-{}.log",
         agent,
@@ -201,7 +201,7 @@ pub fn log_inbound_payload(raw: &str) {
     let cut = raw.floor_char_boundary(MAX_RAW_BYTES);
     let stored = if truncated { &raw[..cut] } else { raw };
 
-    let Some(home) = dirs::home_dir() else { return };
+    let Some(home) = crate::paths::home_dir() else { return };
     let path = home.join(".ai-hook").join("logs").join(format!(
         "ai-hook-inbound-{}.log",
         utc_date_ymd()
