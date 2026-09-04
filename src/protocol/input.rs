@@ -87,6 +87,10 @@ pub struct HookContext {
     pub file: Option<FileContext>,
     /// Tool arguments exactly as the host provided them.
     pub tool_args: serde_json::Value,
+    /// Lifecycle event name (e.g. "PreToolUse", "PostToolUse", "UserPromptSubmit").
+    pub event: Option<String>,
+    /// User prompt verbatim — only for prompt-oriented events (e.g. UserPromptSubmit).
+    pub prompt: Option<String>,
     /// Raw payload as text and as parsed JSON (always available).
     pub raw_input: String,
     pub raw_value: serde_json::Value,
@@ -239,12 +243,17 @@ impl HookContext {
                     cmd: None,
                     file: None,
                     tool_args: serde_json::Value::Null,
+                    event: None,
+                    prompt: None,
                     raw_input: raw_json.to_string(),
                     raw_value: serde_json::Value::Null,
                     parse_failed: true,
                 };
             }
         };
+
+        let event = get_str(&val, &["hook_event_name", "hookEventName", "event"]).map(str::to_string);
+        let prompt = get_str(&val, &["prompt", "user_prompt", "userPrompt"]).map(str::to_string);
 
         // ---- 1. Google Antigravity: `toolCall` envelope ----
         if val.get("toolCall").is_some() {
@@ -273,11 +282,6 @@ impl HookContext {
             return Self {
                 platform: Platform::Antigravity,
                 permission_mode: None,
-                // Prefer the documented AGY env switch, but also honor a
-                // permission mode carried in the payload: relying on the env
-                // var alone silently reports "not YOLO" when the host does not
-                // export it into the hook process, which would emit `force_ask`
-                // to a host that never asks.
                 is_yolo: env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS")
                     || get_str(&val, &["permissionMode", "permission_mode"])
                         .map(permission_mode_is_yolo)
@@ -292,6 +296,8 @@ impl HookContext {
                 cmd,
                 file,
                 tool_args,
+                event: event.or_else(|| Some("PreToolUse".to_string())),
+                prompt,
                 raw_input: raw_json.to_string(),
                 raw_value: val,
                 parse_failed: false,
@@ -328,15 +334,12 @@ impl HookContext {
                     Some(conversation)
                 };
 
-            // Host identity fields sit near the start of the payload; cap the
-            // scan so a multi-megabyte transcript cannot slow every hook call.
             let scan_end = raw_json.floor_char_boundary(raw_json.len().min(64 * 1024));
             let is_codebuddy = std::env::var("CODEBUDDY").is_ok()
                 || std::env::var("CODEBUDDY_CLI").is_ok()
                 || contains_ascii_ignore_case(&raw_json[..scan_end], "codebuddy");
 
             let platform = if val.get("turn_id").is_some() {
-                // `turn_id` is documented as Codex-only.
                 Platform::Codex
             } else if is_codebuddy {
                 Platform::CodeBuddy
@@ -357,13 +360,61 @@ impl HookContext {
                 cmd,
                 file,
                 tool_args,
+                event: event.or_else(|| Some("PreToolUse".to_string())),
+                prompt,
                 raw_input: raw_json.to_string(),
                 raw_value: val,
                 parse_failed: false,
             };
         }
 
-        // ---- 3. Unknown shape: keep raw, expose nothing normalized ----
+        // ---- 3. UserPromptSubmit envelope ----
+        if prompt.is_some() || event.as_deref() == Some("UserPromptSubmit") {
+            let scan_end = raw_json.floor_char_boundary(raw_json.len().min(64 * 1024));
+            let is_codebuddy = std::env::var("CODEBUDDY").is_ok()
+                || std::env::var("CODEBUDDY_CLI").is_ok()
+                || contains_ascii_ignore_case(&raw_json[..scan_end], "codebuddy");
+            let platform = if val.get("turn_id").is_some() {
+                Platform::Codex
+            } else if is_codebuddy {
+                Platform::CodeBuddy
+            } else {
+                Platform::ClaudeCode
+            };
+
+            let conversation = ConversationInfo {
+                id: get_str(&val, &["session_id"]).map(str::to_string),
+                transcript_path: get_str(&val, &["transcript_path"]).map(str::to_string),
+            };
+            let conversation =
+                if conversation.id.is_none() && conversation.transcript_path.is_none() {
+                    None
+                } else {
+                    Some(conversation)
+                };
+
+            return Self {
+                platform,
+                permission_mode: get_str(&val, &["permission_mode"]).map(str::to_string),
+                is_yolo: false,
+                conversation,
+                cwd: get_str(&val, &["cwd"])
+                    .map(str::to_string)
+                    .unwrap_or_else(current_dir_string),
+                model: get_str(&val, &["model"]).map(str::to_string),
+                tool_name: String::new(),
+                cmd: None,
+                file: None,
+                tool_args: serde_json::Value::Null,
+                event: Some(event.unwrap_or_else(|| "UserPromptSubmit".to_string())),
+                prompt,
+                raw_input: raw_json.to_string(),
+                raw_value: val,
+                parse_failed: false,
+            };
+        }
+
+        // ---- 4. Unknown shape: keep raw, expose nothing normalized ----
         Self {
             platform: Platform::Generic,
             permission_mode: None,
@@ -377,6 +428,8 @@ impl HookContext {
             cmd: None,
             file: None,
             tool_args: serde_json::Value::Null,
+            event,
+            prompt,
             raw_input: raw_json.to_string(),
             raw_value: val,
             parse_failed: false,

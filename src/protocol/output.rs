@@ -15,6 +15,12 @@ pub enum HookDecision {
     Deny {
         reason: String,
     },
+    Block {
+        reason: String,
+    },
+    PostContext {
+        additional_context: String,
+    },
 }
 
 /// The offending command (or file when no command) of the current context.
@@ -34,6 +40,30 @@ fn ctx_target(ctx: &HookContext) -> &str {
 /// verbatim — it is authored by the rule writer in their own language).
 impl HookDecision {
     pub fn to_json_output(&self, ctx: &HookContext, gui_approved: Option<bool>) -> String {
+        match self {
+            HookDecision::Block { reason } => {
+                return json!({
+                    "decision": "block",
+                    "reason": reason
+                })
+                .to_string();
+            }
+            HookDecision::PostContext { additional_context } => {
+                let event_name = match ctx.event.as_deref() {
+                    Some("UserPromptSubmit") => "UserPromptSubmit",
+                    _ => "PostToolUse",
+                };
+                return json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": additional_context
+                    }
+                })
+                .to_string();
+            }
+            _ => {}
+        }
+
         let target = ctx_target(ctx);
         let denied_label = t(Msg::M005);
         let command_label = t(Msg::M006);
@@ -84,6 +114,7 @@ impl HookDecision {
                     })
                     .to_string()
                 }
+                HookDecision::Block { .. } | HookDecision::PostContext { .. } => unreachable!(),
             },
             Platform::Codex => match self {
                 HookDecision::Allow => json!({
@@ -159,6 +190,7 @@ impl HookDecision {
                     })
                     .to_string()
                 }
+                HookDecision::Block { .. } | HookDecision::PostContext { .. } => unreachable!(),
             },
             Platform::ClaudeCode | Platform::CodeBuddy | Platform::Generic => match self {
                 HookDecision::Allow => String::new(),
@@ -203,6 +235,7 @@ impl HookDecision {
                     })
                     .to_string()
                 }
+                HookDecision::Block { .. } | HookDecision::PostContext { .. } => unreachable!(),
             },
         }
     }

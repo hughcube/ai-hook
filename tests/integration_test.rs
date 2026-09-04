@@ -1169,3 +1169,104 @@ fn test_claude_confirm_ask_vs_dialog_denied() {
         "CC 弹窗被拒应输出 deny: {denied_out}"
     );
 }
+
+#[test]
+fn test_sys_exec_api() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let exec_rule = rule(
+        "test-exec",
+        r#"export default function(ctx, sys) {
+            if (typeof sys.exec !== 'function') {
+                return { action: "deny", reason: "sys.exec missing" };
+            }
+            let res = sys.exec("cmd", ["/c", "echo ai-hook-exec-ok"]);
+            if (res.status !== 0 || !res.stdout.includes("ai-hook-exec-ok")) {
+                return { action: "deny", reason: "sys.exec failed: " + JSON.stringify(res) };
+            }
+            return null;
+        }"#,
+    );
+    let ctx = ctx_for("test");
+    let (dec, _) = runner.evaluate_all(&[exec_rule], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(dec, HookDecision::Allow);
+}
+
+#[test]
+fn test_sys_http_api_exposed() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let http_rule = rule(
+        "test-http",
+        r#"export default function(ctx, sys) {
+            if (typeof sys.http !== 'object' || typeof sys.http.get !== 'function' || typeof sys.http.post !== 'function') {
+                return { action: "deny", reason: "sys.http missing" };
+            }
+            return null;
+        }"#,
+    );
+    let ctx = ctx_for("test");
+    let (dec, _) = runner.evaluate_all(&[http_rule], &ctx, ErrorPolicy::FailClosed);
+    assert_eq!(dec, HookDecision::Allow);
+}
+
+#[test]
+fn test_user_prompt_submit_intercept_block() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let prompt_rule = rule(
+        "intercept-prompt",
+        r#"export default function(ctx, sys) {
+            if (ctx.prompt && ctx.prompt.startsWith("/ai:balance")) {
+                return { action: "block", reason: "余额为 100 元" };
+            }
+            return null;
+        }"#,
+    );
+    let raw_payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "/ai:balance",
+        "cwd": "C:\\"
+    }).to_string();
+    let ctx = HookContext::parse(&raw_payload);
+    assert_eq!(ctx.prompt.as_deref(), Some("/ai:balance"));
+    assert_eq!(ctx.event.as_deref(), Some("UserPromptSubmit"));
+
+    let (dec, _) = runner.evaluate_all(&[prompt_rule], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::Block { ref reason } if reason == "余额为 100 元"));
+
+    let out = dec.to_json_output(&ctx, None);
+    assert_eq!(out, serde_json::json!({
+        "decision": "block",
+        "reason": "余额为 100 元"
+    }).to_string());
+}
+
+#[test]
+fn test_post_tool_use_additional_context() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let post_rule = rule(
+        "post-migration",
+        r#"export default function(ctx, sys) {
+            return {
+                additionalContext: "请注意迁移规范"
+            };
+        }"#,
+    );
+    let raw_payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "edit_file",
+        "cwd": "C:\\"
+    }).to_string();
+    let ctx = HookContext::parse(&raw_payload);
+    assert_eq!(ctx.event.as_deref(), Some("PostToolUse"));
+
+    let (dec, _) = runner.evaluate_all(&[post_rule], &ctx, ErrorPolicy::FailClosed);
+    assert!(matches!(dec, HookDecision::PostContext { ref additional_context } if additional_context == "请注意迁移规范"));
+
+    let out = dec.to_json_output(&ctx, None);
+    assert_eq!(out, serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "请注意迁移规范"
+        }
+    }).to_string());
+}
+

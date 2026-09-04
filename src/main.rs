@@ -430,6 +430,12 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
             Some(HookDecision::Deny { ref reason }) => {
                 format!("{} ({})", t(Msg::M076), reason)
             }
+            Some(HookDecision::Block { ref reason }) => {
+                format!("BLOCK ({})", reason)
+            }
+            Some(HookDecision::PostContext { ref additional_context }) => {
+                format!("POST_CONTEXT ({})", additional_context)
+            }
             Some(HookDecision::Allow) => t(Msg::M077).to_string(),
             None => t(Msg::M078).to_string(),
         };

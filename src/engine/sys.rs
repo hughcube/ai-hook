@@ -207,5 +207,229 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     git_obj.set("status", status_fn)?;
     sys.set("git", git_obj)?;
 
+    // 5. sys.exec(cmd, args?, options?): Execute external command or script
+    let sys_for_exec = sys_ctx.clone();
+    let exec_fn = Function::new(
+        js_ctx.clone(),
+        move |ctx: Ctx<'js>,
+              cmd: String,
+              args: rquickjs::function::Opt<Vec<String>>,
+              options: rquickjs::function::Opt<Object<'js>>|
+              -> Result<Object<'js>> {
+            let exec_cmd = if cfg!(windows) && cmd.eq_ignore_ascii_case("bash") {
+                resolve_windows_bash(&cmd)
+            } else {
+                cmd
+            };
+            let mut cmd_obj = std::process::Command::new(&exec_cmd);
+            if let Some(a) = args.0 {
+                cmd_obj.args(a);
+            }
+            let mut opt_input = None;
+            if let Some(opt) = options.0 {
+                if let Ok(cwd_val) = opt.get::<_, String>("cwd") {
+                    cmd_obj.current_dir(sys_for_exec.resolve_path(&cwd_val));
+                } else {
+                    cmd_obj.current_dir(&sys_for_exec.cwd);
+                }
+                if let Ok(env_obj) = opt.get::<_, Object<'js>>("env") {
+                    for key in env_obj.keys::<String>() {
+                        if let Ok(k) = key {
+                            if let Ok(v) = env_obj.get::<_, String>(&k) {
+                                cmd_obj.env(k, v);
+                            }
+                        }
+                    }
+                }
+                if let Ok(inp) = opt.get::<_, String>("input") {
+                    opt_input = Some(inp);
+                }
+            } else {
+                cmd_obj.current_dir(&sys_for_exec.cwd);
+            }
+
+            cmd_obj.stdout(std::process::Stdio::piped());
+            cmd_obj.stderr(std::process::Stdio::piped());
+            if opt_input.is_some() {
+                cmd_obj.stdin(std::process::Stdio::piped());
+            } else {
+                cmd_obj.stdin(std::process::Stdio::null());
+            }
+
+            let result_obj = Object::new(ctx)?;
+            match cmd_obj.spawn() {
+                Ok(mut child) => {
+                    if let Some(input_str) = opt_input {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            use std::io::Write;
+                            let _ = stdin.write_all(input_str.as_bytes());
+                        }
+                    }
+                    match child.wait_with_output() {
+                        Ok(output) => {
+                            let code = output.status.code().unwrap_or(-1);
+                            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                            result_obj.set("code", code)?;
+                            result_obj.set("status", code)?;
+                            result_obj.set("exitCode", code)?;
+                            result_obj.set("stdout", stdout)?;
+                            result_obj.set("stderr", stderr)?;
+                            result_obj.set("success", output.status.success())?;
+                        }
+                        Err(e) => {
+                            result_obj.set("code", -1)?;
+                            result_obj.set("status", -1)?;
+                            result_obj.set("exitCode", -1)?;
+                            result_obj.set("stdout", "")?;
+                            result_obj.set("stderr", format!("wait failed: {}", e))?;
+                            result_obj.set("success", false)?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    result_obj.set("code", -1)?;
+                    result_obj.set("status", -1)?;
+                    result_obj.set("exitCode", -1)?;
+                    result_obj.set("stdout", "")?;
+                    result_obj.set("stderr", format!("spawn failed: {}", e))?;
+                    result_obj.set("success", false)?;
+                }
+            }
+            Ok(result_obj)
+        },
+    )?;
+    sys.set("exec", exec_fn)?;
+
+    // 6. sys.http: Light HTTP client
+    let http_obj = Object::new(js_ctx.clone())?;
+
+    fn execute_http_request<'js>(
+        ctx: Ctx<'js>,
+        method: &str,
+        url: String,
+        options: rquickjs::function::Opt<Object<'js>>,
+    ) -> Result<Object<'js>> {
+        let mut timeout_ms = 10000u64;
+        let mut headers = HashMap::new();
+        let mut body_str = None;
+
+        if let Some(opt) = options.0 {
+            if let Ok(t) = opt.get::<_, u64>("timeout") {
+                timeout_ms = t;
+            }
+            if let Ok(b) = opt.get::<_, String>("body") {
+                body_str = Some(b);
+            }
+            if let Ok(hdr_obj) = opt.get::<_, Object<'js>>("headers") {
+                for key in hdr_obj.keys::<String>() {
+                    if let Ok(k) = key {
+                        if let Ok(v) = hdr_obj.get::<_, String>(&k) {
+                            headers.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+
+        let agent = ureq::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build();
+
+        let mut req = agent.request(method, &url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+
+        let res_obj = Object::new(ctx.clone())?;
+        let resp_result = if let Some(body) = body_str {
+            req.send_string(&body)
+        } else {
+            req.call()
+        };
+
+        match resp_result {
+            Ok(response) => {
+                let status = response.status();
+                let headers_obj = Object::new(ctx)?;
+                for name in response.headers_names() {
+                    if let Some(val) = response.header(&name) {
+                        headers_obj.set(name, val)?;
+                    }
+                }
+                let body = response.into_string().unwrap_or_default();
+                res_obj.set("status", status)?;
+                res_obj.set("ok", status >= 200 && status < 300)?;
+                res_obj.set("headers", headers_obj)?;
+                res_obj.set("body", body)?;
+            }
+            Err(ureq::Error::Status(status, response)) => {
+                let headers_obj = Object::new(ctx)?;
+                for name in response.headers_names() {
+                    if let Some(val) = response.header(&name) {
+                        headers_obj.set(name, val)?;
+                    }
+                }
+                let body = response.into_string().unwrap_or_default();
+                res_obj.set("status", status)?;
+                res_obj.set("ok", false)?;
+                res_obj.set("headers", headers_obj)?;
+                res_obj.set("body", body)?;
+            }
+            Err(ureq::Error::Transport(transport_err)) => {
+                res_obj.set("status", 0)?;
+                res_obj.set("ok", false)?;
+                res_obj.set("headers", Object::new(ctx)?)?;
+                res_obj.set("body", format!("{}", transport_err))?;
+            }
+        }
+        Ok(res_obj)
+    }
+
+    let get_fn = Function::new(
+        js_ctx.clone(),
+        |ctx: Ctx<'js>, url: String, options: rquickjs::function::Opt<Object<'js>>| -> Result<Object<'js>> {
+            execute_http_request(ctx, "GET", url, options)
+        },
+    )?;
+    http_obj.set("get", get_fn)?;
+
+    let post_fn = Function::new(
+        js_ctx.clone(),
+        |ctx: Ctx<'js>, url: String, options: rquickjs::function::Opt<Object<'js>>| -> Result<Object<'js>> {
+            execute_http_request(ctx, "POST", url, options)
+        },
+    )?;
+    http_obj.set("post", post_fn)?;
+
+    sys.set("http", http_obj)?;
+
     Ok(sys)
 }
+
+#[cfg(windows)]
+fn resolve_windows_bash(fallback: &str) -> String {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let dir_str = dir.to_string_lossy();
+            if dir_str.to_ascii_lowercase().contains("system32") {
+                continue;
+            }
+            let candidate = dir.join("bash.exe");
+            if candidate.is_file() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    let default_git_bash = std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe");
+    if default_git_bash.is_file() {
+        return default_git_bash.to_string_lossy().to_string();
+    }
+    fallback.to_string()
+}
+
+#[cfg(not(windows))]
+fn resolve_windows_bash(fallback: &str) -> String {
+    fallback.to_string()
+}
+

@@ -311,6 +311,8 @@ impl RuleRunner {
                     "action": f.action.as_str(),
                 })),
                 "args": ctx.tool_args,
+                "event": ctx.event,
+                "prompt": ctx.prompt,
                 "raw": ctx.raw_value,
                 "rawInput": ctx.raw_input,
             });
@@ -367,6 +369,17 @@ impl RuleRunner {
                 )?;
                 sys_obj.set("log", sys_log_fn)?;
             }
+
+            let rule_dir = rule
+                .path
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let rule_path_str = rule.path.to_string_lossy().to_string();
+            sys_obj.set("rulePath", rule_path_str.clone())?;
+            sys_obj.set("ruleDir", rule_dir.clone())?;
+            sys_obj.set("__filename", rule_path_str)?;
+            sys_obj.set("__dirname", rule_dir)?;
 
             // 3. Prepare rule code: rewrite the top-level `export default`
             //    into a `return` statement (comments/strings are respected).
@@ -453,13 +466,36 @@ impl RuleRunner {
                                 force_gui: Some(true),
                             });
                         }
-                        "deny" | "block" | "reject" => {
+                        "block" => {
+                            decision = Some(HookDecision::Block { reason });
+                        }
+                        "deny" | "reject" => {
                             decision = Some(HookDecision::Deny { reason });
                         }
                         "allow" | "pass" => {
                             decision = Some(HookDecision::Allow);
                         }
                         _ => {}
+                    }
+                }
+
+                if decision.is_none() {
+                    if let Ok(ctx_text) = obj
+                        .get::<_, String>("additionalContext")
+                        .or_else(|_| obj.get::<_, String>("additional_context"))
+                    {
+                        decision = Some(HookDecision::PostContext {
+                            additional_context: ctx_text,
+                        });
+                    } else if let Ok(hook_output) = obj.get::<_, Object>("hookSpecificOutput") {
+                        if let Ok(ctx_text) = hook_output
+                            .get::<_, String>("additionalContext")
+                            .or_else(|_| hook_output.get::<_, String>("additional_context"))
+                        {
+                            decision = Some(HookDecision::PostContext {
+                                additional_context: ctx_text,
+                            });
+                        }
                     }
                 }
             } else if let Some(b) = raw_val.as_bool()
@@ -543,7 +579,10 @@ impl RuleRunner {
 
             if let Some(dec) = hit {
                 match dec {
-                    HookDecision::Confirm { .. } | HookDecision::Deny { .. } => {
+                    HookDecision::Confirm { .. }
+                    | HookDecision::Deny { .. }
+                    | HookDecision::Block { .. }
+                    | HookDecision::PostContext { .. } => {
                         return (dec, results);
                     }
                     HookDecision::Allow => {}
