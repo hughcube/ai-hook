@@ -310,6 +310,8 @@ pub enum Msg {
     M147,
     /// Payload is not valid JSON: ask the operator instead of guessing.
     M148,
+    /// Host cannot ask and no GUI dialog is available/allowed: auto-denied.
+    M149,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -368,9 +370,9 @@ impl Msg {
                 }
             },
             Msg::M009 => match l {
-                Lang::Zh => "【硬阻断】用户拒绝或 Codex PreToolUse 不支持交互式确认。命令:",
+                Lang::Zh => "【硬阻断】未获得授权或当前宿主不支持终端交互确认。命令:",
                 Lang::En => {
-                    "[Hard block] Rejected by the user, or Codex PreToolUse does not support interactive confirmation."
+                    "[Hard block] Not authorized, or the current host does not support interactive confirmation."
                 }
             },
             Msg::M010 => match l {
@@ -1013,6 +1015,12 @@ impl Msg {
                 }
                 Lang::En => {
                     "[ai-hook] The host payload is not valid JSON, so its tool-call intent cannot be determined. Please decide manually whether to continue; if unexpected, check the host's hook configuration and data flow."
+                }
+            },
+            Msg::M149 => match l {
+                Lang::Zh => "当前宿主不支持终端交互 ask,且 GUI 弹窗不可用或已被规则禁用(gui: false),操作已自动拒绝。如需执行请由你本人在终端手动运行",
+                Lang::En => {
+                    "The host does not support terminal ask, and no GUI dialog is available or the rule disables it (gui: false); the operation was auto-denied. Run it manually if intended"
                 }
             },
             Msg::AllowWord => match l {

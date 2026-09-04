@@ -105,27 +105,36 @@ fn chinese_tutorial_body() -> String {
   return { action: "allow" };     → 明确放行,继续下一规则
   return { action: "deny",  reason: "…" };   → 硬拒绝,绝对不弹窗
   return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
-      · gui: true(默认)→ 桌面置顶弹窗(Enter 允许 / Esc 拒绝 / 倒计时超时
-        自动拒绝);gui: false → 交由宿主终端 ask(ask 能力见表五)
-      · timeout: 秒(默认 60,<=0 视为默认);超时一律按拒绝处理
-      · force_gui: true / action: "force_gui" → 即使宿主支持终端 ask 也强制弹窗
+      · gui 三态(2026-09-05 约定,默认不配置):
+          gui: true    → 强制桌面置顶弹窗(穿透 --no-gui,不可禁;仅 --dry-run
+                         演练不弹);与 force_gui 同级
+          不配置/缺省  → 宿主能 ask 直接走协议 ask(见表五);不能 ask 时
+                         GUI 可用则弹窗兜底,GUI 不可用则自动拒绝
+          gui: false   → 禁止弹窗:宿主能 ask 走 ask;不能 ask 直接拒绝
+                         (fail-closed)
+      · timeout: 秒(默认 60,<=0 视为默认);弹窗超时一律按拒绝处理
+      · force_gui: true / action: "force_gui" → 强制桌面弹窗(与 gui:true 同级)
   return false;                   → 拒绝(reason 自动生成)
   引擎级硬边界:规则必须为同步函数;5 秒执行看门狗;64MB 内存上限;
   不支持 async/Promise、import、require、fetch;文件必须是单文件 ES 语法。
   规则顺序:按文件名字典序执行;首个 confirm 或 deny 立即短路;
   allow/无表态不短路。目录加载顺序已保证确定性。
 
-五、宿主决策差异矩阵(输出由 ai-hook 自动映射)
+五、宿主决策差异矩阵(can_ask × 模式;输出由 ai-hook 自动映射)
 --------------------------------------------------------------------------------
-  agent 值       宿主 ask 能力        deny/allow 协议载体
-  antigravity    ✓ force_ask        顶层 {decision, reason}
-  claude_code    ✓ ask               hookSpecificOutput.permissionDecision(ask 亦可)
-  codebuddy      ✓ ask               同上(CodeBuddy 亦接受 modifiedInput)
-  codex          ✗ 无 ask(输出 deny)  hookSpecificOutput.permissionDecision
-  generic        — 尽力输出 ask        hookSpecificOutput 形态
-  因此:对 codex 的 confirm(gui:false) 会自动降级为 deny 并附原因;对
-  claude_code/codebuddy 的 confirm(gui:false) 输出 ask,由宿主弹原生确认。
-  YOLO/免确认(mode 含 bypass/dontAsk)下,凡未真正弹窗的 confirm 一律拒绝。
+  agent 值       普通模式 ask 能力    YOLO/bypass(免确认)   deny/allow 协议载体
+  claude_code    ✓ ask(终端)         ✓ ask(官方:ask 在免确认
+                                      模式仍拥有最高决策优先级)
+                                                          hookSpecificOutput.permissionDecision
+  codebuddy      ✓ ask(终端)         ✓ ask(同上)          同上
+  codex          ✓ ask(0.152+ 起)    ✗(免确认下无 ask)     hookSpecificOutput.permissionDecision
+  antigravity    ✓ force_ask         ✗(ask 被静默放行)     顶层 {decision, reason}
+  generic        ✗ 无 ask 协议       ✗                    hookSpecificOutput 形态(尽力)
+  confirm 通道选择(gui 三态 × can_ask):
+  · 缺省(不配置):can_ask 宿主直接走协议 ask;不能 ask 的宿主 GUI 可用则
+    弹窗兜底,不可用(CI/--no-gui/测试)自动拒绝;
+  · gui:true / force_gui:全宿主强制弹窗(穿透 --no-gui);
+  · gui:false:can_ask 宿主走 ask;不能 ask 宿主直接拒绝(禁弹窗 fail-closed)。
 
 六、接入最小配置
 --------------------------------------------------------------------------------
@@ -150,6 +159,9 @@ fn chinese_tutorial_body() -> String {
   --dry-run 不弹窗;--no-gui 禁用弹窗;--force-gui 强制弹窗;
   --allow-on-error 规则出错放行;--no-fast-path 关闭只读白名单旁路;
   AI_HOOK_LANG=zh|en 固定语言;
+  AI_HOOK_LOG_EXTERNAL=1|true:把每次宿主传入的原始 payload(stdin 原文,解析
+  前)记入 ~/.ai-hook/logs/ai-hook-inbound-{日期}.log(JSONL,>1MiB 截断头部,
+  20MB 轮转)——调试 payload 形状/平台判别/解析问题用;默认关闭,关闭时零 IO;
   弹窗语言/日志语言跟随系统(Windows 区域或 LANG),可被 AI_HOOK_LANG 覆盖。
   console.log 与 sys.log 永远不进入 stdout,不会破坏协议。
 
@@ -263,12 +275,17 @@ IV. Decision protocol (rule return values)
   return { action: "allow" };     → allow explicitly, keep going
   return { action: "deny", reason: "…" };  → hard block, never a popup
   return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
-      · gui: true (default) → topmost desktop dialog
-        (Enter allow / Esc deny / countdown timeout auto-denies)
-        gui: false → host terminal ask (see matrix in V)
+      · gui tri-state (2026-09-05 contract; by default NOT set):
+          gui: true    → force the topmost desktop dialog (pierces --no-gui;
+                         only --dry-run skips it); same strength as force_gui
+          unset/null   → host can ask: emit the host protocol ask (see V);
+                         host cannot ask: GUI dialog as fallback, or an
+                         auto-deny when no dialog is available
+          gui: false   → no dialog: ask when the host can ask; otherwise
+                         auto-deny (fail-closed)
       · timeout: seconds (default 60; <=0 treated as default); timeout = deny
-      · force_gui: true / action: "force_gui" → force the desktop dialog even
-        when the host supports terminal ask
+      · force_gui: true / action: "force_gui" → force the desktop dialog
+        (same strength as gui: true)
   return false;                   → deny (auto-generated reason)
   Engine hard limits: rules MUST be synchronous; 5s watchdog; 64MB heap cap;
   no async/Promise, no import/require/fetch; single-file ES syntax only.
@@ -276,18 +293,24 @@ IV. Decision protocol (rule return values)
   short-circuits; allow / no-opinion never short-circuit. Directory loading
   order is deterministic.
 
-V. Host decision matrix (output is mapped automatically)
+V. Host decision matrix (can_ask × mode; output is mapped automatically)
 --------------------------------------------------------------------------------
-  agent value    host ask support   deny/allow transport
-  antigravity    ✓ force_ask        top-level {decision, reason}
-  claude_code    ✓ ask              hookSpecificOutput.permissionDecision (ask ok)
-  codebuddy      ✓ ask              same (CodeBuddy also accepts modifiedInput)
-  codex          ✗ no ask → deny    hookSpecificOutput.permissionDecision
-  generic        — best-effort ask  hookSpecificOutput shape
-  Consequence: for codex a confirm(gui:false) degrades to deny with reason;
-  for claude_code/codebuddy it emits ask and the host shows its own prompt.
-  In YOLO / no-confirm mode (mode contains bypass or dontAsk) any confirm that
-  did not show a real dialog is DENIED.
+  agent value    normal mode ask    YOLO / no-confirm        deny/allow transport
+  claude_code    ✓ ask (terminal)   ✓ ask (official: hook ask
+                                    keeps top priority even
+                                    in no-confirm mode)
+                                                            hookSpecificOutput.permissionDecision
+  codebuddy      ✓ ask (terminal)   ✓ ask (same as CC)       same
+  codex          ✓ ask (since 0.152) ✗ (no ask in bypass)    hookSpecificOutput.permissionDecision
+  antigravity    ✓ force_ask        ✗ (ask silently allowed) top-level {decision, reason}
+  generic        ✗ no ask protocol ✗                         hookSpecificOutput shape
+  Confirm channel selection (gui tri-state × can_ask):
+  · unset: can-ask hosts get the protocol ask directly; hosts that cannot
+    ask fall back to the GUI dialog when available, or auto-deny when it is
+    not (CI / --no-gui / tests);
+  · gui:true / force_gui: force the dialog on every host (pierces --no-gui);
+  · gui:false: can-ask hosts get ask; hosts that cannot ask are denied
+    (no dialog, fail-closed).
 
 VI. Minimal integration
 --------------------------------------------------------------------------------
@@ -313,6 +336,10 @@ VII. Debug & operations
   --dry-run no dialogs; --no-gui disable dialogs; --force-gui force dialogs;
   --allow-on-error allow on rule failure; --no-fast-path disable the read-only
   whitelist bypass; AI_HOOK_LANG=zh|en pins language.
+  AI_HOOK_LOG_EXTERNAL=1|true: record every host stdin payload verbatim
+  (before parsing) to ~/.ai-hook/logs/ai-hook-inbound-{YYYYMMDD}.log as JSONL
+  (head-truncated over 1MiB, 20MB rotation) — for debugging payload shape,
+  platform detection and parse issues. Off by default; zero I/O when off.
   Dialog/log language follows the system (Windows locale or LANG), overridable
   with AI_HOOK_LANG. console.log/sys.log never touch stdout.
 

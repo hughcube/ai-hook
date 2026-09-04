@@ -3,12 +3,20 @@ use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
 use ai_hook::i18n::{Msg, t, tf};
 use ai_hook::protocol::input::env_flag_true;
-use ai_hook::protocol::{HookContext, HookDecision};
+use ai_hook::protocol::{ConfirmPath, HookContext, HookDecision, confirm_path};
 use ai_hook::ui::GuiDialog;
 use clap::FromArgMatches;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// Timestamped stderr log line: `[2026-09-05 02:46:12] message…`.
+/// All diagnostics carry a human-readable local time (2026-09-05 需求).
+macro_rules! eprint_ts {
+    ($($arg:tt)*) => {
+        eprintln!("[{}] {}", ai_hook::engine::local_now_str(), format_args!($($arg)*))
+    };
+}
 
 fn get_binary_info_help() -> String {
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ai-hook"));
@@ -51,7 +59,7 @@ fn main() {
         Some(Commands::Install { ref target_dir }) => handle_install(target_dir.clone()),
         Some(Commands::Update { force, ref repo }) => {
             if let Err(e) = ai_hook::update::handle_update(force, repo) {
-                eprintln!("[ai-hook update] {}: {}", t(Msg::M054), e);
+                eprint_ts!("[ai-hook update] {}: {}", t(Msg::M054), e);
                 std::process::exit(1);
             }
         }
@@ -135,7 +143,7 @@ fn handle_dispatch(args: &Cli) {
         // Unreadable stdin (broken pipe / invalid UTF-8) yields no reliable
         // payload. Empty output means "allow" to every host protocol, so an
         // unreadable payload must deny rather than return silently.
-        eprintln!("[ai-hook] {}: {}", t(Msg::M055), e);
+        eprint_ts!("[ai-hook] {}: {}", t(Msg::M055), e);
         let ctx = HookContext::parse("");
         let reason = t(Msg::M135).to_string();
         print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
@@ -149,6 +157,11 @@ fn handle_dispatch(args: &Cli) {
         print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
         return;
     }
+
+    // Debug aid (AI_HOOK_LOG_EXTERNAL=1): persist the raw payload BEFORE
+    // parsing so shape / platform-detection problems stay diagnosable even
+    // when parse itself fails. Never fails the hook.
+    ai_hook::engine::log_inbound_payload(&buffer);
 
     let ctx = HookContext::parse(&buffer);
 
@@ -203,7 +216,7 @@ fn handle_dispatch(args: &Cli) {
         // Rules exist but were skipped: say so, otherwise the bypass is
         // invisible and rules appear to "not work" for these commands.
         if rules_configured(&explicit_paths) {
-            eprintln!("[ai-hook] {}", t(Msg::M138));
+            eprint_ts!("[ai-hook] {}", t(Msg::M138));
         }
         print_output(&decision.to_json_output(&ctx, None));
         return;
@@ -216,7 +229,7 @@ fn handle_dispatch(args: &Cli) {
         // No gate at all. If the operator pointed at paths that loaded nothing
         // (typo, wrong extension), this is a silent full bypass - warn loudly.
         if !explicit_paths.is_empty() {
-            eprintln!("[ai-hook] {}", tf(Msg::M137, &[&explicit_paths.len()]));
+            eprint_ts!("[ai-hook] {}", tf(Msg::M137, &[&explicit_paths.len()]));
         }
         print_output(&HookDecision::Allow.to_json_output(&ctx, None));
         return;
@@ -231,7 +244,7 @@ fn handle_dispatch(args: &Cli) {
             Ok(r) => r,
             Err(e) => {
                 // Gate is broken: rules cannot run, so do NOT silently allow.
-                eprintln!("[ai-hook] {}: {}", t(Msg::M056), e);
+                eprint_ts!("[ai-hook] {}: {}", t(Msg::M056), e);
                 let reason = t(Msg::M057).to_string();
                 print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
                 return;
@@ -240,59 +253,77 @@ fn handle_dispatch(args: &Cli) {
 
         let (decision, _) = runner.evaluate_all(&rules, &ctx, policy);
 
-        // 4. Handle confirmation & GUI prompt
+        // 4. Handle confirmation & GUI prompt (gui 三态语义,2026-09-05 约定):
+        //    gui:true / force_gui → 强制弹窗(穿透 --no-gui,仅 dry-run 演练除外);
+        //    缺省(不配置)→ 宿主能 ask 走协议 ask;不能 ask 时 GUI 兜底(不可用则自动拒绝);
+        //    gui:false → 能 ask 走 ask;不能 ask 自动拒绝(规则禁弹窗 → fail-closed)。
         let mut gui_approved = None;
+        let mut auto_deny = false;
         if let HookDecision::Confirm {
-            ref reason,
-            ref title,
+            reason,
+            title,
             gui,
             timeout: rule_timeout,
             force_gui: rule_force_gui,
-        } = decision
+        } = &decision
         {
             let gui_enabled = GuiDialog::is_enabled(args.no_gui);
             // Rule-provided timeout of 0 is treated as "use the default".
             let timeout = rule_timeout
                 .filter(|t| *t > 0)
                 .unwrap_or_else(|| GuiDialog::resolve_timeout(args.timeout));
+            let forced = args.force_gui
+                || env_flag_true("AI_HOOK_FORCE_GUI")
+                || rule_force_gui.unwrap_or(false);
 
-            let force_gui_flag = args.force_gui || env_flag_true("AI_HOOK_FORCE_GUI");
-
-            let is_forced = force_gui_flag || rule_force_gui.unwrap_or(false);
-
-            let should_popup = if is_forced {
-                !args.dry_run
-            } else if let Some(rule_gui) = gui {
-                rule_gui && gui_enabled && !args.dry_run
-            } else {
-                // Default: popup if GUI is enabled and not dry-run
-                gui_enabled && !args.dry_run
-            };
-
-            if should_popup {
-                let prompt_target = ctx
-                    .cmd
-                    .as_deref()
-                    .filter(|c| !c.is_empty())
-                    .or_else(|| ctx.file.as_ref().and_then(|f| f.path.as_deref()))
-                    .unwrap_or("");
-                let prompt_title = title.as_deref().unwrap_or_else(|| t(Msg::M058));
-                let prompt_agent = ctx.platform.to_string();
-                let approved =
-                    GuiDialog::confirm(prompt_title, reason, prompt_target, &prompt_agent, timeout);
-                gui_approved = Some(approved);
-            } else if ctx.is_yolo {
-                // YOLO / bypass mode with no real dialog shown must fail
-                // closed: hosts may silently ignore an "ask" decision.
-                gui_approved = Some(false);
+            match confirm_path(*gui, forced, ctx.can_ask(), gui_enabled, args.dry_run) {
+                ConfirmPath::Popup => {
+                    let prompt_target = ctx
+                        .cmd
+                        .as_deref()
+                        .filter(|c| !c.is_empty())
+                        .or_else(|| ctx.file.as_ref().and_then(|f| f.path.as_deref()))
+                        .unwrap_or("");
+                    let prompt_title = title.as_deref().unwrap_or_else(|| t(Msg::M058));
+                    let prompt_agent = ctx.platform.to_string();
+                    let approved = GuiDialog::confirm(
+                        prompt_title,
+                        reason,
+                        prompt_target,
+                        &prompt_agent,
+                        timeout,
+                    );
+                    gui_approved = Some(approved);
+                }
+                ConfirmPath::Ask => {
+                    // 不弹窗:gui_approved 保持 None → 输出层按宿主协议输出
+                    // ask(CC/CB)、ask(Codex 0.152+ 普通)、force_ask(AGY 交互)
+                }
+                ConfirmPath::AutoDeny => auto_deny = true,
             }
         }
+
+        // Auto-deny: turn the confirm into a hard deny with an explanation —
+        // the host cannot ask and no dialog was shown, so an "ask" decision
+        // would be silently ignored or unsupported by the host protocol.
+        let decision = if auto_deny {
+            match &decision {
+                HookDecision::Confirm { reason, .. } => HookDecision::Deny {
+                    reason: format!("{}\n({})", reason, t(Msg::M149)),
+                },
+                _ => HookDecision::Deny {
+                    reason: t(Msg::M149).to_string(),
+                },
+            }
+        } else {
+            decision
+        };
 
         print_output(&decision.to_json_output(&ctx, gui_approved));
     }));
 
     if outcome.is_err() {
-        eprintln!("[ai-hook] {}", t(Msg::M059));
+        eprint_ts!("[ai-hook] {}", t(Msg::M059));
         let reason = t(Msg::M060).to_string();
         print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
     }
@@ -381,7 +412,7 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
     let runner = match RuleRunner::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{}: {}", t(Msg::M074), e);
+            eprint_ts!("{}: {}", t(Msg::M074), e);
             return;
         }
     };
@@ -462,7 +493,7 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf
     let runner = match RuleRunner::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{}: {}", t(Msg::M085), e);
+            eprint_ts!("{}: {}", t(Msg::M085), e);
             return;
         }
     };
@@ -567,7 +598,7 @@ fn handle_install(target_dir: Option<PathBuf>) {
     let current_exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("{}: {}", t(Msg::M092), e);
+            eprint_ts!("{}: {}", t(Msg::M092), e);
             return;
         }
     };
@@ -596,10 +627,10 @@ fn handle_install(target_dir: Option<PathBuf>) {
 
     if !already_there {
         if let Err(e) = std::fs::copy(&current_exe, &dest_file) {
-            eprintln!("{} {}: {}", t(Msg::M093), dest_file.display(), e);
+            eprint_ts!("{} {}: {}", t(Msg::M093), dest_file.display(), e);
             #[cfg(windows)]
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!("   {}", t(Msg::M094));
+                eprint_ts!("   {}", t(Msg::M094));
             }
             return;
         }
@@ -607,7 +638,7 @@ fn handle_install(target_dir: Option<PathBuf>) {
         let src_len = std::fs::metadata(&current_exe).map(|m| m.len()).ok();
         let dest_len = std::fs::metadata(&dest_file).map(|m| m.len()).ok();
         if src_len.is_some() && src_len != dest_len {
-            eprintln!(
+            eprint_ts!(
                 "{} {} ({}).",
                 t(Msg::M095),
                 dest_file.display(),

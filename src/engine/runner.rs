@@ -121,6 +121,12 @@ fn utc_date_ymd() -> String {
     format!("{y:04}{m:02}{d:02}")
 }
 
+/// Human-readable local time `YYYY-MM-DD HH:MM:SS` for log lines
+/// (JSONL "time" field and stderr prefixes).
+pub fn local_now_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 /// Appends one JSONL line to the rule log (opened on demand, then closed).
 /// Never fails the caller: logging must not break rule evaluation.
 fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: &str, msg: &str) {
@@ -145,11 +151,80 @@ fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: 
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
+        "time": local_now_str(),
         "agent": agent,
         "sessionId": session_id,
         "rule": rule_id,
         "level": level,
         "msg": msg,
+    })
+    .to_string();
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Append-only open: atomic for concurrent hook processes per line.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound payload log (debug aid): AI_HOOK_LOG_EXTERNAL=1|true records the
+// raw stdin payload every agent sent — captured BEFORE parsing, so payload
+// shape / platform-detection / parse bugs can be diagnosed from the exact
+// bytes the host delivered. Defaults to off; costs zero I/O when off.
+//
+// - File:    ~/.ai-hook/logs/ai-hook-inbound-{YYYYMMDD}.log
+// - Format:  JSONL: {ts, bytes, truncated, payload}
+// - Bounds:  payloads over 1 MiB store only their head (truncated: true) so
+//            a huge transcript cannot balloon the log; 20MB rotation like the
+//            rule log.
+// ---------------------------------------------------------------------------
+pub fn log_inbound_payload(raw: &str) {
+    let enabled = std::env::var("AI_HOOK_LOG_EXTERNAL")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v != "0" && v != "false" && v != "no" && v != "off"
+        })
+        .unwrap_or(false);
+    if !enabled || raw.is_empty() {
+        return;
+    }
+
+    const MAX_RAW_BYTES: usize = 1024 * 1024;
+    let truncated = raw.len() > MAX_RAW_BYTES;
+    let cut = raw.floor_char_boundary(MAX_RAW_BYTES);
+    let stored = if truncated { &raw[..cut] } else { raw };
+
+    let Some(home) = dirs::home_dir() else { return };
+    let path = home.join(".ai-hook").join("logs").join(format!(
+        "ai-hook-inbound-{}.log",
+        utc_date_ymd()
+    ));
+
+    // Rotate once if oversized (checked at open time — cheap).
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > MAX_LOG_BYTES
+        && let Some(name) = path.file_name()
+    {
+        let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
+        let _ = std::fs::rename(&path, &rotated);
+    }
+
+    let line = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        "time": local_now_str(),
+        "bytes": raw.len(),
+        "truncated": truncated,
+        "payload": stored,
     })
     .to_string();
 
@@ -250,7 +325,7 @@ impl RuleRunner {
                 js_ctx.clone(),
                 move |args: rquickjs::function::Rest<String>| {
                     let msg = args.0.join(" ");
-                    eprintln!("[rule-debug] {}", msg);
+                    eprintln!("[{}] [rule-debug] {}", local_now_str(), msg);
                     append_rule_log(
                         &agent_for_log,
                         session_for_log.as_deref(),
@@ -280,7 +355,7 @@ impl RuleRunner {
                         } else {
                             (first, parts.collect::<Vec<_>>().join(" "))
                         };
-                        eprintln!("[rule-debug][{}] {}", level, msg);
+                        eprintln!("[{}] [rule-debug][{}] {}", local_now_str(), level, msg);
                         append_rule_log(
                             &agent_for_log,
                             session_for_log.as_deref(),

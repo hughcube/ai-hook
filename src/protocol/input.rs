@@ -382,4 +382,20 @@ impl HookContext {
             parse_failed: false,
         }
     }
+
+    /// 宿主×模式是否具备「协议 ask」能力(2026-09-05 约定,与 tutorial 宿主矩阵配套):
+    /// - Claude Code / CodeBuddy:恒可——官方设计 hook 层 ask 拥有最高决策优先级,
+    ///   即使 bypass/YOLO 模式也能唤起终端交互确认;
+    /// - Codex:0.152+ 普通模式支持 PreToolUse ask;bypass(YOLO)模式不支持;
+    /// - Antigravity:普通交互模式走 force_ask;YOLO 下 ask/force_ask 被静默放行,不可;
+    /// - Generic(未知宿主):无 ask 协议,不可。
+    #[must_use]
+    pub fn can_ask(&self) -> bool {
+        match self.platform {
+            Platform::ClaudeCode | Platform::CodeBuddy => true,
+            Platform::Codex => !self.is_yolo,
+            Platform::Antigravity => !self.is_yolo,
+            Platform::Generic => false,
+        }
+    }
 }

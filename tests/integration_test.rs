@@ -1063,3 +1063,109 @@ fn test_cli_unparsable_payload_asks_not_silently_allows() {
         "unparsable payload must ask or deny: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gui 三态语义:can_ask 宿主矩阵(2026-09-05 约定)
+// ---------------------------------------------------------------------------
+#[test]
+fn test_can_ask_host_matrix() {
+    // CC:普通 + bypass(yolo)均可 ask
+    let cc = HookContext::parse(
+        &serde_json::json!({"hook_event_name":"PreToolUse","permission_mode":"default","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert!(cc.can_ask(), "CC 普通模式应可 ask");
+    let cc_yolo = HookContext::parse(
+        &serde_json::json!({"hook_event_name":"PreToolUse","permission_mode":"bypassPermissions","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert!(cc_yolo.can_ask(), "CC bypass 模式也应可 ask(hook ask 最高优先)");
+
+    // Codex:0.152+ 普通可 ask;bypass(yolo)不可
+    let codex = HookContext::parse(
+        &serde_json::json!({"turn_id":"t1","permission_mode":"never","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert!(codex.can_ask(), "Codex 普通模式应可 ask(0.152+)");
+    let codex_yolo = HookContext::parse(
+        &serde_json::json!({"turn_id":"t1","permission_mode":"bypassPermissions","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert!(!codex_yolo.can_ask(), "Codex bypass 模式不可 ask");
+
+    // AGY:普通交互 force_ask 可;YOLO 不可
+    let agy = HookContext::parse(
+        &serde_json::json!({"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}}}).to_string(),
+    );
+    assert!(agy.can_ask(), "AGY 普通交互模式可 ask(force_ask)");
+    let agy_yolo = HookContext::parse(
+        &serde_json::json!({"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}},"permission_mode":"bypassPermissions"}).to_string(),
+    );
+    assert!(!agy_yolo.can_ask(), "AGY YOLO 模式不可 ask(ask 被静默放行)");
+
+    // Generic:无 ask 协议
+    let generic = HookContext::parse("not-json");
+    assert!(!generic.can_ask(), "Generic 无 ask 协议");
+}
+
+/// Codex 普通模式输出层:Confirm + 无 GUI 结果 → permissionDecision ask(0.152+)
+#[test]
+fn test_codex_confirm_outputs_ask_when_can_ask() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({"turn_id":"t1","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"redis-cli flushall"}}).to_string(),
+    );
+    let decision = HookDecision::Confirm {
+        reason: "高危操作确认".to_string(),
+        title: None,
+        gui: None,
+        timeout: None,
+        force_gui: None,
+    };
+    let out = decision.to_json_output(&ctx, None);
+    assert!(
+        out.contains("\"permissionDecision\":\"ask\""),
+        "Codex 普通模式应输出 ask: {out}"
+    );
+    assert!(out.contains("redis-cli flushall"), "ask reason 应含完整命令: {out}");
+}
+
+/// Codex bypass(yolo)输出层:Confirm + 未弹窗(防御路径)→ deny
+#[test]
+fn test_codex_yolo_confirm_falls_back_to_deny() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({"turn_id":"t1","permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"redis-cli flushall"}}).to_string(),
+    );
+    let decision = HookDecision::Confirm {
+        reason: "高危操作确认".to_string(),
+        title: None,
+        gui: None,
+        timeout: None,
+        force_gui: None,
+    };
+    let out = decision.to_json_output(&ctx, None);
+    assert!(
+        out.contains("\"permissionDecision\":\"deny\""),
+        "Codex bypass 未弹窗时必须 deny: {out}"
+    );
+}
+
+/// gui 三态输出层:CC 缺省 → ask;gui_approved Some(false) → deny(弹窗拒绝)
+#[test]
+fn test_claude_confirm_ask_vs_dialog_denied() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({"hook_event_name":"PreToolUse","permission_mode":"default","tool_input":{"command":"ls"}}).to_string(),
+    );
+    let decision = HookDecision::Confirm {
+        reason: "确认删除".to_string(),
+        title: None,
+        gui: None,
+        timeout: None,
+        force_gui: None,
+    };
+    let ask_out = decision.to_json_output(&ctx, None);
+    assert!(
+        ask_out.contains("\"permissionDecision\":\"ask\""),
+        "CC 缺省应输出 ask: {ask_out}"
+    );
+    let denied_out = decision.to_json_output(&ctx, Some(false));
+    assert!(
+        denied_out.contains("\"permissionDecision\":\"deny\""),
+        "CC 弹窗被拒应输出 deny: {denied_out}"
+    );
+}

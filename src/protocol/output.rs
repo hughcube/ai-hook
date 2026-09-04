@@ -102,10 +102,24 @@ impl HookDecision {
                             }
                         })
                         .to_string()
-                    } else {
+                    } else if gui_approved == Some(false) {
+                        let deny_reason = format!(
+                            "{}\n{}\n{}: {}",
+                            denied_label, reason, command_label, target
+                        );
+                        json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": deny_reason
+                            }
+                        })
+                        .to_string()
+                    } else if ctx.is_yolo {
+                        // 防御:yolo 且未弹窗(正常流程 yolo 无 ask → 已弹窗或自动拒绝)
                         let manual_reason = format!(
                             "{}\n{}: {}\n{}: {}",
-                            t(Msg::M009),
+                            t(Msg::M008),
                             command_label,
                             target,
                             t(Msg::M010),
@@ -116,6 +130,19 @@ impl HookDecision {
                                 "hookEventName": "PreToolUse",
                                 "permissionDecision": "deny",
                                 "permissionDecisionReason": manual_reason
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        // Codex 0.152+:普通(非 yolo)模式支持 PreToolUse ask
+                        //(2026-09-05 用户实测口径;旧版 0.151 曾 unsupported,
+                        //  由 main 层 can_ask=false 降级弹窗/拒绝兜底)
+                        let ask_msg = format!("{}\n{}:\n{}", reason, about_to_run, target);
+                        json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "ask",
+                                "permissionDecisionReason": ask_msg
                             }
                         })
                         .to_string()
