@@ -22,6 +22,13 @@ flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
+
+[features]
+# rquickjs ships pre-generated bindings for most targets but NOT for
+# i686-pc-windows-msvc; the Windows-32-bit release build enables bindgen
+# (requires clang/libclang on the runner) to generate them at build time.
+bindgen = ["rquickjs/bindgen"]
+
 [profile.release]
 opt-level = 3
 lto = true

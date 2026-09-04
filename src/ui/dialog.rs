@@ -10,10 +10,6 @@ pub struct GuiDialog;
 
 impl GuiDialog {
     /// Joins a rule-provided reason with the offending command for display in
-    /// the macOS/Linux dialogs (localized connector). Windows does not use it
-    /// (the WPF dialog assembles its own layout).
-    #[cfg(not(windows))]
-    /// Joins a rule-provided reason with the offending command for display in
     /// the macOS/Linux dialogs. Structurally aligned with the Windows dialog:
     /// reason paragraph first, then a "Command: ..." labeled line (omitted
     /// when there is no command; the whole block reduces to reason only).
@@ -519,7 +515,7 @@ impl GuiDialog {
         match output {
             Ok(out) => {
                 let res = String::from_utf8_lossy(&out.stdout);
-                res.contains(expected)
+                res.contains(expected.as_str())
             }
             Err(_) => false,
         }

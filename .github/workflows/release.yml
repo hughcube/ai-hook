@@ -39,6 +39,7 @@ jobs:
             os: windows-latest
             artifact_name: ai-hook.exe
             release_asset: ai-hook-windows-x86.exe
+            needs_bindgen: 'true'  # rquickjs lacks prebuilt i686-windows bindings
           - target: i686-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: ai-hook
@@ -59,8 +60,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-multilib libc6-dev-i386
 
+      # Windows i686 needs clang to generate QuickJS bindings via bindgen.
+      - name: Install LLVM/Clang (Windows i686 bindgen)
+        if: matrix.needs_bindgen == 'true'
+        shell: bash
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=/c/Program Files/LLVM/bin" >> "$GITHUB_ENV"
+
       - name: Build Release Binary
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          FEATURES=""
+          if [ "${{ matrix.needs_bindgen }}" = "true" ]; then FEATURES="--features bindgen"; fi
+          cargo build --release --target ${{ matrix.target }} $FEATURES
 
       - name: Prepare Binary Asset
         shell: bash
