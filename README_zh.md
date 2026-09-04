@@ -102,10 +102,8 @@
 从 [GitHub Releases](https://github.com/hughcube/ai-hook/releases) 直接下载对应系统的独立可执行文件（开箱即用，无需解压）：
 
 ```bash
-# Windows (PowerShell): 下载至原生应用路径（无需解压，零环境变量修改，全终端立即全局可用）
-Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\ai-hook.exe"
-
-> ⚠️ `WindowsApps` 目录通常需要**开发者模式**或管理员权限才可写入;若提示拒绝访问,请改用 `cargo install --path . && ai-hook install`(会自动探测可写的 PATH 目录)。
+# Windows (PowerShell): 下载至 ~/.local/bin（跨平台标准用户级 bin 目录）
+$bin = "$HOME\.local\bin"; if (-not (Test-Path $bin)) { New-Item -ItemType Directory -Path $bin -Force }; Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$bin\ai-hook.exe"
 
 # Linux: 直接下载到系统全局路径
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
@@ -146,7 +144,8 @@ ai:doctor() {
   if ! command -v ai-hook >/dev/null 2>&1; then
     echo "⚠️  未检测到 ai-hook，正在自动下载并安装为全局命令..."
     if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
-      powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe' -OutFile \"\$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\ai-hook.exe\""
+      mkdir -p "$HOME/.local/bin"
+      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -o "$HOME/.local/bin/ai-hook.exe"
     else
       local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
       local mach="$(uname -m)"

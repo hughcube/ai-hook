@@ -102,10 +102,8 @@ In multi-agent collaborative development ecosystems, preventing destructive oper
 Download standalone precompiled executables directly from [GitHub Releases](https://github.com/hughcube/ai-hook/releases) (ready to run, no extraction needed):
 
 ```bash
-# Windows (PowerShell): Download directly into official native app directory (Zero PATH setup needed)
-Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$env:LOCALAPPDATA\Microsoft\WindowsApps\ai-hook.exe"
-
-> ⚠️ The `WindowsApps` directory usually requires **Developer Mode** or an elevated shell to write into. If access is denied, use `cargo install --path . && ai-hook install` instead (it auto-detects a writable PATH directory).
+# Windows (PowerShell): Download directly to ~/.local/bin
+$bin = "$HOME\.local\bin"; if (-not (Test-Path $bin)) { New-Item -ItemType Directory -Path $bin -Force }; Invoke-WebRequest -Uri "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -OutFile "$bin\ai-hook.exe"
 
 # Linux: Download directly to system bin path
 curl -Lo /usr/local/bin/ai-hook https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-linux-x86_64
@@ -146,7 +144,8 @@ ai:doctor() {
   if ! command -v ai-hook >/dev/null 2>&1; then
     echo "⚠️  ai-hook not found. Automatically downloading and installing globally..."
     if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
-      powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe' -OutFile \"\$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\ai-hook.exe\""
+      mkdir -p "$HOME/.local/bin"
+      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -o "$HOME/.local/bin/ai-hook.exe"
     else
       local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
       local mach="$(uname -m)"

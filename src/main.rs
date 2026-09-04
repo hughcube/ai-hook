@@ -665,10 +665,7 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
         }
     }
 
-    // 2. Walk PATH left-to-right and take the first writable directory —
-    //    skipping the WindowsApps app-alias folder, which costs ~70ms extra
-    //    per launch on Windows (2026-09-05 measured: ~95ms vs ~20ms in a
-    //    normal directory); it stays as a last-resort fallback below.
+    // 2. Walk PATH left-to-right and take the first writable directory (ignoring WindowsApps)
     for path in &existing_paths {
         if path.as_os_str().is_empty() {
             continue;
@@ -681,30 +678,7 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
         }
     }
 
-    // 3. Windows fallback: the official app-alias directory (already in the
-    //    user PATH by default) — used only when no other PATH entry is
-    //    writable.
-    #[cfg(windows)]
-    {
-        if let Some(local_app_data) = ai_hook::paths::data_local_dir() {
-            let win_apps = local_app_data.join("Microsoft").join("WindowsApps");
-            if win_apps.exists() && is_dir_writable(&win_apps) {
-                let norm_target = win_apps
-                    .to_string_lossy()
-                    .trim_end_matches('\\')
-                    .to_lowercase();
-                let in_path = existing_paths.iter().any(|p| {
-                    p.to_string_lossy().trim_end_matches('\\').to_lowercase() == norm_target
-                });
-                if in_path {
-                    return win_apps;
-                }
-            }
-        }
-    }
-
-    // 4. Fallback default: ~/.local/bin (Unix convention, also honored on
-    //    Windows since 2026-09-05 — mirrors what automatic placement picks)
+    // 3. Fallback default: ~/.local/bin (Standard cross-platform convention)
     if let Some(home) = ai_hook::paths::home_dir() {
         home.join(".local").join("bin")
     } else {

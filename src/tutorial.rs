@@ -93,7 +93,7 @@ fn chinese_tutorial_body() -> String {
   sys.cwd()             string        当前工作目录(与 ctx.cwd 一致)
   sys.ruleDir / sys.__dirname   string 当前正在执行的规则脚本所在目录绝对路径
   sys.rulePath / sys.__filename string 当前正在执行的规则脚本文件绝对路径
-  sys.exec(cmd, args?, opts?)   object 同步执行外部命令/脚本,支持 Git Bash 智能定锚:
+  sys.exec(cmd, args?, opts?)   object 同步执行外部命令/脚本/二进制(跨平台原生+Shebang智能调度):
                                        返回 { code: number, stdout: string, stderr: string }
   sys.http.get(url, opts?)      object 同步 HTTP GET,返回 { status, body, headers }
   sys.http.post(url, body?, opt)object 同步 HTTP POST,返回 { status, body, headers }
@@ -279,7 +279,7 @@ III. sys — autonomous SDK (in-memory cached + controlled execution & network)
   sys.cwd()             string        current working directory (= ctx.cwd)
   sys.ruleDir / sys.__dirname   string absolute directory path of running rule file
   sys.rulePath / sys.__filename string absolute file path of running rule file
-  sys.exec(cmd, args?, opts?)   object synchronous command execution (Git Bash aware):
+  sys.exec(cmd, args?, opts?)   object synchronous command/script/binary execution (cross-platform & Shebang aware):
                                        returns { code: number, stdout: string, stderr: string }
   sys.http.get(url, opts?)      object synchronous HTTP GET, returns { status, body, headers }
   sys.http.post(url, body?, opt)object synchronous HTTP POST, returns { status, body, headers }
