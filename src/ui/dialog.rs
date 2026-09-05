@@ -490,8 +490,7 @@ impl GuiDialog {
             s.replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace("\r\n", "\\n")
-                .replace('\n', "\\n")
-                .replace('\r', "\\n")
+                .replace(['\n', '\r'], "\\n")
                 .replace('\t', "\\t")
         }
         let clean_title = apple_escape(title);

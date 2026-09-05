@@ -1180,18 +1180,26 @@ fn test_claude_confirm_ask_vs_dialog_denied() {
 #[test]
 fn test_sys_exec_api() {
     let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let (prog, arg) = if cfg!(windows) {
+        ("cmd", "/c")
+    } else {
+        ("sh", "-c")
+    };
     let exec_rule = rule(
         "test-exec",
-        r#"export default function(ctx, sys) {
-            if (typeof sys.exec !== 'function') {
-                return { action: "deny", reason: "sys.exec missing" };
-            }
-            let res = sys.exec("cmd", ["/c", "echo ai-hook-exec-ok"]);
-            if (res.status !== 0 || !res.stdout.includes("ai-hook-exec-ok")) {
-                return { action: "deny", reason: "sys.exec failed: " + JSON.stringify(res) };
-            }
+        &format!(
+            r#"export default function(ctx, sys) {{
+            if (typeof sys.exec !== 'function') {{
+                return {{ action: "deny", reason: "sys.exec missing" }};
+            }}
+            let res = sys.exec("{}", ["{}", "echo ai-hook-exec-ok"]);
+            if (res.status !== 0 || !res.stdout.includes("ai-hook-exec-ok")) {{
+                return {{ action: "deny", reason: "sys.exec failed: " + JSON.stringify(res) }};
+            }}
             return null;
-        }"#,
+        }}"#,
+            prog, arg
+        ),
     );
     let ctx = ctx_for("test");
     let (dec, _) = runner.evaluate_all(&[exec_rule], &ctx, ErrorPolicy::FailClosed);
@@ -1203,12 +1211,23 @@ fn test_sys_exec_script_file_auto_resolve() {
     let runner = RuleRunner::new().expect("Failed to initialize runner");
     let tmp = std::env::temp_dir().join(format!("ai-hook-script-resolve-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
-    let script_path = tmp.join("test_run.bat");
-    std::fs::write(
-        &script_path,
-        "@echo off\r\necho script-auto-resolve-ok %1\r\n",
-    )
-    .expect("write bat");
+    let (script_name, script_content) = if cfg!(windows) {
+        (
+            "test_run.bat",
+            "@echo off\r\necho script-auto-resolve-ok %1\r\n",
+        )
+    } else {
+        ("test_run.sh", "#!/bin/sh\necho script-auto-resolve-ok $1\n")
+    };
+    let script_path = tmp.join(script_name);
+    std::fs::write(&script_path, script_content).expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&script_path, perms);
+    }
     let script_str = script_path.to_string_lossy().replace('\\', "/");
 
     let rule_content = format!(
