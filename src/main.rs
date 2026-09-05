@@ -29,6 +29,7 @@ use std::time::Instant;
 fn attach_parent_console() {
     use std::os::windows::io::RawHandle;
 
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
     const STD_ERROR_HANDLE: u32 = -12i32 as u32;
     const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
@@ -55,9 +56,16 @@ fn attach_parent_console() {
     }
 
     unsafe {
-        let need_output = GetStdHandle(STD_OUTPUT_HANDLE) == INVALID_HANDLE_VALUE;
-        let need_error = GetStdHandle(STD_ERROR_HANDLE) == INVALID_HANDLE_VALUE;
-        if !need_output && !need_error {
+        // A handle is "missing" when GetStdHandle reports NULL (the process
+        // was created without a standard handle) or INVALID_HANDLE_VALUE.
+        // Shells like Git Bash spawn GUI-subsystem children with NULL std
+        // handles, so only checking for INVALID would skip the attach below
+        // and silently swallow all console output / mis-detect a terminal.
+        let missing = |h: RawHandle| h.is_null() || h == INVALID_HANDLE_VALUE;
+        let need_input = missing(GetStdHandle(STD_INPUT_HANDLE));
+        let need_output = missing(GetStdHandle(STD_OUTPUT_HANDLE));
+        let need_error = missing(GetStdHandle(STD_ERROR_HANDLE));
+        if !need_input && !need_output && !need_error {
             return;
         }
         // Only attach when there is a real interactive parent to talk to.
@@ -65,26 +73,48 @@ fn attach_parent_console() {
             return;
         }
         // AttachConsole does not rewrite the standard-handle table; fetch the
-        // console device explicitly and backfill the handles Rust will read.
-        let mut con = [0u16; 8];
-        for (i, c) in "CONOUT$\0".encode_utf16().enumerate() {
-            con[i] = c;
-        }
-        let hout = CreateFileW(
-            con.as_ptr(),
-            GENERIC_WRITE | GENERIC_READ,
-            FILE_SHARE_WRITE | FILE_SHARE_READ,
-            core::ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            INVALID_HANDLE_VALUE,
-        );
-        if hout != INVALID_HANDLE_VALUE {
-            if need_output {
-                SetStdHandle(STD_OUTPUT_HANDLE, hout);
+        // console devices explicitly and backfill the handles Rust will read.
+        // Only overridden handles are touched, so a redirected pipe (the hook
+        // decision channel) is never replaced.
+        if need_output || need_error {
+            let mut con = [0u16; 8];
+            for (i, c) in "CONOUT$\0".encode_utf16().enumerate() {
+                con[i] = c;
             }
-            if need_error {
-                SetStdHandle(STD_ERROR_HANDLE, hout);
+            let hout = CreateFileW(
+                con.as_ptr(),
+                GENERIC_WRITE | GENERIC_READ,
+                FILE_SHARE_WRITE | FILE_SHARE_READ,
+                core::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                INVALID_HANDLE_VALUE,
+            );
+            if hout != INVALID_HANDLE_VALUE {
+                if need_output {
+                    SetStdHandle(STD_OUTPUT_HANDLE, hout);
+                }
+                if need_error {
+                    SetStdHandle(STD_ERROR_HANDLE, hout);
+                }
+            }
+        }
+        if need_input {
+            let mut conin = [0u16; 7];
+            for (i, c) in "CONIN$\0".encode_utf16().enumerate() {
+                conin[i] = c;
+            }
+            let hin = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_WRITE | FILE_SHARE_READ,
+                core::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                INVALID_HANDLE_VALUE,
+            );
+            if hin != INVALID_HANDLE_VALUE {
+                SetStdHandle(STD_INPUT_HANDLE, hin);
             }
         }
     }
