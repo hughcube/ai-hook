@@ -71,11 +71,11 @@ impl HookDecision {
 
         match ctx.platform {
             Platform::Antigravity => match self {
-                HookDecision::Allow => json!({ "decision": "allow" }).to_string(),
+                HookDecision::Allow => r#"{"decision":"allow"}"#.to_string(),
                 HookDecision::Confirm { reason, .. } => {
                     if let Some(approved) = gui_approved {
                         if approved {
-                            json!({ "decision": "allow" }).to_string()
+                            r#"{"decision":"allow"}"#.to_string()
                         } else {
                             let deny_reason = format!(
                                 "{}\n{}\n{}: {}",
@@ -117,22 +117,10 @@ impl HookDecision {
                 HookDecision::Block { .. } | HookDecision::PostContext { .. } => unreachable!(),
             },
             Platform::Codex => match self {
-                HookDecision::Allow => json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow"
-                    }
-                })
-                .to_string(),
+                HookDecision::Allow => r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#.to_string(),
                 HookDecision::Confirm { reason, .. } => {
                     if gui_approved == Some(true) {
-                        json!({
-                            "hookSpecificOutput": {
-                                "hookEventName": "PreToolUse",
-                                "permissionDecision": "allow"
-                            }
-                        })
-                        .to_string()
+                        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#.to_string()
                     } else if gui_approved == Some(false) {
                         let deny_reason = format!(
                             "{}\n{}\n{}: {}",

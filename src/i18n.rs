@@ -97,42 +97,19 @@ fn detect() -> Lang {
     Lang::En
 }
 
-/// Reads HKCU\Control Panel\International\LocaleName (e.g. "zh-CN") or the
-/// legacy hex LCID value "Locale" (e.g. "00000804").
+/// Queries user default locale name via Win32 API without spawning reg.exe.
 #[cfg(windows)]
 fn windows_user_locale_is_chinese() -> bool {
-    use std::process::Command;
-
-    let locale_name = Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Control Panel\International",
-            "/v",
-            "LocaleName",
-        ])
-        .output();
-    if let Ok(out) = locale_name {
-        let text = String::from_utf8_lossy(&out.stdout);
-        if text.contains("zh-") {
-            return true;
-        }
-        // A definitely non-Chinese locale name means we can stop early.
-        if text.contains("REG_SZ") && !text.to_ascii_lowercase().contains("zh") {
-            return false;
-        }
+    unsafe extern "system" {
+        fn GetUserDefaultLocaleName(lpLocaleName: *mut u16, cchLocaleName: i32) -> i32;
     }
-
-    // Legacy LCID: zh-CN 0x0804, zh-TW 0x0404, zh-HK 0x0C04, zh-SG 0x1004,
-    // zh-MO 0x1404.
-    let locale = Command::new("reg")
-        .args(["query", r"HKCU\Control Panel\International", "/v", "Locale"])
-        .output();
-    if let Ok(out) = locale {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for lcid in ["00000804", "00000404", "00000c04", "00001004", "00001404"] {
-            if text.contains(lcid) {
-                return true;
-            }
+    let mut buf = [0u16; 85];
+    let len = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+    if len > 2 {
+        let first = buf[0] as u8;
+        let second = buf[1] as u8;
+        if (first == b'z' || first == b'Z') && (second == b'h' || second == b'H') {
+            return true;
         }
     }
     false

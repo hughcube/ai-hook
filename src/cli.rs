@@ -2,7 +2,7 @@ use crate::i18n::{Msg, t};
 use clap::{Command, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(
     name = "ai-hook",
     author = "hugh.li",

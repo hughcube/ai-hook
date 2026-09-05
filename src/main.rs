@@ -91,14 +91,54 @@ fn get_binary_info_help() -> String {
     )
 }
 
+fn parse_args() -> Cli {
+    let mut raw_args = std::env::args_os();
+    let bin = raw_args.next();
+    let first = raw_args.next();
+
+    match first {
+        None => {
+            // 没有任何参数 (95% 的 Agent Hook 调用场景)，零 Clap 构建，零帮助文本堆分配
+            Cli::default()
+        }
+        Some(first_arg) => {
+            let mut all_args = vec![bin.unwrap_or_default(), first_arg];
+            all_args.extend(raw_args);
+
+            // 检查是否需要帮助或版本信息
+            let wants_help_or_version = all_args.iter().any(|a| {
+                let s = a.to_string_lossy();
+                s == "-h" || s == "--help" || s == "-V" || s == "--version"
+            });
+
+            if wants_help_or_version {
+                let help_info = get_binary_info_help();
+                let cmd = localized_command()
+                    .after_help(help_info.clone())
+                    .after_long_help(help_info);
+                let matches = cmd.get_matches_from(&all_args);
+                Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+            } else {
+                use clap::Parser;
+                match Cli::try_parse_from(&all_args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        let help_info = get_binary_info_help();
+                        let cmd = localized_command()
+                            .after_help(help_info.clone())
+                            .after_long_help(help_info);
+                        let _ = cmd.get_matches_from(&all_args);
+                        e.exit();
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     prof_init!();
-    let help_info = get_binary_info_help();
-    let cmd = localized_command()
-        .after_help(help_info.clone())
-        .after_long_help(help_info);
-    let matches = cmd.get_matches();
-    let args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let args = parse_args();
     prof_mark!("clap 解析完成");
 
     match args.command {
@@ -156,6 +196,10 @@ fn print_output(output: &str) {
     if !output.is_empty() {
         println!("{}", output);
     }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
 }
 
 /// Fail-closed policy can be relaxed explicitly via CLI flag or environment.

@@ -42,15 +42,13 @@ impl RuleLoader {
         }
 
         // 3. Fallback to project-level rules directory if present (./.ai-hook/rules.js or ./.ai-hook/rules/)
-        if let Ok(cwd) = std::env::current_dir() {
-            let local_rule_file = cwd.join(".ai-hook").join("rules.js");
-            if local_rule_file.is_file() {
-                Self::collect_from_path(&local_rule_file, &mut files, &mut seen);
-            } else {
-                let local_rules_dir = cwd.join(".ai-hook").join("rules");
-                if local_rules_dir.is_dir() {
-                    Self::collect_from_path(&local_rules_dir, &mut files, &mut seen);
-                }
+        let local_rule_file = Path::new(".ai-hook/rules.js");
+        if local_rule_file.is_file() {
+            Self::collect_from_path(local_rule_file, &mut files, &mut seen);
+        } else {
+            let local_rules_dir = Path::new(".ai-hook/rules");
+            if local_rules_dir.is_dir() {
+                Self::collect_from_path(local_rules_dir, &mut files, &mut seen);
             }
         }
 
@@ -90,12 +88,7 @@ impl RuleLoader {
     }
 
     fn add_file(path: &Path, files: &mut Vec<RuleSource>, seen: &mut HashSet<PathBuf>) {
-        let canonical = match path.canonicalize() {
-            Ok(c) => c,
-            Err(_) => path.to_path_buf(),
-        };
-
-        if seen.contains(&canonical) {
+        if seen.contains(path) {
             return;
         }
 
@@ -111,7 +104,7 @@ impl RuleLoader {
         }
 
         if let Ok(code) = std::fs::read_to_string(path) {
-            seen.insert(canonical);
+            seen.insert(path.to_path_buf());
             files.push(RuleSource {
                 id: file_stem,
                 path: path.to_path_buf(),

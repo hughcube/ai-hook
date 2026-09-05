@@ -257,9 +257,8 @@ impl HookContext {
         let prompt = get_str(&val, &["prompt", "user_prompt", "userPrompt"]).map(str::to_string);
 
         // ---- 1. Google Antigravity: `toolCall` envelope ----
-        if val.get("toolCall").is_some() {
-            let tool_call = val.get("toolCall").cloned().unwrap_or_default();
-            let tool_name = get_str(&tool_call, &["name", "toolName"])
+        if let Some(tool_call) = val.get("toolCall") {
+            let tool_name = get_str(tool_call, &["name", "toolName"])
                 .unwrap_or("")
                 .to_string();
             let args = tool_call

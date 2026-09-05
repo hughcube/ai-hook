@@ -19,9 +19,8 @@ pub fn home_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(h));
     }
     #[cfg(windows)]
-    match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
-        (Some(d), Some(p)) => return Some(PathBuf::from(d).join(p)),
-        _ => {}
+    if let (Some(d), Some(p)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+        return Some(PathBuf::from(d).join(p));
     }
     None
 }

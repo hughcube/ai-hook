@@ -84,12 +84,12 @@ impl GuiDialog {
         title: &str,
         reason: &str,
         command: &str,
-        agent: &str,
+        _agent: &str,
         timeout_sec: u32,
     ) -> bool {
         #[cfg(target_os = "windows")]
         {
-            return Self::prompt_windows_wpf(title, reason, command, agent, timeout_sec);
+            return Self::prompt_windows_wpf(title, reason, command, _agent, timeout_sec);
         }
 
         #[cfg(target_os = "macos")]

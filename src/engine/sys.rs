@@ -234,14 +234,12 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             cmd_obj.args(&resolved.args);
             cmd_obj.current_dir(&target_cwd);
 
-            if let Some(ref opt) = options.0 {
-                if let Ok(env_obj) = opt.get::<_, Object<'js>>("env") {
-                    for key in env_obj.keys::<String>() {
-                        if let Ok(k) = key {
-                            if let Ok(v) = env_obj.get::<_, String>(&k) {
-                                cmd_obj.env(k, v);
-                            }
-                        }
+            if let Some(ref opt) = options.0
+                && let Ok(env_obj) = opt.get::<_, Object<'js>>("env")
+            {
+                for k in env_obj.keys::<String>().flatten() {
+                    if let Ok(v) = env_obj.get::<_, String>(&k) {
+                        cmd_obj.env(k, v);
                     }
                 }
             }
@@ -258,11 +256,11 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             let result_obj = Object::new(ctx)?;
             match cmd_obj.group_spawn() {
                 Ok(mut group_child) => {
-                    if let Some(input_str) = opt_input {
-                        if let Some(mut stdin) = group_child.inner().stdin.take() {
-                            use std::io::Write;
-                            let _ = stdin.write_all(input_str.as_bytes());
-                        }
+                    if let (Some(input_str), Some(mut stdin)) =
+                        (opt_input, group_child.inner().stdin.take())
+                    {
+                        use std::io::Write;
+                        let _ = stdin.write_all(input_str.as_bytes());
                     }
                     match group_child.wait_with_output() {
                         Ok(output) => {
@@ -321,11 +319,9 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                 body_str = Some(b);
             }
             if let Ok(hdr_obj) = opt.get::<_, Object<'js>>("headers") {
-                for key in hdr_obj.keys::<String>() {
-                    if let Ok(k) = key {
-                        if let Ok(v) = hdr_obj.get::<_, String>(&k) {
-                            headers.insert(k, v);
-                        }
+                for k in hdr_obj.keys::<String>().flatten() {
+                    if let Ok(v) = hdr_obj.get::<_, String>(&k) {
+                        headers.insert(k, v);
                     }
                 }
             }
@@ -358,7 +354,7 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                 }
                 let body = response.into_string().unwrap_or_default();
                 res_obj.set("status", status)?;
-                res_obj.set("ok", status >= 200 && status < 300)?;
+                res_obj.set("ok", (200..300).contains(&status))?;
                 res_obj.set("headers", headers_obj)?;
                 res_obj.set("body", body)?;
             }
@@ -546,10 +542,10 @@ fn find_executable_in_path(cmd_name: &str, cwd: &Path) -> Option<String> {
     }
 
     // 在精简 Linux 容器（如 Alpine）中缺少 bash 时平滑降级至 sh
-    if cmd_name == "bash" {
-        if let Ok(p) = which::which_in("sh", std::env::var_os("PATH"), cwd) {
-            return Some(p.to_string_lossy().to_string());
-        }
+    if cmd_name == "bash"
+        && let Ok(p) = which::which_in("sh", std::env::var_os("PATH"), cwd)
+    {
+        return Some(p.to_string_lossy().to_string());
     }
 
     if cmd_name == "zsh" {
@@ -676,10 +672,10 @@ fn resolve_script_or_binary_file(
                 args,
             };
         }
-        return ResolvedCommand {
+        ResolvedCommand {
             program: file_path.to_string_lossy().to_string(),
             args: raw_args,
-        };
+        }
     }
 
     #[cfg(windows)]
@@ -719,13 +715,13 @@ fn resolve_script_or_binary_file(
     }
 }
 
-fn resolve_command_name(cmd: &str, raw_args: Vec<String>, cwd: &Path) -> ResolvedCommand {
+fn resolve_command_name(cmd: &str, raw_args: Vec<String>, _cwd: &Path) -> ResolvedCommand {
     #[cfg(windows)]
     {
         let lower = cmd.to_ascii_lowercase();
         let stripped = lower.strip_suffix(".exe").unwrap_or(&lower);
         if stripped == "bash" || stripped == "zsh" || stripped == "sh" {
-            let shell_prog = find_windows_posix_shell(stripped, cwd);
+            let shell_prog = find_windows_posix_shell(stripped, _cwd);
             return ResolvedCommand {
                 program: shell_prog,
                 args: raw_args,
@@ -763,10 +759,10 @@ fn find_windows_posix_shell(preferred: &str, cwd: &Path) -> String {
     };
 
     for target in search_order {
-        if let Some(path) = find_executable_in_path(target, cwd) {
-            if !path.to_ascii_lowercase().contains("system32") {
-                return path;
-            }
+        if let Some(path) = find_executable_in_path(target, cwd)
+            && !path.to_ascii_lowercase().contains("system32")
+        {
+            return path;
         }
     }
 

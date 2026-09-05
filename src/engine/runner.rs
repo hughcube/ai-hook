@@ -294,31 +294,82 @@ impl RuleRunner {
         let session_id = ctx.conversation.as_ref().and_then(|c| c.id.as_deref());
 
         let res = js_context.with(|js_ctx| -> rquickjs::Result<()> {
-            // 1. Build the full v2 ctx object from one JSON document (nested
-            //    nulls, sessions, files serialize cleanly this way).
-            let ctx_value = serde_json::json!({
-                "agent": agent_str,
-                "mode": ctx.permission_mode,
-                "isYolo": ctx.is_yolo,
-                "session": ctx.conversation.as_ref().map(|c| serde_json::json!({
-                    "id": c.id,
-                    "transcriptPath": c.transcript_path,
-                })),
-                "cwd": ctx.cwd,
-                "model": ctx.model,
-                "tool": ctx.tool_name,
-                "cmd": ctx.cmd,
-                "file": ctx.file.as_ref().map(|f| serde_json::json!({
-                    "path": f.path,
-                    "action": f.action.as_str(),
-                })),
-                "args": ctx.tool_args,
-                "event": ctx.event,
-                "prompt": ctx.prompt,
-                "raw": ctx.raw_value,
-                "rawInput": ctx.raw_input,
-            });
-            let ctx_obj: Value = js_ctx.json_parse(ctx_value.to_string().as_bytes())?;
+            // 1. Build the v2 ctx object in-place directly on QuickJS (zero redundant Rust serialization).
+            let ctx_obj = Object::new(js_ctx.clone())?;
+            ctx_obj.set("agent", agent_str.as_str())?;
+            if let Some(ref m) = ctx.permission_mode {
+                ctx_obj.set("mode", m.as_str())?;
+            } else {
+                ctx_obj.set("mode", Value::new_null(js_ctx.clone()))?;
+            }
+            ctx_obj.set("isYolo", ctx.is_yolo)?;
+            if let Some(ref c) = ctx.conversation {
+                let session_obj = Object::new(js_ctx.clone())?;
+                if let Some(ref id) = c.id {
+                    session_obj.set("id", id.as_str())?;
+                } else {
+                    session_obj.set("id", Value::new_null(js_ctx.clone()))?;
+                }
+                if let Some(ref tp) = c.transcript_path {
+                    session_obj.set("transcriptPath", tp.as_str())?;
+                } else {
+                    session_obj.set("transcriptPath", Value::new_null(js_ctx.clone()))?;
+                }
+                ctx_obj.set("session", session_obj)?;
+            } else {
+                ctx_obj.set("session", Value::new_null(js_ctx.clone()))?;
+            }
+            ctx_obj.set("cwd", ctx.cwd.as_str())?;
+            if let Some(ref m) = ctx.model {
+                ctx_obj.set("model", m.as_str())?;
+            } else {
+                ctx_obj.set("model", Value::new_null(js_ctx.clone()))?;
+            }
+            ctx_obj.set("tool", ctx.tool_name.as_str())?;
+            if let Some(ref c) = ctx.cmd {
+                ctx_obj.set("cmd", c.as_str())?;
+            } else {
+                ctx_obj.set("cmd", Value::new_null(js_ctx.clone()))?;
+            }
+            if let Some(ref f) = ctx.file {
+                let file_obj = Object::new(js_ctx.clone())?;
+                if let Some(ref p) = f.path {
+                    file_obj.set("path", p.as_str())?;
+                } else {
+                    file_obj.set("path", Value::new_null(js_ctx.clone()))?;
+                }
+                file_obj.set("action", f.action.as_str())?;
+                ctx_obj.set("file", file_obj)?;
+            } else {
+                ctx_obj.set("file", Value::new_null(js_ctx.clone()))?;
+            }
+            let args_val: Value = if !ctx.tool_args.is_null() {
+                js_ctx
+                    .json_parse(ctx.tool_args.to_string().as_bytes())
+                    .unwrap_or_else(|_| Value::new_null(js_ctx.clone()))
+            } else {
+                Value::new_null(js_ctx.clone())
+            };
+            ctx_obj.set("args", args_val)?;
+            if let Some(ref ev) = ctx.event {
+                ctx_obj.set("event", ev.as_str())?;
+            } else {
+                ctx_obj.set("event", Value::new_null(js_ctx.clone()))?;
+            }
+            if let Some(ref pr) = ctx.prompt {
+                ctx_obj.set("prompt", pr.as_str())?;
+            } else {
+                ctx_obj.set("prompt", Value::new_null(js_ctx.clone()))?;
+            }
+            let raw_val: Value = if !ctx.raw_input.is_empty() {
+                js_ctx
+                    .json_parse(ctx.raw_input.as_bytes())
+                    .unwrap_or_else(|_| Value::new_null(js_ctx.clone()))
+            } else {
+                Value::new_null(js_ctx.clone())
+            };
+            ctx_obj.set("raw", raw_val)?;
+            ctx_obj.set("rawInput", ctx.raw_input.as_str())?;
 
             // 1.5 Setup console.log -> stderr (+ optional file channel)
             let console_obj = Object::new(js_ctx.clone())?;
@@ -489,15 +540,14 @@ impl RuleRunner {
                         decision = Some(HookDecision::PostContext {
                             additional_context: ctx_text,
                         });
-                    } else if let Ok(hook_output) = obj.get::<_, Object>("hookSpecificOutput") {
-                        if let Ok(ctx_text) = hook_output
+                    } else if let Ok(hook_output) = obj.get::<_, Object>("hookSpecificOutput")
+                        && let Ok(ctx_text) = hook_output
                             .get::<_, String>("additionalContext")
                             .or_else(|_| hook_output.get::<_, String>("additional_context"))
-                        {
-                            decision = Some(HookDecision::PostContext {
-                                additional_context: ctx_text,
-                            });
-                        }
+                    {
+                        decision = Some(HookDecision::PostContext {
+                            additional_context: ctx_text,
+                        });
                     }
                 }
             } else if let Some(b) = raw_val.as_bool()
