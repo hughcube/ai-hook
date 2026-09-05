@@ -96,9 +96,9 @@ fn chinese_tutorial_body() -> String {
   sys.ruleDir / sys.__dirname   string 当前正在执行的规则脚本所在目录绝对路径
   sys.rulePath / sys.__filename string 当前正在执行的规则脚本文件绝对路径
   sys.exec(cmd, args?, opts?)   object 同步执行外部命令/脚本/二进制(跨平台原生+Shebang智能调度):
-                                       返回 { code: number, stdout: string, stderr: string }
-  sys.http.get(url, opts?)      object 同步 HTTP GET,返回 { status, body, headers }
-  sys.http.post(url, body?, opt)object 同步 HTTP POST,返回 { status, body, headers }
+                                       返回 { code, status, exitCode, stdout, stderr, success }
+  sys.http.get(url, opts?)      object 同步 HTTP GET,返回 { status, ok, headers, body }
+  sys.http.post(url, opts?)     object 同步 HTTP POST(body 放 opts.body),返回 { status, ok, headers, body }
   new Date()            标准 JS 时钟(周五封网、夜间窗口等)
   console.log(...)      stderr + 文件;错误也走 console.error(同通道)
   sys.log(level, ...)   结构化日志;level 自定(warn/info/debug…)
@@ -282,9 +282,9 @@ III. sys — autonomous SDK (in-memory cached + controlled execution & network)
   sys.ruleDir / sys.__dirname   string absolute directory path of running rule file
   sys.rulePath / sys.__filename string absolute file path of running rule file
   sys.exec(cmd, args?, opts?)   object synchronous command/script/binary execution (cross-platform & Shebang aware):
-                                       returns { code: number, stdout: string, stderr: string }
-  sys.http.get(url, opts?)      object synchronous HTTP GET, returns { status, body, headers }
-  sys.http.post(url, body?, opt)object synchronous HTTP POST, returns { status, body, headers }
+                                       returns { code, status, exitCode, stdout, stderr, success }
+  sys.http.get(url, opts?)      object synchronous HTTP GET, returns { status, ok, headers, body }
+  sys.http.post(url, opts?)     object synchronous HTTP POST (body goes in opts.body), returns { status, ok, headers, body }
   new Date()            standard JS clock (freeze windows, night rules…)
   console.log(...)      stderr + file; console.error shares the channel
   sys.log(level, ...)   structured log; level is free-form (warn/info/debug…)
