@@ -1,3 +1,11 @@
+// GUI subsystem (no console): hosts that spawn the hook without an inherited
+// console skip the conhost/console-allocation cost entirely (~9 ms per process
+// measured on Windows). Decision output goes to stdout/stderr pipes that the
+// host redirects; interactive use still works because shells hand their
+// handles over and `attach_parent_console()` below backfills real handles when
+// only the parent console is missing.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
@@ -5,17 +13,88 @@ use ai_hook::i18n::{Msg, t, tf};
 use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{ConfirmPath, HookContext, HookDecision, confirm_path};
 use ai_hook::ui::GuiDialog;
+use ai_hook::{errln, outln};
 use clap::FromArgMatches;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// On Windows, a GUI-subsystem process has no console and, unless the caller
+/// redirected them, no standard handles. When stdout/stderr are missing,
+/// attach to the parent's console (interactive shells) so ordinary CLI use
+/// (`list`, `test`, `install`, help) stays visible. Must run before the first
+/// `println!`/`eprintln!` because Rust caches the std handles on first use.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::os::windows::io::RawHandle;
+
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const OPEN_EXISTING: u32 = 0x3;
+
+    unsafe extern "system" {
+        fn GetStdHandle(n: u32) -> RawHandle;
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            security: *mut core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            template: RawHandle,
+        ) -> RawHandle;
+        fn SetStdHandle(n: u32, h: RawHandle) -> i32;
+    }
+
+    unsafe {
+        let need_output = GetStdHandle(STD_OUTPUT_HANDLE) == INVALID_HANDLE_VALUE;
+        let need_error = GetStdHandle(STD_ERROR_HANDLE) == INVALID_HANDLE_VALUE;
+        if !need_output && !need_error {
+            return;
+        }
+        // Only attach when there is a real interactive parent to talk to.
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        // AttachConsole does not rewrite the standard-handle table; fetch the
+        // console device explicitly and backfill the handles Rust will read.
+        let mut con = [0u16; 8];
+        for (i, c) in "CONOUT$\0".encode_utf16().enumerate() {
+            con[i] = c;
+        }
+        let hout = CreateFileW(
+            con.as_ptr(),
+            GENERIC_WRITE | GENERIC_READ,
+            FILE_SHARE_WRITE | FILE_SHARE_READ,
+            core::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            INVALID_HANDLE_VALUE,
+        );
+        if hout != INVALID_HANDLE_VALUE {
+            if need_output {
+                SetStdHandle(STD_OUTPUT_HANDLE, hout);
+            }
+            if need_error {
+                SetStdHandle(STD_ERROR_HANDLE, hout);
+            }
+        }
+    }
+}
+
 /// Timestamped stderr log line: `[2026-09-05 02:46:12] message…`.
 /// All diagnostics carry a human-readable local time (2026-09-05 需求).
 macro_rules! eprint_ts {
     ($($arg:tt)*) => {
-        eprintln!("[{}] {}", ai_hook::engine::local_now_str(), format_args!($($arg)*))
+        errln!("[{}] {}", ai_hook::engine::local_now_str(), format_args!($($arg)*))
     };
 }
 
@@ -130,10 +209,10 @@ macro_rules! prof_flush {
                 if marks.is_empty() {
                     return;
                 }
-                eprintln!("[ai-hook-profile] 进程全生命周期(原点=进程创建,含 main 之前的加载开销)");
+                errln!("[ai-hook-profile] 进程全生命周期(原点=进程创建,含 main 之前的加载开销)");
                 let mut prev = 0.0f64;
                 for (label, t) in &marks {
-                    eprintln!(
+                    errln!(
                         "  {:<38} 累计 {:7.3} ms   本段 {:7.3} ms",
                         label,
                         t,
@@ -323,6 +402,11 @@ fn parse_args() -> Cli {
 }
 
 fn main() {
+    // Must precede every stdout/stderr write: Rust caches the standard handles
+    // on first use, so attach to a parent console (interactive shells) before
+    // any output happens when the GUI-subsystem binary lacks handles.
+    #[cfg(windows)]
+    attach_parent_console();
     prof_init!();
     // First mark = the invisible prefix: PE mapping, DLL loading, relocations,
     // C + Rust runtime init. On Windows this is most of the hook's latency.
@@ -382,7 +466,7 @@ fn collect_target_rules(args: &Cli, extra_scripts: Option<&[PathBuf]>) -> Vec<Pa
 /// in every host protocol, so we must never print whitespace-only noise).
 fn print_output(output: &str) {
     if !output.is_empty() {
-        println!("{}", output);
+        outln!("{}", output);
     }
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -429,7 +513,7 @@ fn handle_dispatch(args: &Cli) {
             .after_help(help_info.clone())
             .after_long_help(help_info)
             .print_help();
-        println!();
+        outln!();
         return;
     }
 
@@ -443,6 +527,15 @@ fn handle_dispatch(args: &Cli) {
         let reason = t(Msg::M135).to_string();
         print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
         return;
+    }
+
+    // Strip a leading UTF-8 BOM if present. Several hosts / redirection
+    // wrappers (notably PowerShell 5.1's Process.StandardInput and some file
+    // save dialogs) prepend U+FEFF to the piped bytes; serde_json rejects it,
+    // which would route a perfectly valid payload into the "unparseable" ask
+    // path and pop a confirmation dialog on every hook call.
+    if buffer.starts_with('\u{feff}') {
+        buffer.drain(..'\u{feff}'.len_utf8());
     }
 
     if buffer.trim().is_empty() {
@@ -632,17 +725,17 @@ fn handle_list(args: &Cli, scripts: &[PathBuf]) {
     let explicit_paths = collect_target_rules(args, Some(scripts));
     let rules = RuleLoader::load_rules(&explicit_paths);
 
-    println!("============================================================");
-    println!("  {} ({}: {})", t(Msg::M061), t(Msg::M062), rules.len());
-    println!("============================================================");
+    outln!("============================================================");
+    outln!("  {} ({}: {})", t(Msg::M061), t(Msg::M062), rules.len());
+    outln!("============================================================");
 
     if rules.is_empty() {
-        println!("  {}", t(Msg::M063));
-        println!(
+        outln!("  {}", t(Msg::M063));
+        outln!(
             "  {}: ai-hook [选项] <script1.js> <script2.js>...",
             t(Msg::M064)
         );
-        println!(
+        outln!(
             "  {}: ./.ai-hook/rules.js 或 ./.ai-hook/rules/",
             t(Msg::M065)
         );
@@ -650,18 +743,18 @@ fn handle_list(args: &Cli, scripts: &[PathBuf]) {
     }
 
     for (idx, r) in rules.iter().enumerate() {
-        println!("  [{:02}] {:<30} -> {}", idx + 1, r.id, r.path.display());
+        outln!("  [{:02}] {:<30} -> {}", idx + 1, r.id, r.path.display());
     }
 }
 
 fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[PathBuf]) {
-    println!("{}...", t(Msg::M066));
-    println!("{}: {}", t(Msg::M067), command);
-    println!("{}: {}", t(Msg::M068), tool);
+    outln!("{}...", t(Msg::M066));
+    outln!("{}: {}", t(Msg::M067), command);
+    outln!("{}: {}", t(Msg::M068), tool);
     if !file.is_empty() {
-        println!("{}: {}", t(Msg::M069), file);
+        outln!("{}: {}", t(Msg::M069), file);
     }
-    println!("------------------------------------------------------------");
+    outln!("------------------------------------------------------------");
 
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -689,9 +782,9 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
     if !fast_path_disabled(args) {
         let start_fast = Instant::now();
         if let Some(decision) = check_fast_path(&ctx) {
-            println!("⚡ {} {:?}", t(Msg::M070), start_fast.elapsed());
-            println!("{}: {:?}", t(Msg::M071), decision);
-            println!("ℹ️  {}", t(Msg::M138));
+            outln!("⚡ {} {:?}", t(Msg::M070), start_fast.elapsed());
+            outln!("{}: {:?}", t(Msg::M071), decision);
+            outln!("ℹ️  {}", t(Msg::M138));
             return;
         }
     }
@@ -700,8 +793,8 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
     let rules = RuleLoader::load_rules(&explicit_paths);
 
     if rules.is_empty() {
-        println!("⚠️ {}", t(Msg::M072));
-        println!(
+        outln!("⚠️ {}", t(Msg::M072));
+        outln!(
             "{}: ai-hook test <command> <script1.js> <script2.js>...",
             t(Msg::M073)
         );
@@ -742,29 +835,31 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
         };
 
         if let Some(err) = res.error {
-            println!(
+            outln!(
                 "  [{:<25}] ❌ {}: {} (in {:?})",
                 res.rule_id,
                 t(Msg::M079),
                 err,
                 res.duration
             );
-            println!("      {}", res.rule_path.display());
+            outln!("      {}", res.rule_path.display());
         } else {
-            println!(
+            outln!(
                 "  [{:<25}] {:<30} (in {:?})",
-                res.rule_id, status, res.duration
+                res.rule_id,
+                status,
+                res.duration
             );
         }
     }
 
-    println!("------------------------------------------------------------");
-    println!("{}: {:?}", t(Msg::M071), final_decision);
-    println!("{}: {:?}", t(Msg::M080), total_elapsed);
+    outln!("------------------------------------------------------------");
+    outln!("{}: {:?}", t(Msg::M071), final_decision);
+    outln!("{}: {:?}", t(Msg::M080), total_elapsed);
 }
 
 fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf]) {
-    println!(
+    outln!(
         "{}: {} {} '{}'",
         t(Msg::M081),
         t(Msg::M082),
@@ -793,7 +888,7 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf
     let rules = RuleLoader::load_rules(&explicit_paths);
 
     if rules.is_empty() {
-        println!("⚠️ {}", t(Msg::M084));
+        outln!("⚠️ {}", t(Msg::M084));
         return;
     }
 
@@ -813,18 +908,18 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf
     let elapsed = start.elapsed();
 
     let avg_us = elapsed.as_micros() as f64 / iterations as f64;
-    println!("============================================================");
-    println!("  {} : {} {}", t(Msg::M086), rules.len(), t(Msg::M087));
-    println!("  {} : {:?}", t(Msg::M088), elapsed);
-    println!("  {} : {}", t(Msg::M089), iterations);
-    println!(
+    outln!("============================================================");
+    outln!("  {} : {} {}", t(Msg::M086), rules.len(), t(Msg::M087));
+    outln!("  {} : {:?}", t(Msg::M088), elapsed);
+    outln!("  {} : {}", t(Msg::M089), iterations);
+    outln!(
         "  {} : {:.2} µs ({:.4} ms) {}",
         t(Msg::M090),
         avg_us,
         avg_us / 1000.0,
         t(Msg::M091)
     );
-    println!("============================================================");
+    outln!("============================================================");
 }
 
 /// Checks whether a directory is writable by attempting a quick probe file
@@ -974,13 +1069,13 @@ fn handle_install(target_dir: Option<PathBuf>) {
             let _ = std::fs::remove_file(&dest_file);
             return;
         }
-        println!("{}:", t(Msg::M097));
-        println!("   {}", dest_file.display());
+        outln!("{}:", t(Msg::M097));
+        outln!("   {}", dest_file.display());
     } else {
-        println!("{}:", t(Msg::M098));
-        println!("   {}", dest_file.display());
+        outln!("{}:", t(Msg::M098));
+        outln!("   {}", dest_file.display());
     }
-    println!();
+    outln!();
 
     // Check if the destination is already in PATH (no environment variables modified)
     let norm_dest = dest_dir
@@ -995,18 +1090,18 @@ fn handle_install(target_dir: Option<PathBuf>) {
     });
 
     if in_path {
-        println!("✓ {}", t(Msg::M099));
-        println!("  '{}' {}.", dest_dir.display(), t(Msg::M100));
-        println!("  {}", t(Msg::M101));
+        outln!("✓ {}", t(Msg::M099));
+        outln!("  '{}' {}.", dest_dir.display(), t(Msg::M100));
+        outln!("  {}", t(Msg::M101));
     } else {
-        println!(
+        outln!(
             "ℹ️  {} '{}' {}.",
             t(Msg::M102),
             dest_dir.display(),
             t(Msg::M103)
         );
-        println!("   {}:", t(Msg::M104));
-        println!("     {}", dest_file.display());
+        outln!("   {}:", t(Msg::M104));
+        outln!("     {}", dest_file.display());
     }
 }
 

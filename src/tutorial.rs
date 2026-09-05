@@ -1,6 +1,8 @@
 /// Renders the tutorial text for a language ("zh"/"en", anything else -> zh).
 /// Kept separate from printing so tests can assert on content without
 /// spamming stdout.
+use crate::outln;
+
 pub fn tutorial_text(lang: &str) -> String {
     let body = if lang.eq_ignore_ascii_case("en") {
         english_tutorial_body()
@@ -14,7 +16,7 @@ pub fn tutorial_text(lang: &str) -> String {
 
 /// Generates and prints the interactive user tutorial and rule authoring guide
 pub fn print_tutorial(lang: &str) {
-    println!("{}", tutorial_text(lang));
+    outln!("{}", tutorial_text(lang));
 }
 
 fn chinese_tutorial_body() -> String {

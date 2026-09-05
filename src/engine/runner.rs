@@ -1,11 +1,13 @@
 use super::sys::create_sys_object;
 use super::{RequestCache, RuleSource, SysContext};
+use crate::errln;
 use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision};
 use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp, RegExpCompiler};
 use rquickjs::{Context, Function, Object, Runtime, Value};
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Default per-rule execution budget. Rules are synchronous QuickJS scripts;
@@ -281,6 +283,27 @@ impl RuleRunner {
     /// Evaluates a single rule in an isolated QuickJS context.
     pub fn execute_rule(&self, rule: &RuleSource, ctx: &HookContext) -> RuleExecutionResult {
         let start = Instant::now();
+
+        // Temporary engine-internal profiler (AI_HOOK_ENGINE_PROFILE=1).
+        // Cached in a OnceLock so the no-profile fast path never re-reads env.
+        static EP: OnceLock<bool> = OnceLock::new();
+        let ep = *EP.get_or_init(|| {
+            std::env::var("AI_HOOK_ENGINE_PROFILE")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "on"
+                })
+                .unwrap_or(false)
+        });
+        let mut marks: Vec<(&'static str, f64)> = Vec::new();
+        macro_rules! emark {
+            ($label:expr) => {
+                if ep {
+                    marks.push(($label, start.elapsed().as_secs_f64() * 1000.0));
+                }
+            };
+        }
+
         let js_context = match Context::custom::<RuleIntrinsics>(&self.runtime) {
             Ok(c) => c,
             Err(e) => {
@@ -293,6 +316,7 @@ impl RuleRunner {
                 };
             }
         };
+        emark!("context_custom");
 
         let sys_ctx = Rc::new(SysContext::new(&ctx.cwd, self.cache.clone()));
         let mut decision = None;
@@ -305,6 +329,7 @@ impl RuleRunner {
         let deadline = Instant::now() + timeout;
         self.runtime
             .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+        emark!("setup_interrupt");
 
         let agent_str = ctx.platform.to_string();
         let session_id = ctx.conversation.as_ref().and_then(|c| c.id.as_deref());
@@ -386,6 +411,7 @@ impl RuleRunner {
             };
             ctx_obj.set("raw", raw_val)?;
             ctx_obj.set("rawInput", ctx.raw_input.as_str())?;
+            emark!("ctx_object");
 
             // 1.5 Setup console.log -> stderr (+ optional file channel)
             let console_obj = Object::new(js_ctx.clone())?;
@@ -396,7 +422,7 @@ impl RuleRunner {
                 js_ctx.clone(),
                 move |args: rquickjs::function::Rest<String>| {
                     let msg = args.0.join(" ");
-                    eprintln!("[{}] [rule-debug] {}", local_now_str(), msg);
+                    errln!("[{}] [rule-debug] {}", local_now_str(), msg);
                     append_rule_log(
                         &agent_for_log,
                         session_for_log.as_deref(),
@@ -409,6 +435,7 @@ impl RuleRunner {
             console_obj.set("log", log_fn.clone())?;
             console_obj.set("error", log_fn)?;
             js_ctx.globals().set("console", console_obj)?;
+            emark!("console_setup");
 
             // 2. Build sys object (fs/git/env/cwd) + sys.log(level, ...msg)
             let sys_obj = create_sys_object(&js_ctx, sys_ctx)?;
@@ -426,7 +453,7 @@ impl RuleRunner {
                         } else {
                             (first, parts.collect::<Vec<_>>().join(" "))
                         };
-                        eprintln!("[{}] [rule-debug][{}] {}", local_now_str(), level, msg);
+                        errln!("[{}] [rule-debug][{}] {}", local_now_str(), level, msg);
                         append_rule_log(
                             &agent_for_log,
                             session_for_log.as_deref(),
@@ -449,6 +476,7 @@ impl RuleRunner {
             sys_obj.set("ruleDir", rule_dir.clone())?;
             sys_obj.set("__filename", rule_path_str)?;
             sys_obj.set("__dirname", rule_dir)?;
+            emark!("sys_object");
 
             // 3. Prepare rule code: rewrite the top-level `export default`
             //    into a `return` statement (comments/strings are respected).
@@ -461,6 +489,7 @@ impl RuleRunner {
                 }
                 None => raw_code.to_string(),
             };
+            emark!("code_prepare");
 
             let wrapper = r#"
                 (function(code, ctx, sys) {
@@ -492,7 +521,9 @@ impl RuleRunner {
             "#;
 
             let eval_fn: Function = js_ctx.eval(wrapper)?;
+            emark!("wrapper_eval");
             let raw_val: Value = eval_fn.call((prepared_code, ctx_obj, sys_obj))?;
+            emark!("rule_exec");
 
             if let Some(obj) = raw_val.as_object() {
                 if obj.get::<_, bool>("__async_error").unwrap_or(false) {
@@ -590,8 +621,28 @@ impl RuleRunner {
 
         // Always clear the interrupt handler so it cannot leak into later rules.
         self.runtime.set_interrupt_handler(None);
+        emark!("clear_interrupt");
 
         let elapsed = start.elapsed();
+        if ep {
+            let mut prev = 0.0f64;
+            errln!("[ai-hook-engine-profile] rule={}", rule.id);
+            for (label, t) in &marks {
+                errln!(
+                    "  {:<18} 累计 {:7.3} ms   本段 {:7.3} ms",
+                    label,
+                    t,
+                    (t - prev).max(0.0)
+                );
+                prev = *t;
+            }
+            errln!(
+                "  {:<18} 累计 {:7.3} ms   本段 {:7.3} ms",
+                "total",
+                elapsed.as_secs_f64() * 1000.0,
+                (elapsed.as_secs_f64() * 1000.0 - prev).max(0.0)
+            );
+        }
 
         if let Err(e) = res
             && error.is_none()

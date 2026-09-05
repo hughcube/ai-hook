@@ -1,4 +1,5 @@
 use crate::i18n::{Msg, t, tf};
+use crate::{errln, outln};
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -143,7 +144,7 @@ fn confirm_custom_repo(repo: &str) -> Result<(), String> {
     if repo == DEFAULT_REPO || env_flag_true("AI_HOOK_ACCEPT_REPO") {
         return Ok(());
     }
-    println!("{}", tf(Msg::M145, &[&repo]));
+    outln!("{}", tf(Msg::M145, &[&repo]));
     let mut answer = String::new();
     match std::io::stdin().read_line(&mut answer) {
         Ok(_) => {
@@ -268,7 +269,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     // somebody else's binary. Require an explicit confirmation.
     confirm_custom_repo(repo)?;
 
-    println!("{} https://github.com/{} ...", t(Msg::M015), repo);
+    outln!("{} https://github.com/{} ...", t(Msg::M015), repo);
 
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let mut req = ureq::get(&api_url)
@@ -301,8 +302,8 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
 
     let latest_version = tag_name.trim_start_matches('v');
 
-    println!("{}: v{}", t(Msg::M021), current_version);
-    println!("{}: {}", t(Msg::M022), tag_name);
+    outln!("{}: v{}", t(Msg::M021), current_version);
+    outln!("{}: {}", t(Msg::M022), tag_name);
 
     let is_newer = match (parse_semver(latest_version), parse_semver(current_version)) {
         (Some(latest), Some(current)) => latest > current,
@@ -310,7 +311,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     };
 
     if !force && !is_newer {
-        println!("✓ {} (v{}).", t(Msg::M023), current_version);
+        outln!("✓ {} (v{}).", t(Msg::M023), current_version);
         return Ok(());
     }
 
@@ -350,7 +351,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         .and_then(|u| u.as_str())
         .ok_or_else(|| t(Msg::M026).to_string())?;
 
-    println!("{}", tf(Msg::M027, &[&download_url]));
+    outln!("{}", tf(Msg::M027, &[&download_url]));
 
     let mut download_req = ureq::get(download_url)
         .timeout(DOWNLOAD_TIMEOUT)
@@ -384,14 +385,14 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     // `--version` probe below cannot serve this purpose: it asks the
     // downloaded file to identify itself, which any payload can fake.
     if env_flag_true("AI_HOOK_SKIP_CHECKSUM") {
-        eprintln!("[ai-hook] {}", t(Msg::M147));
+        errln!("[ai-hook] {}", t(Msg::M147));
     } else {
         let expected = fetch_expected_checksum(&release_val, asset_name, current_version)?;
         let actual = sha256_hex(&binary_bytes);
         if actual != expected {
             return Err(tf(Msg::M140, &[&expected, &actual]));
         }
-        println!("{}", t(Msg::M143));
+        outln!("{}", t(Msg::M143));
     }
 
     let temp_dir = std::env::temp_dir();
@@ -407,7 +408,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
 
     // Handle extraction or raw executable write
     if asset_name.ends_with(".zip") {
-        println!(
+        outln!(
             "{} {:.2} MB ({}) '{}' ...",
             t(Msg::M031),
             binary_bytes.len() as f64 / (1024.0 * 1024.0),
@@ -445,7 +446,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
             return Err(tf(Msg::M037, &[&binary_name]));
         }
     } else if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") {
-        println!(
+        outln!(
             "{} {:.2} MB ({}) '{}' ...",
             t(Msg::M031),
             binary_bytes.len() as f64 / (1024.0 * 1024.0),
@@ -487,7 +488,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         }
     } else {
         // Raw executable binary! Directly save to a fresh temporary file
-        println!(
+        outln!(
             "{} {:.2} MB ({})",
             t(Msg::M031),
             binary_bytes.len() as f64 / (1024.0 * 1024.0),
@@ -510,7 +511,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     // binary must report itself as ai-hook. This catches truncated downloads,
     // HTML error pages and wrong-architecture assets before they can corrupt
     // the installed copy.
-    println!("{}...", t(Msg::M045));
+    outln!("{}...", t(Msg::M045));
     let verify_ok = Command::new(&temp_bin_path)
         .arg("--version")
         .output()
@@ -527,7 +528,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         return Err(t(Msg::M046).to_string());
     }
 
-    println!("{}...", t(Msg::M047));
+    outln!("{}...", t(Msg::M047));
     self_replace::self_replace(&temp_bin_path).map_err(|e| {
         let _ = std::fs::remove_file(&temp_bin_path);
         tf(Msg::M048, &[&e])
@@ -539,8 +540,8 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "ai-hook".to_string());
 
-    println!("✨ {} {}!", t(Msg::M049), tag_name);
-    println!("   {}: {}", t(Msg::M050), current_exe);
+    outln!("✨ {} {}!", t(Msg::M049), tag_name);
+    outln!("   {}: {}", t(Msg::M050), current_exe);
 
     Ok(())
 }
