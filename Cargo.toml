@@ -1,6 +1,6 @@
 [package]
 name = "ai-hook"
-version = "2.0.9"
+version = "2.0.10"
 edition = "2024"
 authors = ["hugh.li"]
 description = "Ultra-fast, sandboxed rule engine for AI-agent hooks (Rust + QuickJS): one rule set for Claude Code, CodeBuddy, Antigravity and Codex"
