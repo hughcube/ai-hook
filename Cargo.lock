@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hook"
-version = "2.0.7"
+version = "2.0.8"
 dependencies = [
  "chrono",
  "clap",
