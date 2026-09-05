@@ -529,12 +529,42 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     }
 
     outln!("{}...", t(Msg::M047));
+
+    // Replace the running binary with a rollback guard: back up the current
+    // executable (same directory, `.bak`) before handing over to
+    // `self_replace`. On Windows the crate makes room by renaming the running
+    // exe away first; if that rename lands but the new binary does not, the
+    // installed command silently vanishes (`ai-hook: command not found`) and
+    // every hook call starts failing. Restoring the backup on error keeps the
+    // command available no matter where the swap is interrupted.
+    let current_exe = std::env::current_exe().ok();
+    let backup_path = current_exe.as_ref().map(|p| {
+        let mut name = p.as_os_str().to_os_string();
+        name.push(".bak");
+        PathBuf::from(name)
+    });
+    let mut backed_up = false;
+    if let (Some(cur), Some(bak)) = (&current_exe, &backup_path) {
+        let _ = std::fs::remove_file(bak);
+        if std::fs::copy(cur, bak).is_ok() {
+            backed_up = true;
+        }
+    }
+
     self_replace::self_replace(&temp_bin_path).map_err(|e| {
+        // Roll the previous binary back so the hook command never disappears.
+        if backed_up && let (Some(cur), Some(bak)) = (&current_exe, &backup_path) {
+            let _ = std::fs::remove_file(cur);
+            let _ = std::fs::copy(bak, cur);
+        }
         let _ = std::fs::remove_file(&temp_bin_path);
         tf(Msg::M048, &[&e])
     })?;
 
     let _ = std::fs::remove_file(&temp_bin_path);
+    if backed_up && let Some(bak) = &backup_path {
+        let _ = std::fs::remove_file(bak);
+    }
 
     let current_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
