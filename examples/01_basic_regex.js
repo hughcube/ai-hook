@@ -9,7 +9,7 @@ export default function(ctx, sys) {
   const cmd = ctx.cmd || "";
 
   // 1. Block root deletion (绝对禁止删除根目录或盘符根)
-  if (/rm\s+-rf\s+(\/|[a-zA-Z]:[/\\]|\*|\/\*)\b/i.test(cmd)) {
+  if (/rm\s+-rf\s+(\/|[a-zA-Z]:[/\\]|\*|\/\*)(\s+|$)/i.test(cmd)) {
     return {
       action: "deny",
       reason: "【硬阻断】严禁在 Agent 中执行整盘或根目录物理删除命令！"
