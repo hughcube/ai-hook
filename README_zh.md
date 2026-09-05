@@ -129,46 +129,7 @@ cargo install --path .
 ai-hook install
 ```
 
-### 2. AI 依赖环境集成与 Shell 配置
-
-`ai-hook` 作为现代化多 Agent 研发环境的首选安全基座，推荐在系统的 Shell 配置文件（如 `~/.zshrc` 或 `~/.bashrc`）中加入 AI 工具链依赖检查与安装命令（`ai-hook` 作为 AI 基础设施的核心第一项依赖）：
-
-```bash
-# 1. 基础命令别名（可选）
-alias ai:hook="ai-hook"
-
-# 2. AI 依赖自检与自动安装命令（推荐加入 ~/.zshrc）
-# 专用于检查并自动安装/升级当前电脑所需的 AI 开发基础设施依赖（ai-hook 为首项基础设施）
-ai:doctor() {
-  echo "🔍 正在检查当前电脑的 AI 依赖与安全拦截基座..."
-  if ! command -v ai-hook >/dev/null 2>&1; then
-    echo "⚠️  未检测到 ai-hook，正在自动下载并安装为全局命令..."
-    if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
-      mkdir -p "$HOME/.local/bin"
-      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -o "$HOME/.local/bin/ai-hook.exe"
-    else
-      local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-      local mach="$(uname -m)"
-      case "$os:$mach" in
-        darwin:arm64|darwin:aarch64) local asset="ai-hook-darwin-aarch64" ;;
-        darwin:x86_64)               local asset="ai-hook-darwin-x86_64" ;;
-        linux:x86_64)                local asset="ai-hook-linux-x86_64" ;;
-        *) echo "暂不支持的平台: $os-$mach,请手动下载或源码编译"; return 1 ;;
-      esac
-      local target_bin="/usr/local/bin/ai-hook"
-      [[ ! -w "/usr/local/bin" ]] && target_bin="$HOME/.local/bin/ai-hook"
-      mkdir -p "$(dirname "$target_bin")"
-      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/${asset}" -o "$target_bin" && chmod +x "$target_bin"
-    fi
-    echo "✨ ai-hook 安装完成！"
-  else
-    echo "✓ ai-hook 已就绪: $(which ai-hook 2>/dev/null || command -v ai-hook) ($(ai-hook --version 2>/dev/null))"
-  fi
-  # 后续可在此函数中继续扩展其他 AI 基础设施或 Agent 插件依赖项...
-}
-```
-
-### 3. 在各大主流 AI Agent 中配置接入（支持传多个脚本）
+### 2. 在各大主流 AI Agent 中配置接入（支持传多个脚本）
 
 `ai-hook` 设计为零外部依赖的通用拦截基座，支持直接通过命令行位置参数传入一个或多个 JS 规则文件：
 

@@ -129,46 +129,7 @@ cargo install --path .
 ai-hook install
 ```
 
-### 2. AI Dependency Management & Shell Integration
-
-`ai-hook` serves as the primary security guardrail in multi-agent workflows. We recommend configuring a unified AI dependency self-test function in your `~/.zshrc` or `~/.bashrc` (with `ai-hook` as the first baseline dependency):
-
-```bash
-# 1. Convenient command alias (optional)
-alias ai:hook="ai-hook"
-
-# 2. Automated AI environment dependency doctor (recommended in ~/.zshrc)
-# Automatically checks and installs/updates local AI toolchain dependencies
-ai:doctor() {
-  echo "🔍 Checking local AI toolchain dependencies & security hook dispatcher..."
-  if ! command -v ai-hook >/dev/null 2>&1; then
-    echo "⚠️  ai-hook not found. Automatically downloading and installing globally..."
-    if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
-      mkdir -p "$HOME/.local/bin"
-      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/ai-hook-windows-x86_64.exe" -o "$HOME/.local/bin/ai-hook.exe"
-    else
-      local os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-      local mach="$(uname -m)"
-      case "$os:$mach" in
-        darwin:arm64|darwin:aarch64) local asset="ai-hook-darwin-aarch64" ;;
-        darwin:x86_64)               local asset="ai-hook-darwin-x86_64" ;;
-        linux:x86_64)                local asset="ai-hook-linux-x86_64" ;;
-        *) echo "Unsupported platform: $os-$mach. Download manually or build from source."; return 1 ;;
-      esac
-      local target_bin="/usr/local/bin/ai-hook"
-      [[ ! -w "/usr/local/bin" ]] && target_bin="$HOME/.local/bin/ai-hook"
-      mkdir -p "$(dirname "$target_bin")"
-      curl -fsSL "https://github.com/hughcube/ai-hook/releases/latest/download/${asset}" -o "$target_bin" && chmod +x "$target_bin"
-    fi
-    echo "✨ ai-hook successfully installed!"
-  else
-    echo "✓ ai-hook is ready: $(which ai-hook 2>/dev/null || command -v ai-hook) ($(ai-hook --version 2>/dev/null))"
-  fi
-  # Extend additional AI tool dependencies here in the future...
-}
-```
-
-### 3. Register in Agent Configurations (Supports Multiple Scripts)
+### 2. Register in Agent Configurations (Supports Multiple Scripts)
 
 `ai-hook` is designed as a universal, zero-dependency safety gate. Pass one or more rule script paths directly as positional CLI arguments:
 
