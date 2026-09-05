@@ -3,11 +3,11 @@ name = "ai-hook"
 version = "2.0.9"
 edition = "2024"
 authors = ["hugh.li"]
-description = "High-performance, multi-agent unified hook dispatcher and autonomous rule engine"
+description = "Ultra-fast, sandboxed rule engine for AI-agent hooks (Rust + QuickJS): one rule set for Claude Code, CodeBuddy, Antigravity and Codex"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/hughcube/ai-hook"
-keywords = ["ai", "agent", "hook", "security", "guardrail"]
+keywords = ["ai-agent", "hook", "guardrail", "quickjs", "claude-code"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]

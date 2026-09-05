@@ -5,9 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **It exists for two things: hiding complexity, and making rules pleasant to write.**  
-> **① Hide the complexity** — hook-protocol differences across agents, platform quirks, and subprocess/context-fetching plumbing are all wrapped into one native binary: the same rules are written once and run everywhere, with no per-agent, per-platform script matrix. On Windows this also collapses the multi-script stutter (measured **500–750ms**) to **2–3ms**.  
+> **① Hide the complexity** — hook-protocol differences across agents, platform quirks, and subprocess/context-fetching plumbing are all wrapped into one native binary: the same rules are written once and run everywhere, with no per-agent, per-platform script matrix. On Windows it also collapses the old one-process-per-fetch stutter into a single process with millisecond-scale in-process evaluation.  
 > **② Better rule authoring** — a rule is just plain JS: a rich `ctx` context, native microsecond `sys` primitives, one uniform deny/confirm/block decision protocol with desktop/terminal interaction, plus `list`/`test`/`bench`/`tutorial` tooling — instead of hand-written shell glue and cross-platform trial and error.  
-> Zero variable pollution, a single-process closed loop, and extreme speed all fall out of this design.
+> Zero variable pollution, a single-process closed loop, and extreme speed all fall out of this design.  
+> Hooks for **Claude Code**, **Google Antigravity**, **CodeBuddy**, and **OpenAI Codex** — one rule set, every agent, on Windows / macOS / Linux.
 
 English Documentation | [简体中文文档](README_zh.md)
 
@@ -34,11 +35,12 @@ Hooks sit on the **hot path** of every tool invocation — they guard before a t
                        ▼ (stdin: JSON payload)
 ┌─────────────────────────────────────────────────────────────┐
 │             Central Dispatcher Binary: ai-hook.exe          │
-│   (Rust Native / Statically Linked / 0 External Deps / ~2ms)│
+│   (Rust Native / Statically Linked / 0 External Deps /       │
+│    in-process ms-scale evaluation)                            │
 │                                                             │
 │  1. Fast Path Short-Circuit:                                │
-│     Read-only safe commands (git status, ls, pwd) exit in   │
-│     < 0.01ms without loading JS VM                          │
+│     Read-only safe commands (git status, ls, pwd) short-    │
+│     circuit in-process (no JS VM started)                    │
 │  2. Native Serde JSON Ingress Parser:                       │
 │     Recognizes AGY (.toolCall), CC (.tool_input), Codex     │
 │  3. Explicit Rule Loading (CLI args / AI_HOOK_RULES / ./.ai-hook):│
@@ -50,8 +52,8 @@ Hooks sit on the **hot path** of every tool invocation — they guard before a t
 │     │ - every rule runs in its own sandbox, zero merging │   │
 │     └───────────────────────────────────────────────────┘   │
 │  4. Autonomous Prerequisite Data Access (Native sys SDK):   │
-│     - sys.git.branch(): Pure memory .git/HEAD read (0.02ms) │
-│     - sys.fs.readText(): Native Rust file I/O (0.01ms)      │
+│     - sys.git.branch(): Pure in-memory .git/HEAD read (µs)   │
+│     - sys.fs.readText(): Native Rust file I/O (µs, in-engine)│
 │     - Request-Scoped Cache: Automatic single-disk read      │
 │  5. Decision Egress & Real Interactive GUI:                 │
 │     - YOLO/Unattended mode: Native 60s countdown popup      │
@@ -67,9 +69,9 @@ Hooks sit on the **hot path** of every tool invocation — they guard before a t
 ## ✨ Key Features
 
 - 🚀 **Extreme Performance**:
-  - Pure Rust native PE binary; cold startup takes only **1.5ms** on Windows.
-  - Safe read-only commands short-circuit via Fast Path in **< 0.01ms**.
-  - Complete multi-rule evaluation finishes in **1.3ms** — a **500x speedup** over legacy Windows Bash hooks (measured on Windows 11 x64).
+  - Single Rust PE binary with zero runtime deps: one hook invocation measures **~7ms** end-to-end (median, Windows 11 x64, node-style host), and almost all of it is the host's process-creation cost — independent of ai-hook itself;
+  - Read-only safe commands short-circuit in-process via Fast Path without loading the JS VM (near-zero decision cost);
+  - Rule evaluation runs in-process at millisecond scale (measured gap to Fast Path is <1ms); each extra rule adds only ~0.2ms.
 - 🧩 **Write Once, Run in Every Agent**:
   - One binary auto-detects each host's payload/events and emits each host's output protocol (AGY `.toolCall`, CC `.tool_input`, Codex `turn_id`…), so there is no per-agent hook to maintain;
   - The same JS rule files drop straight into Antigravity, Claude Code, CodeBuddy, or Codex with **zero migration cost**.
@@ -88,15 +90,17 @@ Hooks sit on the **hot path** of every tool invocation — they guard before a t
 
 ---
 
-## 📊 Performance Benchmarks (Windows 11 x64)
+## 📊 Performance Benchmarks (Windows 11 x64 / node-style host)
 
-| Metric | Legacy Bash Hooks (10 scripts) | ai-hook (Rust + Autonomous Rules) | Improvement |
+> **Measurement note**: most of a hook invocation's latency is **process creation & loading, triggered by the host** — an empty probe binary measures the same as ai-hook. ai-hook only controls in-process rule evaluation, so the two are reported separately instead of crediting host-side overhead to ai-hook.
+
+| Metric | Legacy Bash Hooks (10 scripts) | ai-hook | Notes |
 | :--- | :--- | :--- | :--- |
-| **Process Count** | **10** `bash.exe` instances | **Strictly 1** `ai-hook.exe` | **-90% processes** |
-| **Read-only Commands** | 420ms ~ 750ms | **< 0.02 ms** (Fast Path) | **20,000x faster** |
-| **End-to-End Evaluation**| 500ms ~ 750ms (noticeable stutter) | **1.34 ms** (1/10th of a 60fps frame) | **500x faster** |
-| **Duplicate File I/O** | Multiple redundant reads | **0** (Request-Scoped Memory Cache) | Instant memory hit |
-| **GUI Popup Launch** | ~300ms (PowerShell cold start) | **Immediate / Native** | Desktop responsive |
+| **Process creation** | 10 `bash.exe` spawns per call | 1 `ai-hook.exe` spawn | 90% fewer process creations |
+| **Full hook lifecycle** | 420–750ms (historical measurement) | **~7ms median** (fast-path 6.7 / engine 6.9) | Gap mostly comes from 10→1 processes |
+| **Read-only commands (Fast Path)** | Boots the whole script chain | In-process short-circuit, no JS VM | Near-zero decision cost |
+| **Rule evaluation (in-process)** | Re-spawns `date`/`git`/`cat`/`curl` per rule | Native `sys` reads + request-scoped cache; <1ms per rule, ~0.2ms per extra rule | Measured engine-side |
+| **GUI popup** | Spawns PowerShell, ~300ms cold start | Raised natively in-process | No second process |
 
 ---
 
@@ -229,11 +233,11 @@ Subprocess spawning is eliminated for standard reads. In addition, controlled co
 
 | Method / Property | Return Type | Description & Latency |
 | :--- | :--- | :--- |
-| `sys.git.branch()` | `string?` | **0.02ms** memory parse of `.git/HEAD` for current branch (e.g. `"master"`) |
+| `sys.git.branch()` | `string?` | In-engine pure-memory parse of `.git/HEAD` for the current branch (e.g. `"master"`), 0 subprocesses |
 | `sys.git.root()` | `string?` | Root directory path of current Git repository |
 | `sys.git.status()` | `string` | Quick status summary |
-| `sys.fs.exists(path)` | `boolean` | **0.01ms** check if file or directory exists (request-scoped cached) |
-| `sys.fs.readText(path)` | `string?` | **0.01ms** read file text (cached in request-scoped memory) |
+| `sys.fs.exists(path)` | `boolean` | In-engine existence check for relative/absolute paths (request-scoped cached) |
+| `sys.fs.readText(path)` | `string?` | In-engine native file read (e.g. `.env`, `package.json`), request-scoped cached |
 | `sys.fs.list([dir])` | `string[]` | List files and directories in path |
 | `sys.env("KEY")` | `string?` | **< 1 µs** get environment variable (or `sys.env.get("KEY")`) |
 | `sys.cwd()` | `string` | Current working directory |

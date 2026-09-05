@@ -5,9 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **为两件事而生：屏蔽复杂度，与舒服地写规则。**  
-> **① 屏蔽复杂度**——把多 Agent 的 Hook 协议差异、平台差异、进程与上下文获取等底层细节，全部封装进单个原生二进制：同一套规则一次编写、处处运行，不再为每个 Agent / 每套平台各维护一份脚本；在 Windows 上还顺带把多脚本连开进程的卡顿（实测 **500~750ms**）压到 **2~3ms**。  
+> **① 屏蔽复杂度**——把多 Agent 的 Hook 协议差异、平台差异、进程与上下文获取等底层细节，全部封装进单个原生二进制：同一套规则一次编写、处处运行，不再为每个 Agent / 每套平台各维护一份脚本；在 Windows 上，还顺带把旧方案“每次调用连开十余个脚本进程”的顿挫收敛为单进程内的毫秒级评估。  
 > **② 舒服地写规则**——规则就是普通 JS：丰富的 `ctx` 上下文、原生微秒级 `sys` 自治 API、统一的 deny/confirm/block 决策协议与桌面/终端交互，配合 `list`/`test`/`bench`/`tutorial` 调试工具，替代手写 Shell 胶水与跨平台试错。  
-> 零变量污染、单进程闭环与极致速度，都是这套设计的自然结果。
+> 零变量污染、单进程闭环与极致速度，都是这套设计的自然结果。  
+> 一套规则，通吃 **Claude Code**、**Google Antigravity**、**CodeBuddy**、**OpenAI Codex**——Windows / macOS / Linux 行为一致。
 
 [English Documentation](README.md) | 简体中文文档
 
@@ -34,11 +35,11 @@ Hook 位于每次工具调用的**关键路径**上：调用前要评估、调�
                        ▼ (stdin: JSON payload)
 ┌─────────────────────────────────────────────────────────────┐
 │             中央调度基座二进制: ai-hook.exe                   │
-│   (Rust 原生编译 / 静态链接 / 零外部依赖 / 2~3ms 物理级瞬发)    │
+│   (Rust 原生编译 / 静态链接 / 零外部依赖 / 进程内毫秒级评估)   │
 │                                                             │
 │  1. Fast Path 前置短路:                                     │
-│     只读安全命令 (git status, ls, pwd 等) 0.01ms 放行，不启引擎│
-│  2. 原生 Serde JSON 纳秒级解析:                              │
+│     只读安全命令 (git status, ls, pwd 等) 进程内近零放行      │
+│  2. 原生 Serde JSON 快速解析:                               │
 │     自动识别 AGY (.toolCall) / CC (.tool_input) / Codex (turn_id)│
 │  3. 显式加载规则脚本 (CLI 参数 / AI_HOOK_RULES / ./.ai-hook):   │
 │     ┌───────────────────────────────────────────────────┐   │
@@ -49,8 +50,8 @@ Hook 位于每次工具调用的**关键路径**上：调用前要评估、调�
 │     │ - 每条规则在独立沙箱执行,零合并零污染    │   │
 │     └───────────────────────────────────────────────────┘   │
 │  4. 规则自治前置数据获取 (sys 原生能力，拒绝外部子进程):         │
-│     - sys.git.branch() 纯内存读取 .git/HEAD (0.02ms)        │
-│     - sys.fs.readText() 原生 Rust 文件 I/O (0.01ms)         │
+│     - sys.git.branch() 纯内存解析 .git/HEAD（引擎内微秒级）   │
+│     - sys.fs.readText() 原生 Rust 文件 I/O（引擎内微秒级）    │
 │     - Request-Scoped Cache: 单次请求内 I/O 自动单例缓存     │
 │  5. 决策中枢与系统级真交互:                                   │
 │     - 免确认模式/高危: 呼出 60s 倒计时吸附置顶弹窗          │
@@ -66,9 +67,9 @@ Hook 位于每次工具调用的**关键路径**上：调用前要评估、调�
 ## ✨ 核心特性
 
 - 🚀 **极致性能**：
-  - 采用 Rust 原生 PE 二进制，Windows 下冷启动耗时仅 **1.5ms**；
-  - 常见只读指令由 Fast Path 在 **0.01ms** 内短路放行；
-  - 全量规则评估仅需 **0.5~1.0ms**，整体验证 **2~3ms**（Windows 11 x64 实测，相比旧方案提速 **200+ 倍**）。
+  - Rust 原生 PE 单二进制、零运行时依赖；一次 hook 调用完整生命周期实测中位数 **~7ms**（Windows 11 x64 / node 式宿主），其中绝大部分是宿主创建进程的固定成本，与 ai-hook 自身几乎无关；
+  - 只读安全命令由 Fast Path 进程内短路，不加载 JS 引擎，判定成本近零；
+  - 规则评估在进程内毫秒级完成（实测 Fast Path 与引擎路径差值 <1ms），每新增一条规则仅增加 ~0.2ms。
 - 🧩 **一处编写，处处通用（Universal Across Agents）**：
   - 单二进制内建各宿主 Payload/事件识别并输出各宿主协议（AGY `.toolCall`、CC `.tool_input`、Codex `turn_id`…），为哪个 Agent 接入都无需另写一套 Hook；
   - 同一份 JS 规则文件可在 Antigravity / Claude Code / CodeBuddy / Codex 间直接复用，切换 Agent **零迁移成本**。
@@ -88,15 +89,17 @@ Hook 位于每次工具调用的**关键路径**上：调用前要评估、调�
 
 ---
 
-## 📊 性能实测指标对比（Windows 11 真机）
+## 📊 性能基准（Windows 11 x64 / node 式宿主实测）
 
-| 指标 | 旧方案（10个独立 Bash 脚本） | ai-hook 基座（Rust + 自治规则） | 提升幅度 |
+> **口径说明**：一次 hook 调用的耗时中，**进程创建与加载（由宿主触发）占绝大多数**——实测空程序与 ai-hook 相当；ai-hook 自身可控的只有进程内规则评估，故分列计量，避免把宿主侧开销误算成 ai-hook 的“启动成本”。
+
+| 指标 | 旧方案（10 个独立 Bash 脚本） | ai-hook 基座 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **进程创建数量** | **10 个** `bash.exe` | **严格仅 1 个** `ai-hook.exe` | **减少 90%** |
-| **只读命令耗时** | 420ms ~ 750ms | **< 0.02 毫秒** (Fast Path) | **提速 20,000+ 倍** |
-| **端到端规则总耗时** | 500ms ~ 750ms (肉眼卡顿) | **2.5 ~ 3.5 毫秒** (1/5 帧画面) | **提速 200 倍** |
-| **单次请求重复 I/O** | 多次读盘 | **0 次** (Request-Scoped 缓存) | 内存级命中 |
-| **交互弹窗延迟** | ~300ms (PowerShell 冷启动) | **立即秒级呼出** | 桌面级响应 |
+| **进程创建数量** | 每次调用 10 个 `bash.exe` 串行 | 仅 1 个 `ai-hook.exe` | 减少 90% 进程创建 |
+| **hook 调用全生命周期** | 420~750ms（历史实测） | **~7ms 中位数**（fast-path 6.7 / 引擎 6.9） | 差异主因是进程数 10→1 |
+| **只读命令（Fast Path）** | 需启动整条脚本链 | 进程内短路，不加载 JS 引擎 | 判定成本近零 |
+| **规则评估（进程内）** | 每规则反复 spawn `date`/`git`/`cat`/`curl` | 原生 sys 直读 + 请求级缓存；单规则 <1ms、每增一条 ~0.2ms | 引擎侧实测 |
+| **GUI 弹窗** | 另起 PowerShell，冷启动 ~300ms | 进程内原生拉起 | 无二次进程 |
 
 ---
 
@@ -230,11 +233,11 @@ export default function(ctx, sys) {
 
 | 方法 / 属性 | 返回类型 | 说明与性能 |
 | :--- | :--- | :--- |
-| `sys.git.branch()` | `string?` | **0.02ms** 内存直读 `.git/HEAD` 获取当前 Git 分支名（如 `"master"`, `"main"`） |
+| `sys.git.branch()` | `string?` | **引擎内纯内存**解析 `.git/HEAD` 获取当前 Git 分支名（如 `"master"`、`"main"`），0 外部子进程 |
 | `sys.git.root()` | `string?` | 获取当前 Git 仓库根目录绝对路径 |
 | `sys.git.status()` | `string` | 快速返回 Git 状态简报 |
-| `sys.fs.exists(path)` | `boolean` | **0.01ms** 检查相对/绝对路径文件是否存在（带请求内单例缓存） |
-| `sys.fs.readText(path)` | `string?` | **0.01ms** 极速读取文本文件（如 `.env`, `package.json`），自动命中请求级单例缓存 |
+| `sys.fs.exists(path)` | `boolean` | 引擎内检查相对/绝对路径文件是否存在（带请求内单例缓存） |
+| `sys.fs.readText(path)` | `string?` | 引擎内原生文件读取（如 `.env`、`package.json`），自动命中请求级单例缓存 |
 | `sys.fs.list([dir])` | `string[]` | 列出目标目录下的所有文件名 |
 | `sys.env("KEY")` | `string?` | **< 1 µs** 获取宿主环境变量，亦可使用 `sys.env.get("KEY")` |
 | `sys.cwd()` | `string` | 获取当前工作目录 |
