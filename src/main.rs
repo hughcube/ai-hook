@@ -6,6 +6,7 @@ use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{ConfirmPath, HookContext, HookDecision, confirm_path};
 use ai_hook::ui::GuiDialog;
 use clap::FromArgMatches;
+use std::ffi::OsString;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -34,10 +35,74 @@ fn profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Wall-clock instant at which the OS created this process.
+///
+/// `Instant::now()` inside `main` cannot see anything that happened before
+/// `main`: PE image mapping, DLL loading, relocations, C/Rust runtime init.
+/// On Windows that invisible prefix dominates hook latency, so the profiler
+/// anchors its origin at process creation instead. `GetProcessTimes` reports
+/// the creation FILETIME the kernel recorded at CreateProcess time; the only
+/// conversion needed is the offset to `Instant`'s monotonic clock, obtained
+/// by sampling both clocks back to back.
+#[cfg(windows)]
+fn process_creation_instant() -> Option<Instant> {
+    #[repr(C)]
+    struct FileTime {
+        lo: u32,
+        hi: u32,
+    }
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn GetProcessTimes(
+            h: *mut core::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn GetSystemTimeAsFileTime(t: *mut FileTime);
+    }
+    unsafe {
+        let mut creation = FileTime { lo: 0, hi: 0 };
+        let mut exit = FileTime { lo: 0, hi: 0 };
+        let mut kernel = FileTime { lo: 0, hi: 0 };
+        let mut user = FileTime { lo: 0, hi: 0 };
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return None;
+        }
+        // Sample both clocks as close together as possible.
+        let mut now_ft = FileTime { lo: 0, hi: 0 };
+        GetSystemTimeAsFileTime(&mut now_ft);
+        let now = Instant::now();
+
+        let ticks = |f: &FileTime| ((f.hi as u64) << 32) | f.lo as u64;
+        let age_ticks = ticks(&now_ft).saturating_sub(ticks(&creation));
+        Some(now - std::time::Duration::from_nanos(age_ticks.saturating_mul(100)))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_creation_instant() -> Option<Instant> {
+    None
+}
+
+/// Profiler origin: process creation when the platform can report it,
+/// `main` entry otherwise (Unix has no cheap equivalent).
+fn prof_origin() -> Instant {
+    process_creation_instant().unwrap_or_else(Instant::now)
+}
+
 macro_rules! prof_init {
     () => {
         if profile_enabled() {
-            PROF_T0.with(|c| c.set(Some(Instant::now())));
+            PROF_T0.with(|c| c.set(Some(prof_origin())));
         }
     };
 }
@@ -65,9 +130,16 @@ macro_rules! prof_flush {
                 if marks.is_empty() {
                     return;
                 }
-                eprintln!("[ai-hook-profile] 分段耗时(从 main 入口起,创建→main 不在内):");
+                eprintln!("[ai-hook-profile] 进程全生命周期(原点=进程创建,含 main 之前的加载开销)");
+                let mut prev = 0.0f64;
                 for (label, t) in &marks {
-                    eprintln!("  {:<30} @ {:.3} ms", label, t);
+                    eprintln!(
+                        "  {:<38} 累计 {:7.3} ms   本段 {:7.3} ms",
+                        label,
+                        t,
+                        (t - prev).max(0.0)
+                    );
+                    prev = *t;
                 }
             });
         }
@@ -91,6 +163,108 @@ fn get_binary_info_help() -> String {
     )
 }
 
+/// Subcommand names defined by the derive macro. When the first positional
+/// argument is one of these, argument handling belongs to clap.
+const SUBCOMMANDS: [&str; 7] = [
+    "list", "test", "bench", "install", "update", "tutorial", "guide",
+];
+
+/// Hand-rolled parse of the argument shapes a hook configuration produces.
+///
+/// Constructing clap's `Command` — every subcommand plus every localized help
+/// string — measures ~0.2 ms, i.e. as much as a whole rule evaluation. Hosts
+/// only ever pass global flags and rule paths, so those are parsed here in
+/// nanoseconds. Anything not recognized returns `None` and the caller falls
+/// back to clap, which keeps the derive definitions authoritative; there is
+/// no second, divergent grammar to keep in sync.
+///
+/// Mirrors clap's `trailing_var_arg` on `scripts`: the first positional and
+/// everything after it is a script path, even when it looks like a flag.
+fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
+    let mut cli = Cli::default();
+    let mut i = 0usize;
+
+    while i < args.len() {
+        // Non-UTF-8 is legal on Unix; let clap report it properly.
+        let arg = args[i].to_str()?;
+
+        // 1. Explicit end of options: everything after is a script path.
+        if arg == "--" {
+            cli.scripts.extend(args[i + 1..].iter().map(PathBuf::from));
+            return Some(cli);
+        }
+
+        // 2. Long flag: --name or --name=value
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            // Inline values on boolean flags are not valid clap syntax;
+            // letting them reach clap keeps the error message consistent.
+            match name {
+                "no-gui" if inline.is_none() => cli.no_gui = true,
+                "force-gui" | "force-popup" if inline.is_none() => cli.force_gui = true,
+                "dry-run" if inline.is_none() => cli.dry_run = true,
+                "allow-on-error" if inline.is_none() => cli.allow_on_error = true,
+                "no-fast-path" if inline.is_none() => cli.no_fast_path = true,
+                "rule" => {
+                    let value = match inline {
+                        Some(v) => v.to_string(),
+                        None => args.get(i + 1)?.to_str()?.to_string(),
+                    };
+                    cli.rule.push(PathBuf::from(value));
+                    if inline.is_none() {
+                        i += 1;
+                    }
+                }
+                "timeout" => {
+                    let value = match inline {
+                        Some(v) => v,
+                        None => args.get(i + 1)?.to_str()?,
+                    };
+                    cli.timeout = Some(value.parse::<u32>().ok()?);
+                    if inline.is_none() {
+                        i += 1;
+                    }
+                }
+                _ => return None,
+            }
+            i += 1;
+            continue;
+        }
+
+        // 3. Short flag. Only `-r` takes a value and every other global flag
+        //    is long-only, so no clustering needs to be supported.
+        if arg.len() > 1 && arg.starts_with('-') {
+            let (name, inline) = match arg[1..].split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (&arg[1..], None),
+            };
+            if name != "r" {
+                return None;
+            }
+            let value = match inline {
+                Some(v) => v.to_string(),
+                None => args.get(i + 1)?.to_str()?.to_string(),
+            };
+            cli.rule.push(PathBuf::from(value));
+            i += if inline.is_none() { 2 } else { 1 };
+            continue;
+        }
+
+        // 4. First positional. A subcommand belongs to clap; anything else is
+        //    a script path, and so is everything after it (trailing var-arg).
+        if SUBCOMMANDS.contains(&arg) {
+            return None;
+        }
+        cli.scripts.extend(args[i..].iter().map(PathBuf::from));
+        return Some(cli);
+    }
+
+    Some(cli)
+}
+
 fn parse_args() -> Cli {
     let mut raw_args = std::env::args_os();
     let bin = raw_args.next();
@@ -98,15 +272,15 @@ fn parse_args() -> Cli {
 
     match first {
         None => {
-            // 没有任何参数 (95% 的 Agent Hook 调用场景)，零 Clap 构建，零帮助文本堆分配
+            // 没有任何参数 (最常见的 Agent Hook 调用场景)，零 Clap 构建，零帮助文本堆分配
             Cli::default()
         }
         Some(first_arg) => {
-            let mut all_args = vec![bin.unwrap_or_default(), first_arg];
-            all_args.extend(raw_args);
+            let mut rest: Vec<OsString> = vec![first_arg];
+            rest.extend(raw_args);
 
             // 检查是否需要帮助或版本信息
-            let wants_help_or_version = all_args.iter().any(|a| {
+            let wants_help_or_version = rest.iter().any(|a| {
                 let s = a.to_string_lossy();
                 s == "-h" || s == "--help" || s == "-V" || s == "--version"
             });
@@ -116,20 +290,32 @@ fn parse_args() -> Cli {
                 let cmd = localized_command()
                     .after_help(help_info.clone())
                     .after_long_help(help_info);
-                let matches = cmd.get_matches_from(&all_args);
-                Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
-            } else {
-                use clap::Parser;
-                match Cli::try_parse_from(&all_args) {
-                    Ok(parsed) => parsed,
-                    Err(e) => {
-                        let help_info = get_binary_info_help();
-                        let cmd = localized_command()
-                            .after_help(help_info.clone())
-                            .after_long_help(help_info);
-                        let _ = cmd.get_matches_from(&all_args);
-                        e.exit();
-                    }
+                let all: Vec<OsString> = std::iter::once(bin.unwrap_or_default())
+                    .chain(rest.iter().cloned())
+                    .collect();
+                let matches = cmd.get_matches_from(&all);
+                return Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+            }
+
+            // 快速路径：宿主实际会产生的参数形态，不构造 clap
+            if let Some(cli) = parse_simple_args(&rest) {
+                return cli;
+            }
+
+            // 回退 clap：子命令、未知 flag、解析错误
+            let all_args: Vec<OsString> = std::iter::once(bin.unwrap_or_default())
+                .chain(rest)
+                .collect();
+            use clap::Parser;
+            match Cli::try_parse_from(&all_args) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let help_info = get_binary_info_help();
+                    let cmd = localized_command()
+                        .after_help(help_info.clone())
+                        .after_long_help(help_info);
+                    let _ = cmd.get_matches_from(&all_args);
+                    e.exit();
                 }
             }
         }
@@ -138,8 +324,11 @@ fn parse_args() -> Cli {
 
 fn main() {
     prof_init!();
+    // First mark = the invisible prefix: PE mapping, DLL loading, relocations,
+    // C + Rust runtime init. On Windows this is most of the hook's latency.
+    prof_mark!("① main 入口前(加载器/DLL/Rust 初始化)");
     let args = parse_args();
-    prof_mark!("clap 解析完成");
+    prof_mark!("② 参数解析完成");
 
     match args.command {
         Some(Commands::List { ref scripts }) => handle_list(&args, scripts),
@@ -192,12 +381,15 @@ fn collect_target_rules(args: &Cli, extra_scripts: Option<&[PathBuf]>) -> Vec<Pa
 /// Prints hook output only when non-empty (empty output = allow / no decision
 /// in every host protocol, so we must never print whitespace-only noise).
 fn print_output(output: &str) {
-    prof_flush!();
     if !output.is_empty() {
         println!("{}", output);
     }
     use std::io::Write;
     let _ = std::io::stdout().flush();
+    // Final mark is taken after flushing the decision, so it reflects the
+    // whole lifecycle; everything after it is `exit()` teardown.
+    prof_mark!("⑦ 输出已写出");
+    prof_flush!();
     let _ = std::io::stderr().flush();
     std::process::exit(0);
 }
@@ -261,14 +453,14 @@ fn handle_dispatch(args: &Cli) {
         return;
     }
 
-    prof_mark!("stdin 读取完成");
+    prof_mark!("③ stdin 读取完成");
     // Debug aid (AI_HOOK_LOG_EXTERNAL=1): persist the raw payload BEFORE
     // parsing so shape / platform-detection problems stay diagnosable even
     // when parse itself fails. Never fails the hook.
     ai_hook::engine::log_inbound_payload(&buffer);
 
     let ctx = HookContext::parse(&buffer);
-    prof_mark!("payload parse");
+    prof_mark!("④ payload 解析完成");
 
     // A payload that is not valid JSON carries no tool semantics at all.
     // Failing silently (empty output would read as "allow") or running rules
@@ -329,7 +521,7 @@ fn handle_dispatch(args: &Cli) {
 
     // 3. Load explicit rules (no full-disk auto traversal)
     let rules = RuleLoader::load_rules(&explicit_paths);
-    prof_mark!("规则文件加载");
+    prof_mark!("⑤ 规则文件加载");
 
     if rules.is_empty() {
         // No gate at all. If the operator pointed at paths that loaded nothing
@@ -358,7 +550,7 @@ fn handle_dispatch(args: &Cli) {
         };
 
         let (decision, _) = runner.evaluate_all(&rules, &ctx, policy);
-        prof_mark!("规则执行");
+        prof_mark!("⑥ 规则执行完成");
 
         // 4. Handle confirmation & GUI prompt (gui 三态语义,2026-09-05 约定):
         //    gui:true / force_gui → 强制弹窗(穿透 --no-gui,仅 dry-run 演练除外);
@@ -815,5 +1007,73 @@ fn handle_install(target_dir: Option<PathBuf>) {
         );
         println!("   {}:", t(Msg::M104));
         println!("     {}", dest_file.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    /// The hand-rolled fast path must agree with clap on every shape it
+    /// claims to handle. If the two ever drift, this fails rather than
+    /// silently changing how a host's hook command line is interpreted.
+    #[test]
+    fn fast_arg_parser_matches_clap() {
+        let cases: &[&[&str]] = &[
+            &[],
+            &["rules/a.js"],
+            &["rules/a.js", "rules/b.js"],
+            &["--no-gui"],
+            &["--force-gui"],
+            &["--dry-run"],
+            &["--allow-on-error"],
+            &["--no-fast-path"],
+            &["--rule", "rules/a.js"],
+            &["--rule=rules/a.js"],
+            &["-r", "rules/a.js"],
+            &["-r=rules/a.js"],
+            &["--timeout", "30"],
+            &["--timeout=30"],
+            &["--no-gui", "--rule", "rules/a.js", "extra.js"],
+            &["--", "weird --name.js"],
+            // trailing_var_arg: once a positional is seen, flags are scripts
+            &["a.js", "--no-gui"],
+        ];
+
+        for case in cases {
+            let mut with_bin = vec![OsString::from("ai-hook")];
+            with_bin.extend(os(case));
+            let expected = Cli::try_parse_from(&with_bin)
+                .unwrap_or_else(|e| panic!("clap 拒绝了用例 {case:?}: {e}"));
+            let got = parse_simple_args(&os(case))
+                .unwrap_or_else(|| panic!("快速路径未覆盖应当覆盖的用例: {case:?}"));
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{expected:?}"),
+                "快速路径与 clap 结果不一致: {case:?}"
+            );
+        }
+    }
+
+    /// Anything the fast path does not fully understand must be handed back
+    /// to clap, which owns the error messages and the subcommand grammar.
+    #[test]
+    fn fast_arg_parser_defers_everything_else_to_clap() {
+        for sub in SUBCOMMANDS {
+            assert!(
+                parse_simple_args(&os(&[sub])).is_none(),
+                "子命令 {sub} 应交回 clap 处理"
+            );
+        }
+        assert!(parse_simple_args(&os(&["--nope"])).is_none());
+        assert!(parse_simple_args(&os(&["--rule"])).is_none());
+        assert!(parse_simple_args(&os(&["--timeout", "abc"])).is_none());
+        assert!(parse_simple_args(&os(&["--timeout"])).is_none());
+        assert!(parse_simple_args(&os(&["-x"])).is_none());
     }
 }

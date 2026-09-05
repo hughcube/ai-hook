@@ -1,0 +1,45 @@
+# Windows 启动速度优化（实测于 x86_64-pc-windows-msvc）
+#
+# ai-hook 作为一个 hook 程序跑在 Agent 的每一次工具调用上，进程生命周期
+# 的绝大部分不在 main() 里，而在 main 之前：PE 映射、DLL 加载、CRT 与 Rust
+# 运行时初始化。实测（空 main 的 100KB 探针，同一目录内对比中位数）：
+#
+#   - 静态导入 1 个额外 DLL ≈ +0.3~2.2 ms，其中 shell32 最贵（+2.2 ms）
+#   - 静态 CRT 把 UCRT 的 5 个 api-ms-win-crt-* api-set 从导入表移除
+#     （9 个 DLL -> 3 个），约 -0.5 ms
+#   - 二进制体积与启动速度无关：给同一个 exe 追加 6MB 数据，pre-main
+#     毫无变化（8.65 vs 8.83 ms），所以这里不为体积牺牲性能，反之亦然
+#
+# 下面的 DLL 全部只被低频路径使用，改成 /DELAYLOAD 后它们不再参与启动，
+# 首次调用时才加载，功能完全不变：
+#   shell32     <- self-replace（仅 `ai-hook update` 替换自身时用到）
+#   ws2_32      <- ureq（仅 sys.http / `ai-hook update` 联网时用到）
+#   advapi32    <- SystemFunction036(RtlGenRandom)，仅哈希随机种子使用
+#   userenv     <- GetUserProfileDirectoryW
+#   bcrypt      <- BCryptGenRandom
+#
+# 延迟加载在 MSVC 下需要 delayimp.lib（MSVC 工具链自带）。GNU 工具链的
+# Windows 目标不在此项目的发布矩阵内，故不配置。
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/DELAYLOAD:shell32.dll",
+    "-C", "link-arg=/DELAYLOAD:ws2_32.dll",
+    "-C", "link-arg=/DELAYLOAD:advapi32.dll",
+    "-C", "link-arg=/DELAYLOAD:userenv.dll",
+    "-C", "link-arg=/DELAYLOAD:bcrypt.dll",
+    "-C", "link-arg=/DELAYLOAD:bcryptprimitives.dll",
+    "-C", "link-arg=delayimp.lib",
+]
+
+[target.i686-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/DELAYLOAD:shell32.dll",
+    "-C", "link-arg=/DELAYLOAD:ws2_32.dll",
+    "-C", "link-arg=/DELAYLOAD:advapi32.dll",
+    "-C", "link-arg=/DELAYLOAD:userenv.dll",
+    "-C", "link-arg=/DELAYLOAD:bcrypt.dll",
+    "-C", "link-arg=/DELAYLOAD:bcryptprimitives.dll",
+    "-C", "link-arg=delayimp.lib",
+]

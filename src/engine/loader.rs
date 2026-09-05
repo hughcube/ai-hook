@@ -10,6 +10,11 @@ pub struct RuleSource {
 
 pub struct RuleLoader;
 
+/// Only `.js` files are rules.
+fn is_js(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("js")
+}
+
 impl RuleLoader {
     /// Loads only explicitly passed scripts or dedicated rules directory.
     /// Does NOT perform whole-system or plugins-wide directory traversal.
@@ -56,34 +61,45 @@ impl RuleLoader {
     }
 
     fn collect_from_path(path: &Path, files: &mut Vec<RuleSource>, seen: &mut HashSet<PathBuf>) {
-        if !path.exists() {
+        // One stat to classify the path. `exists()` followed by `is_file()`
+        // / `is_dir()` would cost two, and this runs on the critical path of
+        // every single hook invocation.
+        if path.is_file() {
+            if is_js(path) {
+                Self::add_file(path, files, seen);
+            }
             return;
         }
 
-        if path.is_file() {
-            if path.extension().and_then(|s| s.to_str()) == Some("js") {
-                Self::add_file(path, files, seen);
-            }
-        } else if path.is_dir() {
-            // Directory rules are evaluated in deterministic file-name order:
-            // `evaluate_all` short-circuits on the first Confirm/Deny, so the
-            // load order must not depend on filesystem enumeration order.
-            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(path)
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file())
-                        .collect()
-                })
-                .unwrap_or_default();
-            paths.sort();
+        if !path.is_dir() {
+            return;
+        }
 
-            for p in paths {
-                if p.extension().and_then(|s| s.to_str()) == Some("js") {
-                    Self::add_file(&p, files, seen);
-                }
-            }
+        // `DirEntry::file_type()` is already known from the directory
+        // enumeration — on Windows FindFirstFile returns the attributes with
+        // the entry, so it is free — whereas `path.is_file()` would re-stat
+        // every entry. Symlinks are kept so rules shared via symlinks load as
+        // before (`read_to_string` below follows them; a broken link simply
+        // fails the read and is skipped). Filtering on the extension here
+        // keeps `paths` small before the sort.
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
+                    .map(|e| e.path())
+                    .filter(|p| is_js(p))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Directory rules are evaluated in deterministic file-name order:
+        // `evaluate_all` short-circuits on the first Confirm/Deny, so the
+        // load order must not depend on filesystem enumeration order.
+        paths.sort();
+
+        for p in paths {
+            Self::add_file(&p, files, seen);
         }
     }
 

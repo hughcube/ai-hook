@@ -2,6 +2,7 @@ use super::sys::create_sys_object;
 use super::{RequestCache, RuleSource, SysContext};
 use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision};
+use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp, RegExpCompiler};
 use rquickjs::{Context, Function, Object, Runtime, Value};
 use std::io::Write;
 use std::rc::Rc;
@@ -10,6 +11,21 @@ use std::time::{Duration, Instant};
 /// Default per-rule execution budget. Rules are synchronous QuickJS scripts;
 /// without this bound a buggy infinite loop would hang the whole hook.
 pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Builtins each rule context is created with.
+///
+/// `Context::full` registers every QuickJS intrinsic and measured 250-390 µs
+/// per rule — more than half of a rule's total execution cost, paid again for
+/// every rule. Rules are small synchronous scripts, so only what they can
+/// realistically use is registered (measured ~40% cheaper context creation).
+///
+/// Kept: JSON (`tool_args` / `raw` are parsed through it), RegExp + compiler
+/// (every example rule matches with a regex literal), Date, Eval, Promise
+/// (async rules are rejected — but they must fail as a *detectable* thenable
+/// rather than as a syntax error), MapSet (plausible in real rules).
+/// Dropped: TypedArrays, Proxy, WeakRef, Performance — no rule shape needs
+/// them, and each adds constructor objects to every single context.
+type RuleIntrinsics = (Date, Eval, RegExpCompiler, RegExp, Json, Promise, MapSet);
 
 /// Maximum size of the rule log file before it rotates to `<name>.1`.
 const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
@@ -265,7 +281,7 @@ impl RuleRunner {
     /// Evaluates a single rule in an isolated QuickJS context.
     pub fn execute_rule(&self, rule: &RuleSource, ctx: &HookContext) -> RuleExecutionResult {
         let start = Instant::now();
-        let js_context = match Context::full(&self.runtime) {
+        let js_context = match Context::custom::<RuleIntrinsics>(&self.runtime) {
             Ok(c) => c,
             Err(e) => {
                 return RuleExecutionResult {
