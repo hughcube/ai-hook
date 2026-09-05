@@ -4,8 +4,10 @@
 [![Release](https://img.shields.io/github/v/release/hughcube/ai-hook)](https://github.com/hughcube/ai-hook/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **极速（2~3ms）、零变量污染、单进程闭环、自治规则驱动** 的新一代 AI Agent 安全防御底座。  
-> 专为 **Google Antigravity**、**Claude Code**、**CodeBuddy**、**OpenAI Codex** 等主流多 Agent 体系深度打造。
+> **为两件事而生：屏蔽复杂度，与舒服地写规则。**  
+> **① 屏蔽复杂度**——把多 Agent 的 Hook 协议差异、平台差异、进程与上下文获取等底层细节，全部封装进单个原生二进制：同一套规则一次编写、处处运行，不再为每个 Agent / 每套平台各维护一份脚本；在 Windows 上还顺带把多脚本连开进程的卡顿（实测 **500~750ms**）压到 **2~3ms**。  
+> **② 舒服地写规则**——规则就是普通 JS：丰富的 `ctx` 上下文、原生微秒级 `sys` 自治 API、统一的 deny/confirm/block 决策协议与桌面/终端交互，配合 `list`/`test`/`bench`/`tutorial` 调试工具，替代手写 Shell 胶水与跨平台试错。  
+> 零变量污染、单进程闭环与极致速度，都是这套设计的自然结果。
 
 [English Documentation](README.md) | 简体中文文档
 
@@ -13,14 +15,14 @@
 
 ## 📖 背景与痛点
 
-在多 Agent 协同与插件化研发环境中，为了防御误操作（如物理删库 `rm -rf /`、未授权高危迁移 `migrate:fresh`、清空缓存 `FLUSHALL`、私钥泄露），传统的 Hook 机制面临严重挑战：
+Hook 位于每次工具调用的**关键路径**上：调用前要评估、调用后要收口。为了防御误操作（如物理删库 `rm -rf /`、未授权高危迁移 `migrate:fresh`、清空缓存 `FLUSHALL`、私钥泄露），多 Agent 与插件化研发环境的传统做法是**各写各的脚本**：在 Windows 上，它们把这条高频路径拖成肉眼可见的顿挫；而在所有平台上，它们最终都沦为无法跨 Agent、跨平台复用的脚本孤岛。传统 Hook 机制由此面临四重挑战：
 
 1. **进程爆炸与明显卡顿**：每个插件各自维护独立 Bash 脚本，Windows 上单次命令触发 10 个进程串行启动，顿挫感长达 **500~750ms**；
 2. **变量污染与环境漂移**：多脚本在同环境中调用时，环境变量泄露、同名函数相互覆盖、工作目录漂移；
 3. **代码强行合并的灾难**：为了提速而将各插件脚本物理拼接打包，导致维护成本与耦合度指数级上升；
-4. **规则僵化，无法自治**：传统 Hook 缺乏上下文，面对“周五封网期禁动生产库”、“master 分支禁强推”、“检测特定本地配置”等动态诉求无能为力。
+4. **规则僵化，无法自治**：这类上下文传统脚本并非拿不到——时间有 `date`、分支有 `git branch`、本地配置有 `cat .env`、网络有 `curl`。但要把它们接进规则，就得自己写胶水：在 **Windows** 上，每抓一次都要临时 spawn 一批子进程（子进程冷启动昂贵，多规则叠加即成卡顿）；而在**所有平台**上，还都要面对——命令输出要靠手写正则解析、Shell 语法跨平台互不通用、同一次请求内多个规则各自重复抓取而零缓存、漏写超时的 `curl` 会把整道闸门挂死，且这套胶水还得为每个 Agent 各写一份。于是“周五封网期禁动生产库”、“master 分支禁强推”、“按本地 `.env` 放行”这类动态规则**难写、也难复用**，最终全部退化成静态正则与路径匹配。
 
-**`ai-hook` 彻底终结了上述问题**：以 Rust 编写的原生单二进制为中央调度基座，内嵌微型 QuickJS 引擎，让每个插件的规则文件在物理隔离的沙箱中**自给自足地获取前置数据**并做出瞬发决策。
+**`ai-hook` 彻底终结了上述问题**：以 Rust 编写的原生单二进制为中央调度基座，内嵌微型 QuickJS 引擎，让每个插件的规则文件在物理隔离的沙箱中**自给自足地获取前置数据**并做出瞬发决策——时间、分支、配置等本地上下文由原生 API 直读并带请求级缓存，规则里不再有 Shell 胶水、无需反复 spawn 子进程，跨平台行为天然一致（在 Windows 上顺带省掉了子进程冷启动的昂贵开销）；网络等远程上下文走内置 `sys.http` 出口，免去 spawn `curl`——网络往返时延不变，可设超时防挂死。
 
 ---
 
@@ -66,7 +68,10 @@
 - 🚀 **极致性能**：
   - 采用 Rust 原生 PE 二进制，Windows 下冷启动耗时仅 **1.5ms**；
   - 常见只读指令由 Fast Path 在 **0.01ms** 内短路放行；
-  - 全量规则评估仅需 **0.5~1.0ms**，整体验证 **2~3ms**（相比旧方案提速 **200+ 倍**）。
+  - 全量规则评估仅需 **0.5~1.0ms**，整体验证 **2~3ms**（Windows 11 x64 实测，相比旧方案提速 **200+ 倍**）。
+- 🧩 **一处编写，处处通用（Universal Across Agents）**：
+  - 单二进制内建各宿主 Payload/事件识别并输出各宿主协议（AGY `.toolCall`、CC `.tool_input`、Codex `turn_id`…），为哪个 Agent 接入都无需另写一套 Hook；
+  - 同一份 JS 规则文件可在 Antigravity / Claude Code / CodeBuddy / Codex 间直接复用，切换 Agent **零迁移成本**。
 - 🛡️ **物理级绝对隔离（零变量污染）**：
   - 各插件规则文件各自独立，**无需做任何物理文件拼接与合并**；
   - 每个规则执行在独立的 QuickJS Context 沙箱中，执行完立即释放，变量绝不外溢。
@@ -221,7 +226,7 @@ export default function(ctx, sys) {
 
 ### 2. `sys` 原生极速自治能力（微秒级原生数据获取与安全扩展）
 
-`ai-hook` 提供丰富的原生微秒级 API，前置只读数据全部内存级解析；同时开放受控的进程调度与 HTTP 通信能力：
+`ai-hook` 提供丰富的原生微秒级 API，前置只读数据全部内存级解析；同时开放**受控的进程调度与 HTTP 通信能力**（HTTP 出口基于内嵌 Rust 客户端而非 `curl` 子进程，务必显式设 `timeout`，默认 10s；适合内网可达性探测、在线封网/审批接口等实时上下文）：
 
 | 方法 / 属性 | 返回类型 | 说明与性能 |
 | :--- | :--- | :--- |
@@ -235,6 +240,7 @@ export default function(ctx, sys) {
 | `sys.cwd()` | `string` | 获取当前工作目录 |
 | `sys.ruleDir` / `sys.__dirname` | `string` | 当前规则脚本所在目录的绝对路径 |
 | `sys.exec(target, args?, opt?)` | `object` | **通用命令/脚本/二进制调度（macOS/Linux/Windows 跨平台原生通用，零写死路径）**：支持系统 PATH 中任意命令、原生二进制（ELF/Mach-O/PE 直接原生执行）、任意脚本与 Shebang（`#!/bin/sh`、`#!/usr/bin/env bash/zsh/python3/node` 等，根据系统环境变量与可用解释器智能自适应调度，不绑定任何单一 shell 或特定安装路径）；支持 `cwd`/`env`/`input`；返回 `{ code, status, exitCode, stdout, stderr, success }` |
+| `sys.http.get(url, opt?)` | `object` | **轻量同步 HTTP GET**：支持 `headers`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `sys.http.post(url, opt?)` | `object` | **轻量同步 HTTP POST**：支持 `headers`/`body`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | 调试日志到 stderr(绝不污染决策 JSON) |
 | `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义) |

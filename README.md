@@ -4,8 +4,10 @@
 [![Release](https://img.shields.io/github/v/release/hughcube/ai-hook)](https://github.com/hughcube/ai-hook/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Ultra-Fast (2~3ms) end-to-end, Zero Variable Pollution, Single-Process Closed-Loop, Autonomous Rule-Driven** Next-Gen Security Base for AI Agents.  
-> Purpose-built for **Google Antigravity**, **Claude Code**, **CodeBuddy**, and **OpenAI Codex**.
+> **It exists for two things: hiding complexity, and making rules pleasant to write.**  
+> **① Hide the complexity** — hook-protocol differences across agents, platform quirks, and subprocess/context-fetching plumbing are all wrapped into one native binary: the same rules are written once and run everywhere, with no per-agent, per-platform script matrix. On Windows this also collapses the multi-script stutter (measured **500–750ms**) to **2–3ms**.  
+> **② Better rule authoring** — a rule is just plain JS: a rich `ctx` context, native microsecond `sys` primitives, one uniform deny/confirm/block decision protocol with desktop/terminal interaction, plus `list`/`test`/`bench`/`tutorial` tooling — instead of hand-written shell glue and cross-platform trial and error.  
+> Zero variable pollution, a single-process closed loop, and extreme speed all fall out of this design.
 
 English Documentation | [简体中文文档](README_zh.md)
 
@@ -13,14 +15,14 @@ English Documentation | [简体中文文档](README_zh.md)
 
 ## 📖 Motivation & Problem Statement
 
-In multi-agent collaborative development ecosystems, preventing destructive operations (e.g. `rm -rf /`, unexpected `migrate:fresh`, cache wiping `FLUSHALL`, or secret leakage) is paramount. However, traditional shell-based hook mechanisms suffer from fundamental bottlenecks:
+Hooks sit on the **hot path** of every tool invocation — they guard before a tool runs and wrap up after it finishes. To defend against destructive operations (e.g. `rm -rf /`, unexpected `migrate:fresh`, cache wiping `FLUSHALL`, or secret leakage), multi-agent and plugin-heavy ecosystems traditionally make each plugin write its own script: on Windows that drags the high-frequency path into jarring stutter, and on every platform those scripts end up as islands that cannot be shared across agents or platforms. Legacy hook mechanisms therefore suffer from four fundamental problems:
 
 1. **Process Explosion & Noticeable Lag**: Each plugin maintaining independent Bash scripts means spawning 10+ sequential processes on Windows, causing jarring **500~750ms** pauses for every single tool invocation;
 2. **Variable Pollution & State Drift**: Sourcing multiple scripts in a shared environment leads to leaked environment variables, overridden functions, and working directory drift;
 3. **The Trap of Forced Script Concatenation**: Trying to speed things up by physically merging scripts into one massive monolithic bundle drastically escalates maintenance complexity;
-4. **Rigid Rules Lacking Autonomous Context**: Static regex hooks cannot dynamically handle real-world needs like *"forbid production writes after 16:00 on Fridays"*, *"block force-push when on master branch"*, or *"inspect project-level .env config"*.
+4. **Rigid, Non-Autonomous Rules**: Traditional hooks *can* reach this context — `date` for time, `git branch` for branches, `cat .env` for local config, `curl` for the network — but wiring it into a rule means writing glue by hand. On **Windows**, each fetch spawns a fresh subprocess whose cold start is expensive, so multiple rules compound into visible stutter. On **every platform**, you still face: hand-rolled regex parsing of command output, shell syntax that is not portable across platforms, zero caching between rules in the same request, a `curl` without a timeout that hangs the whole gate — and that glue must be **re-written for every agent**. So dynamic rules like *"no production writes after 16:00 on Friday"*, *"block force-push on master"*, or *"honor the local `.env`"* are **hard to write and impossible to share**, and in practice collapse into static regexes and path matching.
 
-**`ai-hook` solves these problems once and for all**: A single, standalone native binary written in Rust serves as the central dispatcher. With an embedded lightweight QuickJS engine, every plugin's rules execute in physically isolated sandboxes while **autonomously acquiring their own prerequisite data** with microsecond latency.
+**`ai-hook` solves these problems once and for all**: A single, standalone native binary written in Rust serves as the central dispatcher. With an embedded lightweight QuickJS engine, every plugin's rules execute in physically isolated sandboxes while **autonomously acquiring their own prerequisite data** with microsecond latency — local context (time/branch/config) is read through native APIs with request-scoped caching, so rules contain no shell glue and spawn no subprocesses, behaving identically on every platform (and sidestepping Windows' expensive subprocess cold starts). Remote context such as network probes goes through the built-in `sys.http` exit — no `curl` subprocess spawn, round-trip latency unchanged, timeout required to avoid hangs.
 
 ---
 
@@ -67,7 +69,10 @@ In multi-agent collaborative development ecosystems, preventing destructive oper
 - 🚀 **Extreme Performance**:
   - Pure Rust native PE binary; cold startup takes only **1.5ms** on Windows.
   - Safe read-only commands short-circuit via Fast Path in **< 0.01ms**.
-  - Complete multi-rule evaluation finishes in **1.3ms** (a **500x speedup** over legacy Bash hooks).
+  - Complete multi-rule evaluation finishes in **1.3ms** — a **500x speedup** over legacy Windows Bash hooks (measured on Windows 11 x64).
+- 🧩 **Write Once, Run in Every Agent**:
+  - One binary auto-detects each host's payload/events and emits each host's output protocol (AGY `.toolCall`, CC `.tool_input`, Codex `turn_id`…), so there is no per-agent hook to maintain;
+  - The same JS rule files drop straight into Antigravity, Claude Code, CodeBuddy, or Codex with **zero migration cost**.
 - 🛡️ **Zero Variable Pollution**:
   - Each plugin rule stays completely independent in its own file. **Zero file concatenation or build-step bundling required**.
   - Evaluated in isolated QuickJS Context sandboxes; variables and functions evaporate upon completion.
