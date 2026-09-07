@@ -19,15 +19,17 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// binary every console child then allocates a fresh conhost window (a
 /// visible new-terminal flash on every sys.exec call).
 #[cfg(windows)]
-fn group_spawn_hidden(cmd: &mut std::process::Command) -> std::io::Result<command_group::GroupChild> {
+fn group_spawn_hidden(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<command_group::GroupChild> {
     use command_group::CommandGroup;
-    cmd.group()
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
+    cmd.group().creation_flags(CREATE_NO_WINDOW).spawn()
 }
 
 #[cfg(not(windows))]
-fn group_spawn_hidden(cmd: &mut std::process::Command) -> std::io::Result<command_group::GroupChild> {
+fn group_spawn_hidden(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<command_group::GroupChild> {
     use command_group::CommandGroup;
     cmd.group_spawn()
 }
