@@ -1,5 +1,6 @@
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
 use crate::NoConsoleSpawn;
 
 // macOS/Linux dialog code paths pull strings from the message table; on
