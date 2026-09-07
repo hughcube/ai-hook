@@ -74,14 +74,77 @@ pub fn check_fast_path(ctx: &HookContext) -> Option<HookDecision> {
         return None;
     }
 
-    // 3. Dangerous flags & token check with zero-allocation ASCII comparison.
-    // Additional safety: git branch deletion (-d, -D) or git diff/log write (--output).
-    if matched_prefix == "git branch" && (trimmed.contains(" -d") || trimmed.contains(" -D")) {
-        return None;
-    }
-    if (matched_prefix == "git diff" || matched_prefix == "git log") && trimmed.contains("--output")
-    {
-        return None;
+    // 3. Per-prefix write guards: a whitelisted prefix must only pass its
+    //    read-only surface. Substring matching is deliberately over-broad
+    //    (e.g. "-d" also rejects "--no-describe"): a false positive only
+    //    costs one trip through the rule engine, a false negative silently
+    //    bypasses the gate.
+    match matched_prefix {
+        // `git branch` writes: delete (-d/-D/--delete), rename (-m/-M/--move),
+        // copy (-c/-C/--copy), force (-f/--force), upstream (-u/--set-upstream/
+        // --unset-upstream/--track/--no-track), description (--edit).
+        // Short flags are checked per cluster character (so "-vd", "-dmain"
+        // and "-d" are all caught) while long flags are checked by prefix
+        // ("--set-upstream=x" is caught, "--show-current" is not).
+        "git branch" => {
+            const BRANCH_WRITE_SHORTS: &[char] = &['d', 'D', 'm', 'M', 'c', 'C', 'u', 'f'];
+            const BRANCH_WRITE_LONGS: &[&str] = &[
+                "--delete",
+                "--move",
+                "--copy",
+                "--edit",
+                "--force",
+                "--set-upstream",
+                "--unset-upstream",
+                "--track",
+                "--no-track",
+            ];
+            let writes = trimmed.split_whitespace().any(|tok| {
+                if tok.starts_with('-') && !tok.starts_with("--") {
+                    tok[1..].chars().any(|c| BRANCH_WRITE_SHORTS.contains(&c))
+                } else {
+                    BRANCH_WRITE_LONGS.iter().any(|f| tok.starts_with(f))
+                }
+            });
+            if writes {
+                return None;
+            }
+        }
+        // `git remote` writes config or touches the network: add / rename /
+        // remove / set-url / set-head / prune / update. Only the read-only
+        // surface passes (bare list, -v/--verbose, show, get-url). The
+        // verbose flags are skipped as *tokens*, not prefixes: git's
+        // parse_options consumes `-v` before dispatching on the subcommand,
+        // so `git remote -v add evil <url>` is a real `add` — matching a
+        // bare ` -v` prefix would let it through as "read-only".
+        "git remote" => {
+            let rest = &trimmed[matched_prefix.len()..];
+            let mut tokens = rest
+                .split_whitespace()
+                .skip_while(|tok| *tok == "-v" || *tok == "--verbose");
+            let read_only = match tokens.next() {
+                None => true, // bare list (with or without -v/--verbose)
+                Some(sub) => sub == "show" || sub == "get-url",
+            };
+            if !read_only {
+                return None;
+            }
+        }
+        // git diff/log/show all accept `--output=<file>` / `--output <file>`
+        // and their short form `-o <file>` / `-o<file>`, which writes the
+        // output to disk — that is a write, not a read. `--o…` long options
+        // are excluded from the short-form check so `git log --oneline`
+        // keeps its fast path.
+        "git diff" | "git log" | "git show" => {
+            let writes = trimmed.contains("--output")
+                || trimmed
+                    .split_whitespace()
+                    .any(|tok| tok.starts_with("-o") && !tok.starts_with("--"));
+            if writes {
+                return None;
+            }
+        }
+        _ => {}
     }
 
     let dangerous_tokens = [
@@ -89,9 +152,49 @@ pub fn check_fast_path(ctx: &HookContext) -> Option<HookDecision> {
         "stop", "kill", "token", "password", "secret", "shutdown", "reboot", "mkfs",
     ];
 
+    // Credential / private-key targets.
+    //
+    // The whitelisted prefixes include `cat` / `head` / `tail` — the very
+    // commands used to read secrets. Without these tokens a command like
+    // `cat ~/.ssh/id_rsa` sails through the bypass and any "protect secret
+    // reads" rule never runs. The match is a plain substring scan, so it is
+    // deliberately over-broad (`_key` also matches a source file named
+    // `path_keys.rs`): a false positive
+    // only costs one trip through the rule engine, a false negative silently
+    // bypasses the gate.
+    let sensitive_tokens = [
+        ".ssh",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        "credentials",
+        ".aws",
+        ".netrc",
+        ".kube",
+        "git-credentials",
+        ".env",
+        ".pem",
+        ".key",
+        ".p12",
+        ".pfx",
+        ".keystore",
+        // Bulk secret channels: the process environment itself, classic
+        // account databases, and API keys whose name carries no other token
+        // (`echo $OPENAI_API_KEY` must not ride the `echo ` prefix).
+        "environ",
+        "passwd",
+        "shadow",
+        "api_key",
+        "apikey",
+        "_key",
+        ".kdbx",
+        "hosts.yml",
+    ];
+
     // Zero-allocation case-insensitive ASCII substring search
     let bytes = trimmed.as_bytes();
-    for token in dangerous_tokens {
+    for token in dangerous_tokens.iter().chain(sensitive_tokens.iter()) {
         let t_bytes = token.as_bytes();
         if bytes.len() >= t_bytes.len()
             && bytes.windows(t_bytes.len()).any(|w| {

@@ -1,10 +1,10 @@
 use super::sys::create_sys_object;
-use super::{RequestCache, RuleSource, SysContext};
+use super::{RuleSource, SysContext};
 use crate::errln;
 use crate::i18n::{Msg, t, tf};
-use crate::protocol::{HookContext, HookDecision};
+use crate::protocol::{HookContext, HookDecision, Mutation};
 use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp, RegExpCompiler};
-use rquickjs::{Context, Function, Object, Runtime, Value};
+use rquickjs::{Coerced, Context, Function, Object, Runtime, Value};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -21,11 +21,12 @@ pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(5);
 /// every rule. Rules are small synchronous scripts, so only what they can
 /// realistically use is registered (measured ~40% cheaper context creation).
 ///
-/// Kept: JSON (`tool_args` / `raw` are parsed through it), RegExp + compiler
+/// Kept: JSON (`ctx.args` is parsed through it; `ctx.raw` defers to a lazy
+/// JS-side `JSON.parse` defined in the wrapper below), RegExp + compiler
 /// (every example rule matches with a regex literal), Date, Eval, Promise
 /// (async rules are rejected — but they must fail as a *detectable* thenable
 /// rather than as a syntax error), MapSet (plausible in real rules).
-/// Dropped: TypedArrays, Proxy, WeakRef, Performance — no rule shape needs
+/// Omitted: TypedArrays, Proxy, WeakRef, Performance — no rule shape needs
 /// them, and each adds constructor objects to every single context.
 type RuleIntrinsics = (Date, Eval, RegExpCompiler, RegExp, Json, Promise, MapSet);
 
@@ -60,7 +61,6 @@ impl ErrorPolicy {
 
 pub struct RuleRunner {
     runtime: Runtime,
-    cache: RequestCache,
     timeout: Duration,
 }
 
@@ -204,13 +204,9 @@ fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: 
 //            rule log.
 // ---------------------------------------------------------------------------
 pub fn log_inbound_payload(raw: &str) {
-    let enabled = std::env::var("AI_HOOK_LOG_EXTERNAL")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v != "0" && v != "false" && v != "no" && v != "off"
-        })
-        .unwrap_or(false);
-    if !enabled || raw.is_empty() {
+    // Enabled only by 1/true, exactly as the tutorial documents
+    // (AI_HOOK_LOG_EXTERNAL=1|true) — same convention as the other env flags.
+    if !crate::protocol::env_flag_true("AI_HOOK_LOG_EXTERNAL") || raw.is_empty() {
         return;
     }
 
@@ -273,11 +269,7 @@ impl RuleRunner {
         // Max stack size 1MB
         runtime.set_max_stack_size(1024 * 1024);
 
-        Ok(Self {
-            runtime,
-            cache: RequestCache::new(),
-            timeout,
-        })
+        Ok(Self { runtime, timeout })
     }
 
     /// Evaluates a single rule in an isolated QuickJS context.
@@ -318,7 +310,7 @@ impl RuleRunner {
         };
         emark!("context_custom");
 
-        let sys_ctx = Rc::new(SysContext::new(&ctx.cwd, self.cache.clone()));
+        let sys_ctx = Rc::new(SysContext::new(&ctx.cwd));
         let mut decision = None;
         let mut error = None;
 
@@ -331,13 +323,16 @@ impl RuleRunner {
             .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
         emark!("setup_interrupt");
 
-        let agent_str = ctx.platform.to_string();
+        let platform_str = ctx.platform.to_string();
         let session_id = ctx.conversation.as_ref().and_then(|c| c.id.as_deref());
 
         let res = js_context.with(|js_ctx| -> rquickjs::Result<()> {
-            // 1. Build the v2 ctx object in-place directly on QuickJS (zero redundant Rust serialization).
+            // 1. Build the ctx object in-place directly on QuickJS (zero redundant Rust serialization).
             let ctx_obj = Object::new(js_ctx.clone())?;
-            ctx_obj.set("agent", agent_str.as_str())?;
+            ctx_obj.set("platform", platform_str.as_str())?;
+            // The engine already downgrades decisions the host cannot express
+            // (protocol::output::to_op), so a rule never needs to hand-write
+            // that fallback — and no capability-query API is exposed.
             if let Some(ref m) = ctx.permission_mode {
                 ctx_obj.set("mode", m.as_str())?;
             } else {
@@ -384,44 +379,136 @@ impl RuleRunner {
             } else {
                 ctx_obj.set("file", Value::new_null(js_ctx.clone()))?;
             }
-            let args_val: Value = if !ctx.tool_args.is_null() {
+            // MCP view: {server, tool} — host spellings mcp__s__t / mcp_s_t
+            // both normalize here; parameters stay in ctx.args.
+            if let Some(ref m) = ctx.mcp {
+                let mcp_obj = Object::new(js_ctx.clone())?;
+                if let Some(ref s) = m.server {
+                    mcp_obj.set("server", s.as_str())?;
+                } else {
+                    mcp_obj.set("server", Value::new_null(js_ctx.clone()))?;
+                }
+                if let Some(ref t) = m.tool {
+                    mcp_obj.set("tool", t.as_str())?;
+                } else {
+                    mcp_obj.set("tool", Value::new_null(js_ctx.clone()))?;
+                }
+                ctx_obj.set("mcp", mcp_obj)?;
+            } else {
+                ctx_obj.set("mcp", Value::new_null(js_ctx.clone()))?;
+            }
+            // Web view: {action: "fetch"|"search", url, query}.
+            if let Some(ref w) = ctx.web {
+                let web_obj = Object::new(js_ctx.clone())?;
+                web_obj.set("action", w.action.as_str())?;
+                if let Some(ref u) = w.url {
+                    web_obj.set("url", u.as_str())?;
+                } else {
+                    web_obj.set("url", Value::new_null(js_ctx.clone()))?;
+                }
+                if let Some(ref q) = w.query {
+                    web_obj.set("query", q.as_str())?;
+                } else {
+                    web_obj.set("query", Value::new_null(js_ctx.clone()))?;
+                }
+                ctx_obj.set("web", web_obj)?;
+            } else {
+                ctx_obj.set("web", Value::new_null(js_ctx.clone()))?;
+            }
+            // Code-search view: {kind: "glob"|"grep", path, pattern}.
+            if let Some(ref s) = ctx.search {
+                let search_obj = Object::new(js_ctx.clone())?;
+                search_obj.set("kind", s.kind.as_str())?;
+                if let Some(ref p) = s.path {
+                    search_obj.set("path", p.as_str())?;
+                } else {
+                    search_obj.set("path", Value::new_null(js_ctx.clone()))?;
+                }
+                if let Some(ref pat) = s.pattern {
+                    search_obj.set("pattern", pat.as_str())?;
+                } else {
+                    search_obj.set("pattern", Value::new_null(js_ctx.clone()))?;
+                }
+                ctx_obj.set("search", search_obj)?;
+            } else {
+                ctx_obj.set("search", Value::new_null(js_ctx.clone()))?;
+            }
+            // Delegation view: {kind: "agent"|"workflow"|"task",
+            // description, prompt}.
+            if let Some(ref a) = ctx.agent {
+                let agent_obj = Object::new(js_ctx.clone())?;
+                agent_obj.set("kind", a.kind.as_str())?;
+                if let Some(ref d) = a.description {
+                    agent_obj.set("description", d.as_str())?;
+                } else {
+                    agent_obj.set("description", Value::new_null(js_ctx.clone()))?;
+                }
+                if let Some(ref p) = a.prompt {
+                    agent_obj.set("prompt", p.as_str())?;
+                } else {
+                    agent_obj.set("prompt", Value::new_null(js_ctx.clone()))?;
+                }
+                ctx_obj.set("agent", agent_obj)?;
+            } else {
+                ctx_obj.set("agent", Value::new_null(js_ctx.clone()))?;
+            }
+            let args_val: Value = if !ctx.args.is_null() {
                 js_ctx
-                    .json_parse(ctx.tool_args.to_string().as_bytes())
+                    .json_parse(ctx.args.to_string().as_bytes())
                     .unwrap_or_else(|_| Value::new_null(js_ctx.clone()))
             } else {
                 Value::new_null(js_ctx.clone())
             };
             ctx_obj.set("args", args_val)?;
-            if let Some(ref ev) = ctx.event {
-                ctx_obj.set("event", ev.as_str())?;
-            } else {
+            // ctx.event is the CANONICAL, host-independent event name: Gemini
+            // fires "AfterTool" and Antigravity sends nothing at all, yet a
+            // rule written as `ctx.event === "PostToolUse"` must work on every
+            // host — that portability is the whole point of this engine. The
+            // host's own spelling stays available as ctx.eventRaw.
+            let event_canonical = {
+                let s = ctx.event_enum.canonical_name();
+                if s.is_empty() {
+                    ctx.event.clone().unwrap_or_default()
+                } else {
+                    s.to_string()
+                }
+            };
+            let event_raw = ctx.event_raw.clone().unwrap_or_default();
+            if event_canonical.is_empty() {
                 ctx_obj.set("event", Value::new_null(js_ctx.clone()))?;
+            } else {
+                ctx_obj.set("event", event_canonical.as_str())?;
+            }
+            if event_raw.is_empty() {
+                ctx_obj.set("eventRaw", Value::new_null(js_ctx.clone()))?;
+            } else {
+                ctx_obj.set("eventRaw", event_raw.as_str())?;
             }
             if let Some(ref pr) = ctx.prompt {
                 ctx_obj.set("prompt", pr.as_str())?;
             } else {
                 ctx_obj.set("prompt", Value::new_null(js_ctx.clone()))?;
             }
-            let raw_val: Value = if !ctx.raw_input.is_empty() {
-                js_ctx
-                    .json_parse(ctx.raw_input.as_bytes())
-                    .unwrap_or_else(|_| Value::new_null(js_ctx.clone()))
-            } else {
-                Value::new_null(js_ctx.clone())
-            };
-            ctx_obj.set("raw", raw_val)?;
+            // ctx.raw is intentionally NOT parsed here. It is an escape hatch
+            // (rules should prefer cmd/file/args) and payloads can be megabytes
+            // of transcript; since the ctx object is rebuilt for every rule,
+            // the parse is deferred to first access inside the wrapper.
             ctx_obj.set("rawInput", ctx.raw_input.as_str())?;
             emark!("ctx_object");
 
             // 1.5 Setup console.log -> stderr (+ optional file channel)
             let console_obj = Object::new(js_ctx.clone())?;
-            let agent_for_log = agent_str.clone();
+            let agent_for_log = platform_str.clone();
             let session_for_log = session_id.map(str::to_string);
             let rule_id_for_log = rule.id.clone();
             let log_fn = Function::new(
                 js_ctx.clone(),
-                move |args: rquickjs::function::Rest<String>| {
-                    let msg = args.0.join(" ");
+                move |args: rquickjs::function::Rest<Coerced<String>>| {
+                    // Coerced<String>: console.log(1) / console.log(null) must
+                    // coerce like plain JS ("1" / "null"). A bare String param
+                    // is strict (FromJs accepts only real strings) and would
+                    // throw TypeError, failing the whole rule fail-closed.
+                    let msg = args.0.iter().map(|s| s.0.as_str()).collect::<Vec<_>>().join(" ");
                     errln!("[{}] [rule-debug] {}", local_now_str(), msg);
                     append_rule_log(
                         &agent_for_log,
@@ -440,18 +527,22 @@ impl RuleRunner {
             // 2. Build sys object (fs/git/env/cwd) + sys.log(level, ...msg)
             let sys_obj = create_sys_object(&js_ctx, sys_ctx)?;
             {
-                let agent_for_log = agent_str.clone();
+                let agent_for_log = platform_str.clone();
                 let session_for_log = session_id.map(str::to_string);
                 let rule_id_for_log = rule.id.clone();
                 let sys_log_fn = Function::new(
                     js_ctx.clone(),
-                    move |args: rquickjs::function::Rest<String>| {
-                        let mut parts = args.0.into_iter();
+                    move |args: rquickjs::function::Rest<Coerced<String>>| {
+                        // Coerced<String> for the same reason as console.log:
+                        // sys.log("info", 42) / sys.log(level, null) must not
+                        // throw; JS coercion mirrors console.log semantics.
+                        let mut parts = args.0.iter().map(|s| s.0.as_str());
                         let first = parts.next().unwrap_or_default();
-                        let (level, msg) = if parts.len() == 0 {
-                            ("log".to_string(), first)
+                        let rest: Vec<&str> = parts.collect();
+                        let (level, msg) = if rest.is_empty() {
+                            ("log".to_string(), first.to_string())
                         } else {
-                            (first, parts.collect::<Vec<_>>().join(" "))
+                            (first.to_string(), rest.join(" "))
                         };
                         errln!("[{}] [rule-debug][{}] {}", local_now_str(), level, msg);
                         append_rule_log(
@@ -466,50 +557,132 @@ impl RuleRunner {
                 sys_obj.set("log", sys_log_fn)?;
             }
 
+            // Rule-file location: one pair of names (sys.rulePath / sys.ruleDir)
+            // so a rule never has to guess which spelling exists.
             let rule_dir = rule
                 .path
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let rule_path_str = rule.path.to_string_lossy().to_string();
-            sys_obj.set("rulePath", rule_path_str.clone())?;
-            sys_obj.set("ruleDir", rule_dir.clone())?;
-            sys_obj.set("__filename", rule_path_str)?;
-            sys_obj.set("__dirname", rule_dir)?;
+            sys_obj.set("rulePath", rule.path.to_string_lossy().to_string())?;
+            sys_obj.set("ruleDir", rule_dir)?;
             emark!("sys_object");
 
-            // 3. Prepare rule code: rewrite the top-level `export default`
-            //    into a `return` statement (comments/strings are respected).
-            let raw_code = rule.code.as_str();
-            let prepared_code = match find_export_default(raw_code) {
-                Some(pos) => {
-                    let mut s = raw_code.to_string();
-                    s.replace_range(pos..pos + EXPORT_DEFAULT_LEN, "return ");
-                    s
+            // 3. Prepare rule code: rewrite top-level `export` statements for
+            //    execution inside `new Function` (comments/strings respected):
+            //      export default <expr>            -> var __ai_default__ = <expr>
+            //      export function NAME(...)       -> function NAME(...)
+            //      export async function NAME(...) -> async function NAME(...)
+            //    then append a tail returning the handler table so the wrapper
+            //    can dispatch by the current event name.
+            let (prepared_code, event_name) = {
+                let mut s = rule.code.clone();
+                let hits = find_exports(&s);
+                let mut names: Vec<String> = Vec::new();
+                let mut has_default = false;
+                // Back to front so earlier offsets stay valid while splicing.
+                for hit in hits.into_iter().rev() {
+                    match hit {
+                        ExportHit::Default { offset } => {
+                            s.replace_range(offset..offset + 14, "var __ai_default__ = ");
+                            has_default = true;
+                        }
+                        ExportHit::Handler { offset, name } => {
+                            s.replace_range(offset..offset + "export ".len(), "");
+                            names.push(name);
+                        }
+                    }
                 }
-                None => raw_code.to_string(),
+                if has_default || !names.is_empty() {
+                    // The leading newline terminates a trailing line comment:
+                    // `... // note` + `;return {...}` would otherwise be
+                    // swallowed by the comment and the rule would silently
+                    // lose every handler.
+                    let mut tail = String::from("\n;return { __fns__: {");
+                    for name in &names {
+                        tail.push_str(name);
+                        tail.push_str(": typeof ");
+                        tail.push_str(name);
+                        tail.push_str(" !== 'undefined' ? ");
+                        tail.push_str(name);
+                        tail.push_str(" : undefined,");
+                    }
+                    tail.push_str(
+                        "}, __default__: typeof __ai_default__ !== 'undefined' ? __ai_default__ : undefined };",
+                    );
+                    s.push_str(&tail);
+                }
+                // Handler dispatch must use the canonical name: a rule exports
+                // `PostToolUse` because the tutorial documents canonical event
+                // names, and Gemini fires "AfterTool" — dispatching by the raw
+                // host name would silently never match there. The wrapper
+                // still falls back to the host spelling (and ctx.eventRaw)
+                // for robustness.
+                let ev = ctx.event_enum.canonical_name();
+                let ev = if ev.is_empty() {
+                    ctx.event.as_deref().unwrap_or("")
+                } else {
+                    ev
+                };
+                (s, ev.to_string())
             };
             emark!("code_prepare");
 
             let wrapper = r#"
-                (function(code, ctx, sys) {
+                (function(code, ctx, sys, eventName) {
                     function isThenable(v) {
                         return v != null &&
                                (typeof v === 'object' || typeof v === 'function') &&
                                typeof v.then === 'function';
                     }
                     try {
+                        // Lazy ctx.raw: the raw payload can be megabytes of
+                        // transcript and this context is rebuilt per rule, so
+                        // parse only when a rule actually touches it. The
+                        // parsed value is memoized on first access ("parsed
+                        // on first access" per the docs) so repeated reads in
+                        // one rule cost nothing; the cache dies with the
+                        // per-rule context.
+                        var __raw_cache;
+                        Object.defineProperty(ctx, "raw", {
+                            enumerable: true,
+                            configurable: true,
+                            get: function() {
+                                if (__raw_cache === undefined) {
+                                    try {
+                                        __raw_cache = JSON.parse(ctx.rawInput);
+                                    } catch (e) {
+                                        // Parse failure is memoized as null
+                                        // (matches the previous error
+                                        // semantics and avoids re-parsing
+                                        // known-bad input on every access).
+                                        __raw_cache = null;
+                                    }
+                                }
+                                return __raw_cache;
+                            }
+                        });
                         var factory = new Function("ctx", "sys", code);
                         var result = factory(ctx, sys);
-                        if (typeof result === 'function') {
-                            result = result(ctx, sys);
+                        var v;
+                        if (result && typeof result === 'object' && result.__fns__) {
+                            var handler = result.__fns__[eventName];
+                            if (typeof handler !== 'function') handler = result.__fns__[ctx.event];
+                            if (typeof handler !== 'function') handler = result.__fns__[ctx.eventRaw];
+                            if (typeof handler !== 'function') handler = result.__default__;
+                            v = (typeof handler === 'function') ? handler(ctx, sys) : undefined;
+                        } else {
+                            v = result;
+                            if (typeof v === 'function') {
+                                v = v(ctx, sys);
+                            }
                         }
-                        if (isThenable(result)) {
+                        if (isThenable(v)) {
                             // Structured marker; the localized message is
                             // generated on the Rust side (language-agnostic).
                             return { __async_error: true };
                         }
-                        return result;
+                        return v;
                     } catch (err) {
                         // NOTE: the watchdog interrupt (deadline exceeded) also
                         // lands here as an opaque "Exception generated by
@@ -522,7 +695,7 @@ impl RuleRunner {
 
             let eval_fn: Function = js_ctx.eval(wrapper)?;
             emark!("wrapper_eval");
-            let raw_val: Value = eval_fn.call((prepared_code, ctx_obj, sys_obj))?;
+            let raw_val: Value = eval_fn.call((prepared_code, ctx_obj, sys_obj, event_name))?;
             emark!("rule_exec");
 
             if let Some(obj) = raw_val.as_object() {
@@ -536,67 +709,74 @@ impl RuleRunner {
                     return Ok(());
                 }
 
-                if let Ok(action) = obj.get::<_, String>("action") {
-                    let reason = obj.get::<_, String>("reason").unwrap_or_default();
-                    let title = obj.get::<_, String>("title").ok();
-                    let gui = obj.get::<_, bool>("gui").ok();
-                    let timeout = obj.get::<_, u32>("timeout").ok();
-                    let explicit_force_gui = obj
-                        .get::<_, bool>("force_gui")
-                        .or_else(|_| obj.get::<_, bool>("forceGui"))
-                        .ok();
+                // ---- intent syntax --------------------------------------
+                // Gate (exactly one wins): deny > ask > allow.
+                // Modifiers (combinable): inject / mutateInput / replaceOutput.
+                // Stop events: keepGoing.
+                let deny = obj.get::<_, String>("deny").ok();
+                let ask = obj.get::<_, String>("ask").ok();
+                let allow = obj.get::<_, bool>("allow").ok();
+                let keep_going = obj.get::<_, String>("keepGoing").ok();
 
-                    let act = action.to_lowercase();
-                    match act.as_str() {
-                        "confirm" | "ask" | "prompt" => {
-                            decision = Some(HookDecision::Confirm {
-                                reason,
-                                title,
-                                gui,
-                                timeout,
-                                force_gui: explicit_force_gui,
-                            });
-                        }
-                        "force_confirm" | "force_ask" | "force_gui" | "force_popup" => {
-                            decision = Some(HookDecision::Confirm {
-                                reason,
-                                title,
-                                gui: Some(true),
-                                timeout,
-                                force_gui: Some(true),
-                            });
-                        }
-                        "block" => {
-                            decision = Some(HookDecision::Block { reason });
-                        }
-                        "deny" | "reject" => {
-                            decision = Some(HookDecision::Deny { reason });
-                        }
-                        "allow" | "pass" => {
-                            decision = Some(HookDecision::Allow);
-                        }
-                        _ => {}
-                    }
+                let mutation = Mutation {
+                    inject: obj.get::<_, String>("inject").ok(),
+                    mutate_input: obj
+                        .get::<_, rquickjs::Value>("mutateInput")
+                        .ok()
+                        .and_then(|v| {
+                            js_ctx
+                                .json_stringify(v)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| s.to_string().ok())
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                        }),
+                    // replaceOutput accepts a string (the common case) or a
+                    // structured value matching a tool's output shape — Claude
+                    // Code ignores a shape-mismatched `updatedToolOutput`, so
+                    // built-in tool replacement needs the object form.
+                    replace_output: obj
+                        .get::<_, rquickjs::Value>("replaceOutput")
+                        .ok()
+                        .and_then(|v| {
+                            js_ctx
+                                .json_stringify(v)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| s.to_string().ok())
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                        }),
+                };
+
+                // A gate decision (deny/ask/keepGoing) shadows the modifiers
+                // (inject/mutateInput/replaceOutput) below; that used to drop
+                // the modifiers silently. Warn so the author sees it in the
+                // stderr/log channel instead of debugging a no-op inject.
+                if (deny.is_some() || ask.is_some() || keep_going.is_some())
+                    && !mutation.is_empty()
+                {
+                    errln!("[ai-hook] {}", tf(Msg::M158, &[&rule.id]));
                 }
 
-                if decision.is_none() {
-                    if let Ok(ctx_text) = obj
-                        .get::<_, String>("additionalContext")
-                        .or_else(|_| obj.get::<_, String>("additional_context"))
-                    {
-                        decision = Some(HookDecision::PostContext {
-                            additional_context: ctx_text,
-                        });
-                    } else if let Ok(hook_output) = obj.get::<_, Object>("hookSpecificOutput")
-                        && let Ok(ctx_text) = hook_output
-                            .get::<_, String>("additionalContext")
-                            .or_else(|_| hook_output.get::<_, String>("additional_context"))
-                    {
-                        decision = Some(HookDecision::PostContext {
-                            additional_context: ctx_text,
-                        });
-                    }
-                }
+                decision = if let Some(reason) = deny {
+                    Some(HookDecision::Deny { reason })
+                } else if let Some(reason) = ask {
+                    Some(HookDecision::Confirm {
+                        reason,
+                        title: obj.get::<_, String>("title").ok(),
+                        gui: obj.get::<_, bool>("gui").ok(),
+                        timeout: obj.get::<_, u32>("timeout").ok(),
+                        force_gui: obj.get::<_, bool>("forceGui").ok(),
+                    })
+                } else if let Some(reason) = keep_going {
+                    Some(HookDecision::KeepGoing { reason })
+                } else if !mutation.is_empty() {
+                    Some(HookDecision::Modify(mutation))
+                } else if allow == Some(true) {
+                    Some(HookDecision::Allow)
+                } else {
+                    None
+                };
             } else if let Some(b) = raw_val.as_bool()
                 && !b
             {
@@ -606,12 +786,12 @@ impl RuleRunner {
             }
 
             // A rule that yielded neither a decision nor an error returned
-            // something the engine cannot interpret: a missing `return`, an
-            // unknown `action` string, a bare `true`, a number, ... Only an
-            // explicit null/undefined means "no opinion". Anything else is a
-            // broken rule and MUST be reported, otherwise the fail-closed
-            // check below sees (decision=None, error=None) and silently lets
-            // the command through.
+            // something the engine cannot interpret: an unknown key, a bare
+            // `true`, a number, ... Only an explicit null/undefined means
+            // "no opinion". Anything else is a broken rule and MUST be
+            // reported, otherwise the fail-closed check below sees
+            // (decision=None, error=None) and silently lets the command
+            // through.
             if decision.is_none() && error.is_none() && !is_no_opinion(&raw_val) {
                 error = Some(tf(Msg::M134, &[&rule.id]));
             }
@@ -629,7 +809,7 @@ impl RuleRunner {
             errln!("[ai-hook-engine-profile] rule={}", rule.id);
             for (label, t) in &marks {
                 errln!(
-                    "  {:<18} 累计 {:7.3} ms   本段 {:7.3} ms",
+                    "  {:<18} cum {:7.3} ms   seg {:7.3} ms",
                     label,
                     t,
                     (t - prev).max(0.0)
@@ -637,7 +817,7 @@ impl RuleRunner {
                 prev = *t;
             }
             errln!(
-                "  {:<18} 累计 {:7.3} ms   本段 {:7.3} ms",
+                "  {:<18} cum {:7.3} ms   seg {:7.3} ms",
                 "total",
                 elapsed.as_secs_f64() * 1000.0,
                 (elapsed.as_secs_f64() * 1000.0 - prev).max(0.0)
@@ -669,8 +849,9 @@ impl RuleRunner {
     }
 
     /// Evaluates a list of rules sequentially. Short-circuits on the first
-    /// Confirm or Deny. Under `ErrorPolicy::FailClosed`, a failing rule also
-    /// short-circuits to Deny so a broken gate never opens silently.
+    /// decisive outcome (Confirm / Deny / Modify / KeepGoing). Under
+    /// `ErrorPolicy::FailClosed`, a failing rule also short-circuits to Deny
+    /// so a broken gate never opens silently.
     pub fn evaluate_all(
         &self,
         rules: &[RuleSource],
@@ -700,8 +881,8 @@ impl RuleRunner {
                 match dec {
                     HookDecision::Confirm { .. }
                     | HookDecision::Deny { .. }
-                    | HookDecision::Block { .. }
-                    | HookDecision::PostContext { .. } => {
+                    | HookDecision::Modify(_)
+                    | HookDecision::KeepGoing { .. } => {
                         return (dec, results);
                     }
                     HookDecision::Allow => {}
@@ -713,36 +894,49 @@ impl RuleRunner {
     }
 }
 
-/// Length of the literal `export default` (14 chars) replaced by `return `.
-const EXPORT_DEFAULT_LEN: usize = "export default".len();
-
 /// Normalizes error text (rquickjs prefixes vary across versions).
 fn normalize_rule_error(err: &str) -> String {
     err.trim().to_string()
 }
 
 /// True when a rule explicitly declined to state an opinion (`return null`),
-/// the documented way to hand control to the next rule.
-///
-/// `undefined` deliberately does NOT count: a function that simply falls off
-/// the end is almost always a missing `return`, and a security gate must not
-/// treat that as "this rule is fine with the command". Rules that want to pass
-/// must say so with `return null`.
+/// the documented way to hand control to the next rule. `undefined` counts as
+/// "no opinion" too: with per-event named exports a handler whose
+/// guard does not match simply falls off the end, and that is the normal case
+/// rather than a missing return. Any other unrecognizable value is still an
+/// engine error (fail-closed), see the check at the call site.
 fn is_no_opinion(val: &Value) -> bool {
-    val.is_null()
+    val.is_null() || val.is_undefined()
 }
 
-/// Locates the first top-level `export default` occurrence that is NOT inside a
-/// comment or a string literal, is preceded by a non-identifier boundary and is
-/// the first code on its line. Returns the byte offset of `export` in `code`.
+/// A top-level `export ...` occurrence found by [`find_exports`].
+enum ExportHit {
+    /// `export default <expr>`
+    Default { offset: usize },
+    /// `export [async] function NAME(...)`
+    Handler { offset: usize, name: String },
+}
+
+/// Reads an ASCII identifier from the start of `s`.
+fn take_ident(s: &str) -> String {
+    s.chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .collect()
+}
+
+/// Locates every top-level `export` occurrence that is NOT inside a comment or
+/// a string literal, is preceded by a non-identifier boundary and is the first
+/// code on its line.
 ///
-/// This is deliberately conservative: if we cannot prove a candidate is the
-/// real module export we return None (the code is then passed through as-is
-/// and any real `export default` inside `new Function` surfaces as a syntax
-/// error reported by the wrapper instead of a silent mis-replace).
-fn find_export_default(code: &str) -> Option<usize> {
+/// This is deliberately conservative: candidates we cannot prove to be real
+/// module exports are skipped (the code is then passed through as-is and any
+/// real `export` inside `new Function` surfaces as a syntax error reported by
+/// the wrapper instead of a silent mis-replace).
+fn find_exports(code: &str) -> Vec<ExportHit> {
+    const EXPORT: &str = "export ";
     let bytes = code.as_bytes();
     let n = bytes.len();
+    let mut hits = Vec::new();
     let mut i = 0usize;
 
     while i < n {
@@ -779,34 +973,47 @@ fn find_export_default(code: &str) -> Option<usize> {
                 i += 1;
             }
             _ => {
-                if b == b'e' && bytes[i..].starts_with(b"export default") {
+                if b == b'e' && bytes[i..].starts_with(EXPORT.as_bytes()) {
                     // Boundary: previous char must not be identifier-ish.
                     let prev_ok = i == 0
                         || !(bytes[i - 1].is_ascii_alphanumeric()
                             || bytes[i - 1] == b'_'
                             || bytes[i - 1] == b'$');
-                    // Boundary: neither may the next char continue the
-                    // identifier (`export defaultValue = 5` is not the default
-                    // export; rewriting it would silently change semantics).
-                    let next_idx = i + EXPORT_DEFAULT_LEN;
-                    let next_ok = next_idx >= n
-                        || !(bytes[next_idx].is_ascii_alphanumeric()
-                            || bytes[next_idx] == b'_'
-                            || bytes[next_idx] == b'$');
                     // Must be the first code on its line (only whitespace before).
                     let line_ok = code[..i]
                         .rfind('\n')
                         .map(|ls| code[ls + 1..i].chars().all(|c| c.is_whitespace()))
                         .unwrap_or_else(|| code[..i].chars().all(|c| c.is_whitespace()));
-                    if prev_ok && line_ok && next_ok {
-                        return Some(i);
+
+                    if prev_ok && line_ok {
+                        let after = &code[i + EXPORT.len()..];
+                        let after_trim = after.trim_start();
+                        if after_trim.starts_with("default") {
+                            // `export defaultValue = ...` is not the default export.
+                            let d_end = i + EXPORT.len() + (after.len() - after_trim.len()) + 7;
+                            let next_ok = d_end >= n
+                                || !(bytes[d_end].is_ascii_alphanumeric()
+                                    || bytes[d_end] == b'_'
+                                    || bytes[d_end] == b'$');
+                            if next_ok {
+                                hits.push(ExportHit::Default { offset: i });
+                            }
+                        } else if let Some(rest) = after_trim.strip_prefix("function ") {
+                            let name = take_ident(rest);
+                            if !name.is_empty() {
+                                hits.push(ExportHit::Handler { offset: i, name });
+                            }
+                        } else if let Some(rest) = after_trim.strip_prefix("async function ") {
+                            let name = take_ident(rest);
+                            if !name.is_empty() {
+                                hits.push(ExportHit::Handler { offset: i, name });
+                            }
+                        }
                     }
-                    i += "export".len();
-                } else {
-                    i += 1;
                 }
+                i += 1;
             }
         }
     }
-    None
+    hits
 }

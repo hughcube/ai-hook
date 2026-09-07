@@ -1,8 +1,8 @@
 //! Home / data-directory resolution via environment variables.
 //!
-//! Replaces the `dirs` crate (2026-09-05): on Windows dirs-sys pulls in
-//! `Win32_UI_Shell` (shell32.dll) and `Win32_System_Com` (ole32.dll) just to
-//! read USERPROFILE/LOCALAPPDATA — two large system DLLs that the loader then
+//! On Windows the `dirs` crate family pulls in `Win32_UI_Shell`
+//! (shell32.dll) and `Win32_System_Com` (ole32.dll) just to read
+//! USERPROFILE/LOCALAPPDATA — two large system DLLs that the loader then
 //! initializes serially inside every CreateProcess, costing 1-3ms of startup
 //! that a plain environment lookup avoids entirely. ai-hook runs inside agent
 //! hosts where these variables are always present.

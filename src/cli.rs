@@ -67,13 +67,17 @@ pub enum Commands {
         /// Command line string to simulate and test
         command: String,
 
-        /// Simulated tool name (default: run_command)
-        #[arg(short, long, default_value = "run_command")]
+        /// Simulated tool name (default: Bash)
+        #[arg(short, long, default_value = "Bash")]
         tool: String,
 
         /// Simulated target file path
         #[arg(short, long, default_value = "")]
         file: String,
+
+        /// Simulated host (default: claude_code)
+        #[arg(short, long, default_value = "claude_code")]
+        platform: String,
 
         /// Explicit rule scripts to test against
         #[arg(trailing_var_arg = true)]
@@ -89,6 +93,10 @@ pub enum Commands {
         /// Command string to benchmark against
         #[arg(short, long, default_value = "git status --short")]
         command: String,
+
+        /// Simulated host (default: claude_code)
+        #[arg(short, long, default_value = "claude_code")]
+        platform: String,
 
         /// Explicit rule scripts to benchmark
         #[arg(trailing_var_arg = true)]
@@ -203,6 +211,7 @@ pub fn localized_command() -> Command {
             ("command", M119),
             ("tool", M120),
             ("file", M121),
+            ("platform", M155),
             ("scripts", M122),
         ]
     );
@@ -210,7 +219,12 @@ pub fn localized_command() -> Command {
         cmd,
         "bench",
         M123,
-        [("iterations", M124), ("command", M125), ("scripts", M126),]
+        [
+            ("iterations", M124),
+            ("command", M125),
+            ("platform", M155),
+            ("scripts", M126),
+        ]
     );
     let cmd = sub_help!(cmd, "install", M127, [("target_dir", M128)]);
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);

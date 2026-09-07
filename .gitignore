@@ -6,3 +6,6 @@
 Thumbs.db
 .idea/
 .vscode/
+docs/*
+bench_tmp/*
+*.html

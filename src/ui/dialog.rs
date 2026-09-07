@@ -1,5 +1,7 @@
 use std::process::Command;
 
+use crate::NoConsoleSpawn;
+
 // macOS/Linux dialog code paths pull strings from the message table; on
 // Windows those functions are compiled out, so the import is cfg-gated to
 // avoid an unused-import warning there.
@@ -116,6 +118,27 @@ impl GuiDialog {
         agent: &str,
         timeout_sec: u32,
     ) -> bool {
+        // The dialog content travels through the child's environment block,
+        // which Windows caps at ~32,767 characters for ALL variables combined.
+        // A rule reason can reach the 10k-char hook limit on its own, so
+        // passing it through verbatim could make the powershell spawn fail —
+        // turning the confirm into a silent deny with no dialog at all. Values
+        // are truncated for DISPLAY here only; the decision JSON sent to the
+        // host is built by the caller and never passes through the environment.
+        const MAX_TITLE_CHARS: usize = 200;
+        const MAX_TEXT_CHARS: usize = 6000;
+        let truncate = |s: &str, max: usize| -> String {
+            if s.chars().count() <= max {
+                s.to_string()
+            } else {
+                let mut clipped: String = s.chars().take(max).collect();
+                clipped.push_str("\n…(truncated/截断)");
+                clipped
+            }
+        };
+        let title = truncate(title, MAX_TITLE_CHARS);
+        let reason = truncate(reason, MAX_TEXT_CHARS);
+        let command = truncate(command, MAX_TEXT_CHARS);
         let ps_script = r###"
             param()
             Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -455,9 +478,12 @@ impl GuiDialog {
             .arg("Bypass")
             .arg("-Command")
             .arg(ps_script)
-            .env("AI_HOOK_DLG_TITLE", title)
-            .env("AI_HOOK_DLG_REASON", reason)
-            .env("AI_HOOK_DLG_CMD", command)
+            // Hide the PowerShell console window (see NoConsoleSpawn): the
+            // WPF dialog itself is unaffected.
+            .no_console_window()
+            .env("AI_HOOK_DLG_TITLE", title.as_str())
+            .env("AI_HOOK_DLG_REASON", reason.as_str())
+            .env("AI_HOOK_DLG_CMD", command.as_str())
             .env("AI_HOOK_DLG_AGENT", agent)
             .env("AI_HOOK_DLG_TIMEOUT", timeout_sec.to_string())
             .env(

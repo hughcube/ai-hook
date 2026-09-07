@@ -1,3 +1,4 @@
+use crate::NoConsoleSpawn;
 use crate::i18n::{Msg, t, tf};
 use crate::{errln, outln};
 use std::io::Cursor;
@@ -514,6 +515,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     outln!("{}...", t(Msg::M045));
     let verify_ok = Command::new(&temp_bin_path)
         .arg("--version")
+        .no_console_window()
         .output()
         .map(|o| {
             o.status.success()

@@ -1,31 +1,45 @@
+pub mod capability;
+pub mod decision;
+pub mod event;
 pub mod input;
 pub mod output;
 
-pub use input::{ConversationInfo, FileAction, FileContext, HookContext, Platform, env_flag_true};
-pub use output::HookDecision;
+pub use capability::{Capabilities, capabilities};
+pub use decision::{HookDecision, Mutation};
+pub use event::HookEvent;
+pub use input::{
+    AgentContext, AgentKind, ConversationInfo, FileAction, FileContext, HookContext, McpContext,
+    Platform, SearchContext, SearchKind, WebAction, WebContext, env_flag_true,
+};
 
 /// 规则 confirm 决策在「宿主协议 ask」与「GUI 弹窗」之间的通道选择结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmPath {
     /// 弹系统置顶 GUI 窗(强制弹窗或「宿主不能 ask」的兜底)。
     Popup,
-    /// 直接走宿主协议 ask:CC/CB 的 ask、Codex 0.152+ 普通模式的 ask、
-    /// AGY 普通交互模式的 force_ask。
+    /// 直接走宿主协议 ask: CC/CB 的 ask、AGY 普通交互模式的 force_ask。
+    /// (Codex 官方证实不支持 ask 协议且会 fail-open，已在能力层关闭)。
     Ask,
     /// 宿主不能 ask 且不弹窗 → fail-closed 自动拒绝。
     AutoDeny,
 }
 
-/// gui 字段三态语义(2026-09-05 约定,与 ai-hook tutorial 宿主矩阵配套):
+/// gui 字段三态语义(与 ai-hook tutorial 宿主矩阵配套):
 ///
-/// | 规则 gui | 宿主能 ask | 宿主不能 ask |
+/// | 规则 gui | ask_ok | 结果 |
 /// |---|---|---|
-/// | `true` / force_gui | 强制 Popup(穿透 --no-gui,仅 dry-run 除外) | 同左 |
-/// | 缺省(不配置) | Ask,不弹窗 | GUI 可用则 Popup 兜底;不可用 AutoDeny |
-/// | `false` | Ask,不弹窗 | AutoDeny(规则禁弹窗 → fail-closed) |
+/// | `true` / force_gui | 任意 | 强制 Popup(穿透 --no-gui,仅 dry-run 除外) |
+/// | 缺省(不配置) | true | Ask,不弹窗 |
+/// | 缺省(不配置) | false | GUI 可用则 Popup 兜底;不可用 AutoDeny |
+/// | `false` | true | Ask,不弹窗 |
+/// | `false` | false | AutoDeny(规则禁弹窗 → fail-closed) |
 ///
+/// `ask_ok` 由调用方提供,必须是**事件级**判定(协议 ask 通道存在且该
+/// (platform, event) 的能力矩阵开放 ask —— 即 `can_ask() && caps.ask`);
+/// 只按平台判定会把 UserPromptSubmit / PermissionRequest / PreCompact 等
+/// 无 ask 槽位的事件误送进 Ask 分支,使 GUI 兜底永不执行。
 /// `forced` 由 CLI `--force-gui` / 环境 `AI_HOOK_FORCE_GUI` / 规则 `force_gui: true`
-/// 汇聚而来;`gui: true` 与 force_gui 同级不可禁(2026-09-05 用户拍板)。
+/// 汇聚而来;`gui: true` 与 force_gui 同级不可禁。
 #[must_use]
 pub fn confirm_path(
     gui: Option<bool>,

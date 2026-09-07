@@ -3,7 +3,7 @@
  *
  * Demonstrates:
  * - Autonomous file existence check and content reading via `sys.fs.exists()` and `sys.fs.readText()`
- * - Request-scoped I/O caching (single-disk read per hook evaluation)
+ *   (repeat reads ride the OS page cache — no app-level cache in the engine)
  * - Fine-grained identity-based access control (特权写账户管控，放行只读账户)
  */
 export default function(ctx, sys) {
@@ -16,8 +16,7 @@ export default function(ctx, sys) {
       // Exclude readonly account
       if (!cmd.includes("xrapp_prod_readonly")) {
         return {
-          action: "confirm",
-          reason: "【生产特权写账户门禁】动用生产主账户 xrapp_prod 访问数据库，请核验 SQL 影响并确认！"
+          ask: "【生产特权写账户门禁】动用生产主账户 xrapp_prod 访问数据库，请核验 SQL 影响并确认！"
         };
       }
     }
@@ -29,8 +28,7 @@ export default function(ctx, sys) {
     if (envContent.includes("APP_ENV=production") || envContent.includes("DB_DATABASE=xrapp_prod")) {
       if (/\b(migrate:fresh|migrate:reset|db:wipe)\b/i.test(cmd)) {
         return {
-          action: "deny",
-          reason: "【灾难防御】当前工作区 .env 绑定生产数据库，物理级严禁执行清库与重置迁移！"
+          deny: "【灾难防御】当前工作区 .env 绑定生产数据库，物理级严禁执行清库与重置迁移！"
         };
       }
     }

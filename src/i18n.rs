@@ -263,6 +263,8 @@ pub enum Msg {
     /// stdin was empty -> deny.
     M136,
     /// Explicit rule paths were given but none of them loaded.
+    /// Superseded by M160 (which also covers AI_HOOK_RULES); kept in the
+    /// message table for numbering continuity, no longer referenced.
     M137,
     /// A command was allowed by the fast path before any rule ran.
     M138,
@@ -289,6 +291,33 @@ pub enum Msg {
     M148,
     /// Host cannot ask and no GUI dialog is available/allowed: auto-denied.
     M149,
+    /// A deny on an event that cannot block was downgraded to feedback.
+    M150,
+    /// `list` output label for an injected-context decision.
+    M151,
+    /// `list` output label for a replaced-tool-result decision.
+    M152,
+    /// `list` output label for a rewritten-tool-arguments decision.
+    M153,
+    /// Fallback denial reason: a deny with an empty reason is rejected as
+    /// invalid by Codex (fail open), so one is always supplied.
+    M154,
+    /// `test` / `bench`: which host's envelope to synthesize.
+    M155,
+    /// `test` / `bench`: label for the JSON the host would actually receive.
+    M156,
+    /// `test` / `bench`: short label for the simulated host line.
+    M157,
+    /// Rule returned a gate decision (deny/ask/keepGoing) alongside
+    /// inject/mutateInput/replaceOutput: the modifiers are ignored.
+    M158,
+    /// A modifier of a rule's Modify decision cannot be expressed by the
+    /// host/event capability matrix and was dropped. Args: capability name,
+    /// canonical event name.
+    M159,
+    /// Rules were configured (explicit CLI paths or AI_HOOK_RULES) but none
+    /// loaded: warn that every command will pass.
+    M160,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -420,10 +449,10 @@ impl Msg {
             },
             Msg::M025 => match l {
                 Lang::Zh => {
-                    "在 Release {} 中未找到匹配的二进制或归档文件。候选: {:?}。该 Release 中可用的文件: [{}]"
+                    "在 Release {} 中未找到匹配的二进制或归档文件。候选: {}。该 Release 中可用的文件: {}"
                 }
                 Lang::En => {
-                    "No matching binary or archive was found in release {}. Candidates: {:?}. Available in release: [{}]"
+                    "No matching binary or archive was found in release {}. Candidates: {}. Available in release: {}"
                 }
             },
             Msg::M026 => match l {
@@ -896,10 +925,10 @@ impl Msg {
             },
             Msg::M134 => match l {
                 Lang::Zh => {
-                    "[ai-hook] 规则 '{}' 返回了引擎无法识别的值(期望 { action: \"allow\"|\"deny\"|\"confirm\" } 对象、false,或显式 return null 表示不表态)。已按拒绝处理,请检查规则是否漏写了 return。"
+                    "[ai-hook] 规则 '{}' 返回了引擎无法识别的值(期望 { allow: true } / { deny: '原因' } / { ask: '原因' } / { inject: '文本' } / { mutateInput: {...} } / { replaceOutput: '文本或对象' } / { keepGoing: '原因' } 对象、false 等)。null / undefined 表示不表态。已按拒绝处理,请检查规则返回值。"
                 }
                 Lang::En => {
-                    "[ai-hook] Rule '{}' returned a value the engine cannot interpret (expected an object { action: \"allow\"|\"deny\"|\"confirm\" }, false, or an explicit `return null` for \"no opinion\"). Treated as DENIED - check whether the rule is missing a return statement."
+                    "[ai-hook] Rule '{}' returned a value the engine cannot interpret (expected { allow: true } / { deny: 'reason' } / { ask: 'reason' } / { inject: 'text' } / { mutateInput: {...} } / { replaceOutput: 'text or object' } / { keepGoing: 'reason' }, false, etc.). null / undefined mean \"no opinion\". Treated as DENIED - check the rule's return value."
                 }
             },
             Msg::M135 => match l {
@@ -1000,6 +1029,68 @@ impl Msg {
                 }
                 Lang::En => {
                     "The host does not support terminal ask, and no GUI dialog is available or the rule disables it (gui: false); the operation was auto-denied. Run it manually if intended"
+                }
+            },
+            Msg::M150 => match l {
+                Lang::Zh => "该事件在宿主协议上没有阻断位;仍按拒绝输出(宿主最多忽略,不会静默放行)",
+                Lang::En => {
+                    "This event has no blocking slot in the host protocol; the denial is still emitted (the host may ignore it, but will not silently allow)"
+                }
+            },
+            Msg::M151 => match l {
+                Lang::Zh => "注入",
+                Lang::En => "INJECT",
+            },
+            Msg::M152 => match l {
+                Lang::Zh => "替换结果",
+                Lang::En => "REPLACE",
+            },
+            Msg::M153 => match l {
+                Lang::Zh => "改参",
+                Lang::En => "MUTATE",
+            },
+            Msg::M154 => match l {
+                Lang::Zh => "被 ai-hook 安全规则拒绝(规则未提供具体原因)",
+                Lang::En => "Blocked by an ai-hook rule (the rule gave no reason)",
+            },
+            Msg::M155 => match l {
+                Lang::Zh => {
+                    "模拟宿主:claude_code / codex / codebuddy / workbuddy / gemini / antigravity / opencode"
+                }
+                Lang::En => {
+                    "Host to simulate: claude_code / codex / codebuddy / workbuddy / gemini / antigravity / opencode"
+                }
+            },
+            Msg::M156 => match l {
+                Lang::Zh => "宿主收到的输出",
+                Lang::En => "Host output",
+            },
+            Msg::M157 => match l {
+                Lang::Zh => "模拟宿主",
+                Lang::En => "Simulated host",
+            },
+            Msg::M158 => match l {
+                Lang::Zh => {
+                    "规则 {} 同时返回了 deny/ask/keepGoing 与 inject/mutateInput/replaceOutput:修饰项被忽略(门控决策优先)"
+                }
+                Lang::En => {
+                    "Rule {} returned deny/ask/keepGoing together with inject/mutateInput/replaceOutput: the modifiers are ignored (the gate decision wins)"
+                }
+            },
+            Msg::M159 => match l {
+                Lang::Zh => {
+                    "能力 {} 在当前宿主×事件({})上没有可用通道,已丢弃(宿主不会静默误解该输出)"
+                }
+                Lang::En => {
+                    "The {} capability has no channel on this host×event ({}) and was dropped (the host will not silently misread the output)"
+                }
+            },
+            Msg::M160 => match l {
+                Lang::Zh => {
+                    "警告:已配置规则(AI_HOOK_RULES 或显式路径)但实际加载到 0 条规则,当前所有命令都会被放行。请检查路径是否存在、扩展名是否为 .js、目录规则是否被 _/*.tmp.js/*.test.js 过滤规则排除。"
+                }
+                Lang::En => {
+                    "Warning: rules were configured (AI_HOOK_RULES or explicit paths) but 0 loaded; every command will now pass. Check that the paths exist, use .js files, and remember directory rules skip _-prefixed, *.tmp.js and *.test.js files."
                 }
             },
             Msg::AllowWord => match l {

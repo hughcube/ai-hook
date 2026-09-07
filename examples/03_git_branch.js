@@ -12,14 +12,13 @@ export default function(ctx, sys) {
   if (/git\s+push\b/i.test(cmd)) {
     // Autonomously query current Git branch
     const currentBranch = sys.git.branch();
-    console.log("Current Git branch:", currentBranch);
+    console.log("Current Git branch:", String(currentBranch));
 
     if (currentBranch === "master" || currentBranch === "main") {
       // Check for force push flags
       if (/\s+(-f|--force|--force-with-lease)\b/.test(cmd)) {
         return {
-          action: "deny",
-          reason: `【分支安全门禁】当前处于核心生产分支 '${currentBranch}'，严禁执行强制推送操作！`
+          deny: `【分支安全门禁】当前处于核心生产分支 '${currentBranch}'，严禁执行强制推送操作！`
         };
       }
     }

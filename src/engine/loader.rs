@@ -31,10 +31,12 @@ impl RuleLoader {
         }
 
         // 2. Check environment variable override.
-        //    Path-list separator differs per platform: ';' on Windows (':' is
-        //    part of drive letters such as "C:\..."), ';' or ':' elsewhere.
+        //    Path-list separator matches the platform's PATH convention: ';'
+        //    on Windows (':' is part of drive letters such as "C:\..."), ':'
+        //    on Unix. Splitting Unix on ';' as well used to mis-split rule
+        //    paths whose directory names contain a semicolon.
         if let Ok(env_rules) = std::env::var("AI_HOOK_RULES") {
-            let separators = if cfg!(windows) { ";" } else { ";:" };
+            let separators = if cfg!(windows) { ";" } else { ":" };
             for part in env_rules.split(|c| separators.contains(c)) {
                 let trimmed = part.trim();
                 if !trimmed.is_empty() {
@@ -94,7 +96,7 @@ impl RuleLoader {
             .unwrap_or_default();
 
         // Directory rules are evaluated in deterministic file-name order:
-        // `evaluate_all` short-circuits on the first Confirm/Deny, so the
+        // `evaluate_all` short-circuits on the first decisive outcome, so the
         // load order must not depend on filesystem enumeration order.
         paths.sort();
 
@@ -119,7 +121,11 @@ impl RuleLoader {
             return;
         }
 
-        if let Ok(code) = std::fs::read_to_string(path) {
+        if let Ok(mut code) = std::fs::read_to_string(path) {
+            // Strip UTF-8 BOM if present (e.g. created by Windows Notepad)
+            if code.starts_with('\u{feff}') {
+                code.remove(0);
+            }
             seen.insert(path.to_path_buf());
             files.push(RuleSource {
                 id: file_stem,

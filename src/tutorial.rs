@@ -35,7 +35,8 @@ fn chinese_tutorial_body() -> String {
 
   运行模型(必须理解,规则都建立在这之上):
   · 每次调用 = 一个全新进程、全新 QuickJS 沙箱;规则文件之间零状态共享。
-    唯一例外:同一进程内多个规则共享 sys.fs / sys.git 的只读内存缓存。
+    sys.fs / sys.git 是无状态直读:重复读同一文件由 OS page cache 兜底为
+    纯内存操作,引擎不做应用级缓存。
   · 规则能力:内置 sys 增强 SDK,包括 git/fs/env 内存查询,以及为 0-Token 命令
     拦截和自动化联动提供的同步外部进程执行 sys.exec() 与轻量 HTTP 请求
     sys.http。stdout 严格保留承载协议 JSON——任何规则日志都不得写入 stdout。
@@ -45,9 +46,9 @@ fn chinese_tutorial_body() -> String {
     引擎。需要让白名单命令也经过规则时,用 --no-fast-path(或
     AI_HOOK_FAST_PATH=0)关闭旁路。
   · 引擎失效边界(fail-closed):规则语法错误、运行时异常、死循环超时、
-    返回 Promise、漏写 return(返回 undefined)或返回无法识别的值 —— 一律
-    按"拒绝"处理并把错误作为原因返回;绝不静默放行。规则的"放行"必须
-    显式写 return null。显式传入 --allow-on-error(或
+    返回 Promise 或返回无法识别的值 —— 一律按"拒绝"处理并把错误作为
+    原因返回;绝不静默放行(null / undefined / 漏写 return 是"未表态",
+    继续评估下一规则)。显式传入 --allow-on-error(或
     AI_HOOK_ALLOW_ON_ERROR=1)才恢复出错放行。
   · 输入失效边界:stdin 为空或不可读时一律按"拒绝"处理(空输出会被宿主
     解读为放行,因此不可静默返回);能读入但无法解析为 JSON 的 payload 会被
@@ -56,8 +57,11 @@ fn chinese_tutorial_body() -> String {
 二、ctx —— 一次调用的完整归一化视图(唯一 schema,无别名)
 --------------------------------------------------------------------------------
   {
-    agent:  "claude_code"|"codex"|"antigravity"|"codebuddy"|"generic", // 检测到的宿主
-    event:  "PreToolUse"|"PostToolUse"|"UserPromptSubmit"|string, // 生命周期事件
+    platform: "claude_code"|"codex"|"antigravity"|"codebuddy"|"workbuddy"|"gemini"|"opencode"|"generic", // 检测到的宿主
+    event:  "PreToolUse"|"PostToolUse"|"UserPromptSubmit"|"Stop"|"SessionStart"|…,
+            // 规范化事件名,跨宿主一致:Gemini 的 AfterTool/BeforeAgent 会归一为
+            // PostToolUse/UserPromptSubmit,规则写一次处处成立
+    eventRaw: string|null, // 宿主原始事件拼写(如 Gemini 的 "AfterTool")
     prompt: string|null, // 仅在 UserPromptSubmit 时存在用户输入的 Prompt 文本
     mode:   "default"|"plan"|"acceptEdits"|"dontAsk"|"bypassPermissions"|null,
             // 宿主权限模式(仅提供该字段的宿主)
@@ -72,34 +76,61 @@ fn chinese_tutorial_body() -> String {
     cmd:    string|null, // 仅命令类工具(Bash/run_command/…),其余为 null
     file:   { path: string|null, action: "read"|"write"|"edit"|"delete"|"list" } | null,
             // 仅文件类工具;action 由工具名归一(Read→read, Write→write,
-            // Edit/apply_patch→edit, Delete→delete, list_dir→list)
+            // Edit/apply_patch→edit, Delete→delete, list_dir→list)。
+            // Codex apply_patch 的目标路径由引擎从 patch 文本提取,
+            // 规则无需解析 ctx.rawInput
+    mcp:    { server: string|null, tool: string|null } | null,
+            // 仅 MCP 工具(mcp__server__tool 双下划线 / mcp_server_tool 单
+            // 下划线,两形态均归一,跨宿主一致);参数由 server 自定义,
+            // 引擎不归一 —— 仍在 ctx.args 原文里。server/tool 已小写归一;
+            // 需要精确大小写时用 ctx.tool 原文
+    web:    { action: "fetch"|"search", url: string|null, query: string|null } | null,
+            // 仅网页工具:WebFetch/read_url_content→fetch(带 url),
+            // WebSearch/search_web→search(带 query)
+    search: { kind: "glob"|"grep", path: string|null, pattern: string|null } | null,
+            // 仅代码搜索工具:Glob/Grep(CC/Codex)、grep_search(AGY)
+    agent:  { kind: "agent"|"workflow"|"task", description: string|null,
+              prompt: string|null } | null,
+            // 仅委托类工具:Agent/spawn_agent→agent、Workflow→workflow、
+            // Task→task;description/prompt 跨宿主键提取
     args:   object,    // 宿主工具参数原文(如 {command},{file_path,content},{CommandLine})
-    raw:    object,    // 宿主下发完整 payload(字段以宿主文档为准,永远可用)
+    raw:    object|null, // 宿主下发完整 payload —— 逃生舱,ctx 字段不够用才用;
+                       // 访问时才解析(lazy),MB 级 transcript 不拖慢未用它的规则
     rawInput: string,  // payload 原始文本
   }
   规则判空惯例:
   - 拦截 Prompt 命令先 `if (ctx.prompt && ...)` 或 `if (ctx.event === "UserPromptSubmit")`;
   - 命令规则先 `if (ctx.cmd && …)`;文件规则先
   `if (ctx.file && ctx.file.action === "write" …)`——因为 cmd/file 对非适用
-  工具恒为 null。
+  工具恒为 null。mcp/web/search/agent 同理:一次工具调用至多命中一个语义
+  视图(命中者非 null,其余恒 null),未建模的工具(如 ExitPlanMode)四个视图
+  全为 null,只能经 ctx.tool/ctx.args 访问。
 
-三、sys —— 自治增强 SDK(只读内存缓存 + 受控执行与网络)
+三、sys —— 宿主能力 SDK(一个能力一个名字;exec/http 是沙箱逃逸点)
 --------------------------------------------------------------------------------
+  JS 原生可用,无需 sys:new Date() / Date.now()(周五封网、夜间窗口等)、
+  JSON / RegExp / Math / Map / Set —— QuickJS 内建,引擎零参与。
+  sys 只补 JS 没有的 I/O 能力:
+
   sys.git.branch()      string|null   当前分支名(.git/HEAD 纯内存解析)
   sys.git.root()        string|null   仓库根目录
-  sys.git.status()      string        分支简报("branch: x" / "not a git repository")
-  sys.fs.exists(path)   bool          相对 cwd 解析;单进程内缓存
-  sys.fs.readText(path) string|null   文本读取;单进程内缓存
+  sys.fs.exists(path)   bool          相对 ctx.cwd 解析
+  sys.fs.readText(path) string|null   文本读取
   sys.fs.list([dir])    string[]      目录条目
-  sys.env("KEY")        string|null   进程环境变量(亦可 sys.env.get("KEY"))
-  sys.cwd()             string        当前工作目录(与 ctx.cwd 一致)
-  sys.ruleDir / sys.__dirname   string 当前正在执行的规则脚本所在目录绝对路径
-  sys.rulePath / sys.__filename string 当前正在执行的规则脚本文件绝对路径
-  sys.exec(cmd, args?, opts?)   object 同步执行外部命令/脚本/二进制(跨平台原生+Shebang智能调度):
-                                       返回 { code, status, exitCode, stdout, stderr, success }
-  sys.http.get(url, opts?)      object 同步 HTTP GET,返回 { status, ok, headers, body }
-  sys.http.post(url, opts?)     object 同步 HTTP POST(body 放 opts.body),返回 { status, ok, headers, body }
-  new Date()            标准 JS 时钟(周五封网、夜间窗口等)
+  sys.env("KEY")        string|null   进程环境变量
+  sys.ruleDir           string        当前规则脚本所在目录绝对路径
+  sys.rulePath          string        当前规则脚本文件绝对路径
+  sys.exec(cmd, args?, opts?)   object ⚠️沙箱逃逸点(任意子进程)。
+                                       同步执行外部命令/脚本/二进制(跨平台原生+Shebang智能调度):
+                                       返回 { code, ok, stdout, stderr }。
+                                       内置硬超时:opts.timeout 毫秒(默认 10000),
+                                       超时终止整个进程组并返回 ok:false ——
+                                       JS 看门狗管不到原生阻塞调用,由 exec 自身兜底
+  sys.http.get(url, opts?)      object ⚠️沙箱逃逸点(任意网络)。
+                                       同步 HTTP GET,返回 { status, ok, headers, body }
+  sys.http.post(url, opts?)     object ⚠️沙箱逃逸点。同步 HTTP POST(body 放 opts.body)
+  无请求级缓存:重复读同一文件时 OS page cache 已是纯内存操作,
+  应用层再缓存只会多一个需要解释的概念。
   console.log(...)      stderr + 文件;错误也走 console.error(同通道)
   sys.log(level, ...)   结构化日志;level 自定(warn/info/debug…)
   日志文件:默认 ~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log(UTC 按日切分),
@@ -110,66 +141,133 @@ fn chinese_tutorial_body() -> String {
 
 四、决策协议(规则返回值)
 --------------------------------------------------------------------------------
-  return null;                    → 通过,继续下一规则(等价未表态)
-  return undefined / 漏写 return  → 视为引擎错误,按"拒绝"处理;
-                                  想放行请显式 return null
-  return { action: "allow" };     → 明确放行,继续下一规则
-  return { action: "deny",  reason: "…" };   → 硬拒绝,绝对不弹窗
-  return { action: "block", reason: "…" };   → 拦截大模型推理,在终端直接向用户输出
-                                              reason 文本(UserPromptSubmit 零 Token 拦截)
-  return { additionalContext: "…" };         → 向宿主注入上下文规范提示(PostToolUse 提示注入)
-  return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
-      · gui 三态(2026-09-05 约定,默认不配置):
+  return null / undefined / 漏写 return → 未表态,继续下一规则
+  return { allow: true };        → 明确放行,继续下一规则
+  return { deny: "…" };          → 硬拒绝,绝对不弹窗
+  return { keepGoing: "…" };     → Stop 类事件:让宿主继续执行(附原因)。
+                                   ⚠️ Stop 类事件上写 deny 的语义随宿主而异:
+                                   claude_code 恰好也输出 decision:block(=继续),
+                                   antigravity 则输出 decision:deny
+                                   (官方:非 continue 一律允许停止);
+                                   要"别停下"必须用 keepGoing。
+  return { inject: "…" };        → 向宿主注入上下文规范提示(PostToolUse 提示注入)
+  return { mutateInput: {...} };             → 改写工具参数(PreToolUse)。
+                                   仅 PreToolUse 类 gate 事件可用;宿主/事件无改写
+                                   通道时(如在 PostToolUse 或不支持改参的事件上)由引擎
+                                   丢弃并输出 stderr 提示,绝不输出宿主不认识的键
+  return { replaceOutput: "…" };             → 替换工具结果(PostToolUse)。
+                                   值可以是字符串(文本块宿主会用文本包裹),
+                                   也可以是对象/数组 —— Claude Code 内置工具的
+                                   updatedToolOutput 必须匹配工具输出形状
+                                   (如 Bash 是 {stdout,stderr,interrupted,isImage}),
+                                   形状不符会被忽略,只有结构化值才能替换
+  return { ask: "…", title?, gui?, timeout?, forceGui? };
+      · gui 三态(默认不配置):
           gui: true    → 强制桌面置顶弹窗(穿透 --no-gui,不可禁;仅 --dry-run
-                         演练不弹);与 force_gui 同级
+                         演练不弹);与 forceGui:true 同级
           不配置/缺省  → 宿主能 ask 直接走协议 ask(见表五);不能 ask 时
                          GUI 可用则弹窗兜底,GUI 不可用则自动拒绝
           gui: false   → 禁止弹窗:宿主能 ask 走 ask;不能 ask 直接拒绝
                          (fail-closed)
       · timeout: 秒(默认 60,<=0 视为默认);弹窗超时一律按拒绝处理
-      · force_gui: true / action: "force_gui" → 强制桌面弹窗(与 gui:true 同级)
+      · forceGui: true → 强制桌面弹窗(与 gui:true 同级)
   return false;                   → 拒绝(reason 自动生成)
   引擎级硬边界:规则必须为同步函数;5 秒执行看门狗;64MB 内存上限;
   不支持 async/Promise、import、require;文件必须是单文件 ES 语法。
-  规则顺序:按文件名字典序执行;首个 confirm、deny 或 block 立即短路;
+  规则顺序:按文件名字典序执行;首个 ask、deny、inject/modify 或 keepGoing 立即短路;
   allow/无表态不短路。目录加载顺序已保证确定性。
+  ⚠️ 排序有语义:inject / mutateInput / replaceOutput 同样会短路。若"注入提示"类
+  规则的文件名排在"硬阻断"规则之前,命中提示后阻断规则将不再执行。需要两者叠加时,
+  请把阻断类规则的文件名排在前面。
+  ⚠️ 同一规则内 deny/ask/keepGoing 与 inject/mutateInput/replaceOutput 同时返回时,
+  门控决策优先、修饰项被忽略——引擎会向 stderr 输出提示,不要依赖被吞掉的修饰项。
 
 五、宿主决策差异矩阵(can_ask × 模式;输出由 ai-hook 自动映射)
 --------------------------------------------------------------------------------
-  agent 值       普通模式 ask 能力    YOLO/bypass(免确认)   deny/allow 协议载体
-  claude_code    ✓ ask(终端)         ✓ ask(官方:ask 在免确认
-                                      模式仍拥有最高决策优先级)
+  platform 值    普通模式 ask 能力    YOLO/bypass(免确认)   deny/allow 协议载体
+  claude_code    ✓ ask(终端)         ✓ ask(官方:ask 提示用户确认;
+                                      且 ask 在免确认模式下同样强制弹窗)
                                                           hookSpecificOutput.permissionDecision
   codebuddy      ✓ ask(终端)         ✓ ask(同上)          同上
-  codex          ✓ ask(0.152+ 起)    ✗(免确认下无 ask)     hookSpecificOutput.permissionDecision
-  antigravity    ✓ force_ask         ✗(ask 被静默放行)     顶层 {decision, reason}
+  codex          ✗ 协议无 ask(输出 ask 会被判 unsupported 并 fail open:宿主
+                   标记 hook failed 后继续执行工具调用)→ confirm 一律走 GUI,
+                   无 GUI 时 fail-closed 拒绝   hookSpecificOutput.permissionDecision
+  workbuddy      ✓ ask(终端)         ✓ ask(同上)          同上
+  gemini         ✗ 协议无 ask        ✗                    顶层 {decision, reason}
+  antigravity    ✓ force_ask         ✗(bypass 不弹,走 GUI) 顶层 {decision, reason}
   generic        ✗ 无 ask 协议       ✗                    hookSpecificOutput 形态(尽力)
   confirm 通道选择(gui 三态 × can_ask):
   · 缺省(不配置):can_ask 宿主直接走协议 ask;不能 ask 的宿主 GUI 可用则
     弹窗兜底,不可用(CI/--no-gui/测试)自动拒绝;
-  · gui:true / force_gui:全宿主强制弹窗(穿透 --no-gui);
+  · gui:true / forceGui:true:全宿主强制弹窗(穿透 --no-gui);
   · gui:false:can_ask 宿主走 ask;不能 ask 宿主直接拒绝(禁弹窗 fail-closed)。
+
+  ── 事件名速查:ctx.event 的宿主差异 ─────────────────────────────
+  ctx.event 一律采用 Claude Code 拼写;Codex / CodeBuddy / WorkBuddy /
+  OpenCode(桥)同名同形,仅下列宿主不同:
+    PreToolUse        ← Gemini: BeforeTool
+    PostToolUse       ← Gemini: AfterTool
+    UserPromptSubmit  ← Gemini: BeforeAgent
+    Stop              ← Gemini: AfterAgent;AGY:无事件名,按载荷形状推断
+    PreCompact        ← Gemini: PreCompress
+    PreInvocation     ← AGY:按形状推断(Pre/PostInvocation 输入同形,统一归此类)
+  Antigravity 的 stdin 没有事件名(官方无 hook_event_name),上表是其按信封
+  形状推断的结果;其 PostToolUse 被刻意不推断(用 error 键推断未文档化,误判
+  会丢 gate),post-tool 载荷显示为 PreToolUse,且该期规则决策会被宿主忽略
+  (官方 PostToolUse 输出固定 {})。未建模的宿主事件(如 TaskCompleted /
+  Notification / ConfigChange)以宿主原名透传 ctx.event,可观测但不可决策。
+  完整 43 事件能力矩阵见 docs/HOOK_EVENT_MATRIX.md。
+  ── 原生 matcher 速查:拦截目标 × 各家工具注册名 ─────────────────
+  执行命令:CC Bash|PowerShell、Codex Bash、CB Bash、AGY run_command、
+  Gemini run_shell_command、OpenCode bash(小写);写文件:Write / Write(别名
+  apply_patch)/ Write / write_to_file / write_file / write;编辑:Edit /
+  Edit(或 apply_patch)/ Edit / replace_file_content / replace / edit;
+  读文件:Read / Read / Read / view_file / read_file / read。
+  matcher 语法随宿主:CC 值仅含 [A-Za-z0-9_ ,|-] 时=精确串/列表,否则为非
+  锚定正则(整名匹配要 ^…$);Codex 官方 "regex string"(示例锚定 ^Bash$);
+  CB 正则且大小写敏感,裸 Write 是"包含"匹配(精确需 ^Write$);AGY/Gemini
+  正则,"" 或 "*" 全匹配(Gemini 仅工具事件用正则);OpenCode 桥按 CC 配置
+  对**小写**工具 id 做大小写敏感锚定匹配——CC 式大写 "Bash" 不命中 opencode
+  的 bash,请用小写 matcher。
+  MCP 工具名:CC/Codex/CB 是 mcp__server__tool(双下划线;匹配整 server 必须
+  mcp__server__.*),Gemini 是 mcp_server_tool(单下划线)。规则层统一经
+  ctx.mcp.server / ctx.mcp.tool 读取,感知不到分隔符差异。
+  规则侧无需感知任何工具名:判断一律用归一视图(ctx.cmd / ctx.file /
+  ctx.mcp / ctx.web / ctx.search / ctx.agent);matcher 只需"配宽",让无关
+  工具调用不付进程开销。示例规则见 examples/(README §Rule Demos 已内嵌)。
 
 六、接入最小配置
 --------------------------------------------------------------------------------
-  Claude Code / CodeBuddy(~/.claude/hooks.json 或 settings.json):
+  Claude Code(~/.claude/settings.json 用户级,或 <项目>/.claude/settings.json
+  项目级;官方不使用单独的 hooks.json):
     { "hooks": { "PreToolUse": [
         { "matcher": "Bash|Write|Edit|Read",
           "hooks": [{ "type": "command", "command": "ai-hook ./rules/protect.js" }] } ],
       "UserPromptSubmit": [
-        { "matcher": ".*",
-          "hooks": [{ "type": "command", "command": "ai-hook ./rules/intercept.js" }] } ] } }
-  Antigravity(~/.gemini/config/hooks.json):
-    { "PreToolUse": [ { "matcher": "run_command|write_to_file|view_file",
-        "hooks": [ { "command": "ai-hook ./rules/protect.js", "timeout": 70 } ] } ] }
-  Codex(~/.codex/hooks.json):结构与 Claude Code 相同;matcher 支持正则。
-  规则文件三种加载方式:显式传参 > AI_HOOK_RULES(路径列表,';' 或 ':' 分隔)>
-  ./.ai-hook/rules.js 或 ./.ai-hook/rules/ 目录(仅一层,按名排序)。
+        { "hooks": [{ "type": "command", "command": "ai-hook ./rules/intercept.js" }] } ] } }
+  CodeBuddy(~/.codebuddy/settings.json 或 <项目>/.codebuddy/settings.json):
+    结构同上。
+  Antigravity(~/.gemini/config/hooks.json 或工作区 .agents/hooks.json;
+  官方要求顶层多一层 hook 名,可配 enabled):
+    { "ai-hook-gate": { "enabled": true,
+        "PreToolUse": [ { "matcher": "run_command|write_to_file|view_file",
+          "hooks": [ { "command": "ai-hook ./rules/protect.js", "timeout": 70 } ] } ] } }
+  Codex(~/.codex/hooks.json 或 config.toml 内联):结构与 Claude Code 相同;
+  matcher 支持正则。注意 Codex 要求先在 /hooks 面板信任 hook,新增或变更的
+  hook 未信任前会被静默跳过。
+  Gemini CLI(~/.gemini/settings.json 的 hooks 段):事件为 BeforeTool/
+  AfterTool 等自有命名;shell 工具名为 run_shell_command。
+  规则文件三种加载方式:显式传参 > AI_HOOK_RULES(路径列表,分隔符与平台 PATH
+  一致:Windows 用 ';',Unix 用 ':')> ./.ai-hook/rules.js 或 ./.ai-hook/rules/
+  目录(仅一层,按名排序)。
   目录内以下划线开头的文件与 *.tmp.js / *.test.js 会被忽略。
 
 七、调试与运维
 --------------------------------------------------------------------------------
-  ai-hook test <命令> <rules…>      单条命令过所有规则,显示每规则决策与耗时
+  ai-hook test <命令> <rules…>      单条命令过所有规则,显示每规则决策、耗时与
+                                    宿主真实输出 JSON;--platform 指定模拟宿主
+                                    (默认 claude_code,可选 codex/codebuddy/
+                                    workbuddy/gemini/antigravity/opencode)
   ai-hook bench -i 1000 -c <命令>   压测
   ai-hook list [<rules…>]           列出实际加载的规则
   ai-hook tutorial --lang en        英文版本文档
@@ -213,8 +311,9 @@ I. What it is / when it runs / when it does not
 
   Execution model (rules build on this):
   · One invocation = one fresh process and one fresh QuickJS sandbox; rule
-    files share zero state. Only exception: rules in the same process share
-    the read-only in-memory caches of sys.fs / sys.git.
+    files share zero state. sys.fs / sys.git are stateless direct reads:
+    repeat reads of the same file are already pure in-memory operations via
+    the OS page cache — the engine adds no application-level cache.
   · Rule capability: built-in sys enhanced SDK, including in-memory git/fs/env
     queries, plus synchronous external process execution via sys.exec() and
     lightweight HTTP requests via sys.http for 0-Token prompt interception and
@@ -228,10 +327,10 @@ I. What it is / when it runs / when it does not
     commands through the rules too, disable the bypass with --no-fast-path or
     AI_HOOK_FAST_PATH=0.
   · Engine failure boundary (fail-closed): syntax errors, runtime exceptions,
-    watchdog timeouts, returned Promises, a missing return (yielding
-    `undefined`) or any unparsable return value are DENIED with the error as
-    the reason; a broken gate never silently opens. To pass, a rule must say
-    `return null` explicitly. Pass --allow-on-error
+    watchdog timeouts, returned Promises, or any unparsable return value are
+    DENIED with the error as the reason; a broken gate never silently opens.
+    (null / undefined / a missing return count as "no opinion" and evaluation
+    continues with the next rule.) Pass --allow-on-error
     (or AI_HOOK_ALLOW_ON_ERROR=1) explicitly to restore allow-on-error.
   · Input failure boundary: an empty or unreadable stdin is DENIED (empty
     output would read as "allow", so ai-hook never returns silently); a
@@ -242,8 +341,12 @@ I. What it is / when it runs / when it does not
 II. ctx — one normalized view of an invocation (single schema, no aliases)
 --------------------------------------------------------------------------------
   {
-    agent:  "claude_code"|"codex"|"antigravity"|"codebuddy"|"generic", // detected host
-    event:  "PreToolUse"|"PostToolUse"|"UserPromptSubmit"|string, // lifecycle event
+    platform: "claude_code"|"codex"|"antigravity"|"codebuddy"|"workbuddy"|"gemini"|"opencode"|"generic", // detected host
+    event:  "PreToolUse"|"PostToolUse"|"UserPromptSubmit"|"Stop"|"SessionStart"|…,
+            // canonical event name, identical across hosts: Gemini's
+            // AfterTool/BeforeAgent fold into PostToolUse/UserPromptSubmit so a
+            // rule written once holds everywhere
+    eventRaw: string|null, // the host's own event spelling (e.g. Gemini "AfterTool")
     prompt: string|null, // user input prompt string (UserPromptSubmit only)
     mode:   "default"|"plan"|"acceptEdits"|"dontAsk"|"bypassPermissions"|null,
             // host permission mode (hosts that provide it)
@@ -258,34 +361,67 @@ II. ctx — one normalized view of an invocation (single schema, no aliases)
     cmd:    string|null, // command tools only (Bash/run_command/…); null otherwise
     file:   { path: string|null, action: "read"|"write"|"edit"|"delete"|"list" } | null,
             // file tools only; action normalized from tool name
-            // (Read→read, Write→write, Edit/apply_patch→edit, Delete→delete, list_dir→list)
+            // (Read→read, Write→write, Edit/apply_patch→edit, Delete→delete, list_dir→list).
+            // Codex apply_patch targets are extracted from the patch text by
+            // the engine — rules never need to regex ctx.rawInput for them
+    mcp:    { server: string|null, tool: string|null } | null,
+            // MCP tools only (mcp__server__tool / mcp_server_tool — both
+            // spellings normalize identically); parameters are server-defined
+            // and stay verbatim in ctx.args. server/tool are lower-cased; use
+            // ctx.tool verbatim when exact case matters
+    web:    { action: "fetch"|"search", url: string|null, query: string|null } | null,
+            // web tools only: WebFetch/read_url_content→fetch (url),
+            // WebSearch/search_web→search (query)
+    search: { kind: "glob"|"grep", path: string|null, pattern: string|null } | null,
+            // code-search tools only: Glob/Grep (CC/Codex), grep_search (AGY)
+    agent:  { kind: "agent"|"workflow"|"task", description: string|null,
+              prompt: string|null } | null,
+            // delegation tools only: Agent/spawn_agent→agent, Workflow→
+            // workflow, Task→task; description/prompt keys per host
     args:   object,     // host tool arguments verbatim ({command},{file_path,…})
-    raw:    object,     // full host payload (host fields win; always available)
+    raw:    object|null, // full host payload — escape hatch, prefer cmd/file/args;
+                        // parsed on first access (lazy), so MB-sized transcripts
+                        // cost nothing to rules that never touch it
     rawInput: string,   // raw payload text
   }
   Rule idiom:
   - Guard prompt interception with `if (ctx.prompt && ...)` or `if (ctx.event === "UserPromptSubmit")`;
   - Guard command rules with `if (ctx.cmd && …)` and file rules with
     `if (ctx.file && ctx.file.action === "write" …)` — cmd/file are null for
-    tools they do not describe.
+    tools they do not describe. mcp/web/search/agent work the same way: one
+    tool call populates at most one semantic view (the hit one is non-null,
+    the others stay null); tools we do not model (e.g. ExitPlanMode) leave all
+    four null and stay reachable through ctx.tool / ctx.args.
 
-III. sys — autonomous SDK (in-memory cached + controlled execution & network)
+III. sys — host-capability SDK (one name per capability; exec/http escape the sandbox)
 --------------------------------------------------------------------------------
+  Plain JS already covers pure computation — new Date() / Date.now() (freeze
+  windows, night rules…), JSON / RegExp / Math / Map / Set are QuickJS builtins.
+  sys only adds the I/O that JS has no primitive for:
+
   sys.git.branch()      string|null   current branch (pure .git/HEAD parse)
   sys.git.root()        string|null   repository root
-  sys.git.status()      string        "branch: x" / "not a git repository"
-  sys.fs.exists(path)   bool          resolved against cwd; cached per process
-  sys.fs.readText(path) string|null   text read; cached per process
+  sys.fs.exists(path)   bool          resolved against ctx.cwd
+  sys.fs.readText(path) string|null   text read
   sys.fs.list([dir])    string[]      directory entries
-  sys.env("KEY")        string|null   process environment (or sys.env.get)
-  sys.cwd()             string        current working directory (= ctx.cwd)
-  sys.ruleDir / sys.__dirname   string absolute directory path of running rule file
-  sys.rulePath / sys.__filename string absolute file path of running rule file
-  sys.exec(cmd, args?, opts?)   object synchronous command/script/binary execution (cross-platform & Shebang aware):
-                                       returns { code, status, exitCode, stdout, stderr, success }
-  sys.http.get(url, opts?)      object synchronous HTTP GET, returns { status, ok, headers, body }
-  sys.http.post(url, opts?)     object synchronous HTTP POST (body goes in opts.body), returns { status, ok, headers, body }
-  new Date()            standard JS clock (freeze windows, night rules…)
+  sys.env("KEY")        string|null   process environment
+  sys.ruleDir           string        absolute directory of the running rule file
+  sys.rulePath          string        absolute path of the running rule file
+  sys.exec(cmd, args?, opts?)   object ⚠️ sandbox escape (arbitrary processes).
+                                       Synchronous command/script/binary execution (cross-platform & Shebang aware):
+                                       returns { code, ok, stdout, stderr }.
+                                       Hard timeout built in: opts.timeout in ms
+                                       (default 10000); on expiry the whole
+                                       process group is killed and ok:false is
+                                       returned — the JS watchdog cannot fire
+                                       during a native blocking call, so exec
+                                       bounds itself.
+  sys.http.get(url, opts?)      object ⚠️ sandbox escape (arbitrary network).
+                                       synchronous HTTP GET, returns { status, ok, headers, body }
+  sys.http.post(url, opts?)     object ⚠️ sandbox escape. synchronous HTTP POST (body in opts.body)
+  No request-level cache: repeat reads of the same file are already pure
+  in-memory operations via the OS page cache; an app-level cache would only add
+  a concept that needs explaining.
   console.log(...)      stderr + file; console.error shares the channel
   sys.log(level, ...)   structured log; level is free-form (warn/info/debug…)
   Log files: default ~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log (UTC day
@@ -296,73 +432,161 @@ III. sys — autonomous SDK (in-memory cached + controlled execution & network)
 
 IV. Decision protocol (rule return values)
 --------------------------------------------------------------------------------
-  return null;                    → pass, continue to the next rule
-  return undefined / no return    → engine error, DENIED;
-                                   say `return null` to pass explicitly
-  return { action: "allow" };     → allow explicitly, keep going
-  return { action: "deny", reason: "…" };  → hard block, never a popup
-  return { action: "block", reason: "…" }; → block LLM inference, output reason directly
-                                             to user in terminal (UserPromptSubmit 0-Token)
-  return { additionalContext: "…" };       → inject guidance context to host (PostToolUse)
-  return { action: "confirm", reason, title?, gui?, timeout?, force_gui? };
-      · gui tri-state (2026-09-05 contract; by default NOT set):
+  return null / undefined / no return → no opinion, continue to the next rule
+  return { allow: true };        → allow explicitly, keep going
+  return { deny: "…" };          → hard block, never a popup
+  return { keepGoing: "…" };     → on Stop-like events: tell the host to keep
+                                   going (with reason). ⚠️ A `deny` on Stop-like
+                                   events means different things per host:
+                                   claude_code happens to emit decision:block
+                                   (= keep going), while antigravity emits
+                                   decision:deny (official: any value other
+                                   than "continue" allows the stop). To prevent
+                                   stopping you must use keepGoing.
+  return { inject: "…" };        → inject guidance context to host (PostToolUse)
+  return { mutateInput: {...} };             → rewrite tool arguments
+                                   (PreToolUse). Only gate events expose a
+                                   rewrite channel; when the host/event has
+                                   none (e.g. on non-PreToolUse events), the engine drops it
+                                   with a stderr notice and never emits a key
+                                   the host does not know
+  return { replaceOutput: "…" };             → replace the tool result (PostToolUse).
+                                   The value may be a string (text-block hosts
+                                   wrap it) or an object/array — Claude Code
+                                   built-in tools ignore an updatedToolOutput
+                                   whose value does not match the tool's
+                                   output shape (Bash is
+                                   {stdout,stderr,interrupted,isImage}), so
+                                   only a structured value can replace those
+  return { ask: "…", title?, gui?, timeout?, forceGui? };
+      · gui tri-state (by default NOT set):
           gui: true    → force the topmost desktop dialog (pierces --no-gui;
-                         only --dry-run skips it); same strength as force_gui
+                         only --dry-run skips it); same strength as forceGui:true
           unset/null   → host can ask: emit the host protocol ask (see V);
                          host cannot ask: GUI dialog as fallback, or an
                          auto-deny when no dialog is available
           gui: false   → no dialog: ask when the host can ask; otherwise
                          auto-deny (fail-closed)
       · timeout: seconds (default 60; <=0 treated as default); timeout = deny
-      · force_gui: true / action: "force_gui" → force the desktop dialog
+      · forceGui: true → force the desktop dialog
         (same strength as gui: true)
   return false;                   → deny (auto-generated reason)
   Engine hard limits: rules MUST be synchronous; 5s watchdog; 64MB heap cap;
   no async/Promise, no import/require; single-file ES syntax only.
-  Order: rules run in file-name lexicographic order; the first confirm, deny, or block
-  short-circuits; allow / no-opinion never short-circuit. Directory loading
+  Order: rules run in file-name lexicographic order; the first ask, deny, modify or
+  keep-going short-circuits; allow / no-opinion never short-circuit. Directory loading
   order is deterministic.
+  ⚠️ Order is semantic: inject / mutateInput / replaceOutput short-circuit too. If a
+  "context injection" rule sorts before a "hard block" rule, the block never runs.
+  Put blocking rules first when both must apply.
+  ⚠️ Within one rule, deny/ask/keepGoing together with inject/mutateInput/
+  replaceOutput: the gate decision wins and the modifiers are ignored — the
+  engine prints a stderr notice, so never rely on a swallowed modifier.
 
 V. Host decision matrix (can_ask × mode; output is mapped automatically)
 --------------------------------------------------------------------------------
-  agent value    normal mode ask    YOLO / no-confirm        deny/allow transport
-  claude_code    ✓ ask (terminal)   ✓ ask (official: hook ask
-                                    keeps top priority even
-                                    in no-confirm mode)
+  platform       normal mode ask    YOLO / no-confirm        deny/allow transport
+  claude_code    ✓ ask (terminal)   ✓ ask (official: "ask"
+                                    prompts the user to confirm, and also
+                                    forces the prompt in no-confirm modes)
                                                             hookSpecificOutput.permissionDecision
   codebuddy      ✓ ask (terminal)   ✓ ask (same as CC)       same
-  codex          ✓ ask (since 0.152) ✗ (no ask in bypass)    hookSpecificOutput.permissionDecision
-  antigravity    ✓ force_ask        ✗ (ask silently allowed) top-level {decision, reason}
+  codex          ✗ no ask in protocol ✗                      hookSpecificOutput.permissionDecision
+                 (official: emitting an ask is parsed but unsupported — the
+                  hook run is marked failed and the tool call CONTINUES, i.e.
+                  fail open. Confirmations fall back to the GUI dialog, or
+                  fail-closed deny when no dialog is available)
+  workbuddy      ✓ ask (terminal)   ✓ ask (same as CC)       same
+  gemini         ✗ no ask in protocol ✗                      top-level {decision, reason}
+  antigravity    ✓ force_ask        ✗ (bypass: no prompt,
+                                    GUI fallback)          top-level {decision, reason}
   generic        ✗ no ask protocol ✗                         hookSpecificOutput shape
   Confirm channel selection (gui tri-state × can_ask):
   · unset: can-ask hosts get the protocol ask directly; hosts that cannot
     ask fall back to the GUI dialog when available, or auto-deny when it is
     not (CI / --no-gui / tests);
-  · gui:true / force_gui: force the dialog on every host (pierces --no-gui);
+  · gui:true / forceGui:true: force the dialog on every host (pierces --no-gui);
   · gui:false: can-ask hosts get ask; hosts that cannot ask are denied
     (no dialog, fail-closed).
 
+  ── Event-name cheat sheet: host differences of ctx.event ──────────
+  ctx.event always uses the Claude Code spelling; Codex / CodeBuddy /
+  WorkBuddy / OpenCode (bridge) share the name verbatim. Only these hosts
+  differ:
+    PreToolUse        ← Gemini: BeforeTool
+    PostToolUse       ← Gemini: AfterTool
+    UserPromptSubmit  ← Gemini: BeforeAgent
+    Stop              ← Gemini: AfterAgent;AGY: no event name, shape-inferred
+    PreCompact        ← Gemini: PreCompress
+    PreInvocation     ← AGY: shape-inferred (Pre/PostInvocation share one
+                       input shape and are merged into this class)
+  Antigravity's stdin carries no event name (official schema has no
+  hook_event_name); the table above is what ai-hook infers from the envelope
+  shape. AGY's PostToolUse is deliberately NOT inferred (the `error` key is
+  undocumented for PreToolUse and a misclassification would drop the gate):
+  post-tool payloads report as PreToolUse and any decision a rule emits there
+  is ignored by the host (official PostToolUse output is `{}`). Host events
+  ai-hook does not model (TaskCompleted / Notification / ConfigChange / …)
+  surface with the host's own spelling in ctx.event — observable, not
+  decidable. Full 43-event capability matrix: docs/HOOK_EVENT_MATRIX.md.
+  ── Native matcher cheat sheet: intercept goal × host tool names ───
+  Run a command: CC Bash|PowerShell, Codex Bash, CB Bash, AGY run_command,
+  Gemini run_shell_command, OpenCode bash (lowercase); write a file: Write /
+  Write (alias apply_patch) / Write / write_to_file / write_file / write;
+  edit: Edit / Edit (or apply_patch) / Edit / replace_file_content /
+  replace / edit; read: Read / Read / Read / view_file / read_file / read.
+  matcher syntax is host-specific: CC treats a value containing only
+  [A-Za-z0-9_ ,|-] as an exact string/list, anything else as an unanchored
+  regex (anchor with ^…$ for whole-name); Codex is officially a "regex
+  string" (example anchors ^Bash$); CB is regex + case-sensitive, and a bare
+  Write is a *containment* match (anchor ^Write$ for exact); AGY/Gemini use
+  regex with "" or "*" matching all (Gemini regex only on tool events);
+  OpenCode's bridge matches CC configs against *lowercase* tool ids,
+  case-sensitively anchored — a CC-style "Bash" never hits opencode's bash,
+  so write lowercase matchers there.
+  MCP tool names: CC/Codex/CB use mcp__server__tool (double underscore; to
+  match a whole server write mcp__server__.*), Gemini uses mcp_server_tool
+  (single underscore). Rules read ctx.mcp.server / ctx.mcp.tool and never see
+  the separator difference.
+  Rules never need tool names: judge through the normalized views (ctx.cmd /
+  ctx.file / ctx.mcp / ctx.web / ctx.search / ctx.agent); keep the native
+  matcher wide so unrelated tool calls do not pay the hook's process cost.
+  Example rules: examples/ (embedded in README §Rule Demos).
+
 VI. Minimal integration
 --------------------------------------------------------------------------------
-  Claude Code / CodeBuddy (~/.claude/hooks.json or settings.json):
+  Claude Code (~/.claude/settings.json user-level, or <project>/.claude/settings.json
+  project-level; the official docs do not use a standalone hooks.json):
     { "hooks": { "PreToolUse": [
         { "matcher": "Bash|Write|Edit|Read",
           "hooks": [{ "type": "command", "command": "ai-hook ./rules/protect.js" }] } ],
       "UserPromptSubmit": [
-        { "matcher": ".*",
-          "hooks": [{ "type": "command", "command": "ai-hook ./rules/intercept.js" }] } ] } }
-  Antigravity (~/.gemini/config/hooks.json):
-    { "PreToolUse": [ { "matcher": "run_command|write_to_file|view_file",
-        "hooks": [ { "command": "ai-hook ./rules/protect.js", "timeout": 70 } ] } ] }
-  Codex (~/.codex/hooks.json): same envelope as Claude Code; matcher is regex.
-  Rule loading precedence: explicit CLI paths > AI_HOOK_RULES (path list, ';'
-  or ':' separated) > ./.ai-hook/rules.js or ./.ai-hook/rules/ directory
-  (one level, name-sorted). Files starting with '_' and *.tmp.js/*.test.js
-  are ignored.
+        { "hooks": [{ "type": "command", "command": "ai-hook ./rules/intercept.js" }] } ] } }
+  CodeBuddy (~/.codebuddy/settings.json or <project>/.codebuddy/settings.json):
+    same structure as above.
+  Antigravity (~/.gemini/config/hooks.json or workspace .agents/hooks.json;
+  the official schema wraps events in a top-level hook name with `enabled`):
+    { "ai-hook-gate": { "enabled": true,
+        "PreToolUse": [ { "matcher": "run_command|write_to_file|view_file",
+          "hooks": [ { "command": "ai-hook ./rules/protect.js", "timeout": 70 } ] } ] } }
+  Codex (~/.codex/hooks.json or inline config.toml): same envelope as Claude
+  Code; matcher is regex. Codex requires trusting the hook via the /hooks
+  panel — new or changed hooks are silently skipped until trusted.
+  Gemini CLI (~/.gemini/settings.json hooks section): events use Gemini's own
+  names (BeforeTool/AfterTool/...); the shell tool is named run_shell_command.
+  Rule loading precedence: explicit CLI paths > AI_HOOK_RULES (path list,
+  separator matches the platform PATH convention: ';' on Windows, ':' on
+  Unix) > ./.ai-hook/rules.js or ./.ai-hook/rules/ directory (one level,
+  name-sorted). Files starting with '_' and *.tmp.js/*.test.js are ignored.
 
 VII. Debug & operations
 --------------------------------------------------------------------------------
-  ai-hook test <command> <rules…>    run one command through all rules
+  ai-hook test <command> <rules…>    run one command through all rules; prints
+                                     each rule's decision, timing and the exact
+                                     host JSON. --platform picks the simulated
+                                     host (default claude_code; also codex /
+                                     codebuddy / workbuddy / gemini /
+                                     antigravity / opencode)
   ai-hook bench -i 1000 -c <command> benchmark
   ai-hook list [<rules…>]            show actually loaded rules
   ai-hook tutorial --lang zh         this document in Chinese

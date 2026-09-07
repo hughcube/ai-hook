@@ -3,7 +3,7 @@
  * 
  * ai-hook 全能力与上下文演示规则脚本 (Comprehensive Feature Demo)
  * 演示：
- * 1. 如何直接读取当前是什么类型 AI Agent (ctx.agent)
+ * 1. 如何直接读取当前是什么类型 AI Agent (ctx.platform)
  * 2. 如何获取 AI 原始输入 (ctx.raw, ctx.rawInput) 与参数 (ctx.args)
  * 3. 如何调用 sys 极速自治能力 (时间/Git/文件/环境变量)
  * 4. 如何控制：直接强制阻断(不弹窗) vs 唤起吸附倒计时弹窗 vs 命令行终端确认
@@ -13,13 +13,16 @@ export default function(ctx, sys) {
   // =========================================================================
   // 1. 获取当前是什么类型的 AI Agent
   // =========================================================================
-  // ctx.agent 可取值：
+  // ctx.platform 可取值：
   // - "antigravity" : Google Antigravity
   // - "claude_code"  : Anthropic Claude Code
   // - "codebuddy"    : CodeBuddy
+  // - "workbuddy"    : WorkBuddy（与 CodeBuddy 同内核，独立配置目录）
   // - "codex"        : OpenAI Codex
+  // - "gemini"       : Gemini CLI
+  // - "opencode"     : OpenCode（经桥接）
   // - "generic"      : 通用/其他未知 Agent
-  console.log(`[Demo] 当前 AI Agent: ${ctx.agent}`);
+  console.log(`[Demo] 当前 AI Agent: ${ctx.platform}`);
 
   // =========================================================================
   // 2. 获取 AI 原始输入与工具上下文
@@ -51,20 +54,20 @@ export default function(ctx, sys) {
 
   // 3.2 Git 仓库自治感知 (0.02ms 纯内存读取，不启动 git.exe 子进程)
   const currentBranch = sys.git.branch(); // 返回当前分支名，如 "master", "main", "feature/..."
-  const gitStatus = sys.git.status();     // 返回工作区状态信息
+  const gitRoot = sys.git.root();        // 仓库根目录绝对路径
 
-  // 3.3 文件与配置极速读取 (带单次请求单例内存缓存，0.01ms)
+  // 3.3 文件与配置极速读取 (0.01ms, 相对 ctx.cwd 解析)
   const hasEnv = sys.fs.exists(".env");
   const envContent = hasEnv ? sys.fs.readText(".env") : "";
 
   // 3.4 环境变量获取与规则自身路径元数据
   const appEnv = sys.env("APP_ENV") || "local";
-  const ruleDir = sys.ruleDir || sys.__dirname;   // 规则自身所在目录
-  const rulePath = sys.rulePath || sys.__filename; // 规则脚本自身完整路径
+  const ruleDir = sys.ruleDir;           // 规则自身所在目录
+  const rulePath = sys.rulePath;         // 规则脚本自身完整路径
 
   // 3.5 外部命令/脚本执行调度 (sys.exec: 为 0 Token 拦截与工具扩展服务)
-  // const echoRes = sys.exec("cmd", ["/c", "echo ok"], { cwd: sys.cwd() });
-  // 返回结构: { code, status, exitCode, stdout, stderr, success }
+  // const echoRes = sys.exec("cmd", ["/c", "echo ok"], { cwd: ctx.cwd });
+  // 返回结构: { code, ok, stdout, stderr }
   // Windows 下自动防止 WSL 存根劫持，原生指向 Git Bash
 
   // 3.6 轻量同步 HTTP 通信 (sys.http)
@@ -76,8 +79,7 @@ export default function(ctx, sys) {
     const fp = ctx.file.path || "";
     if (/\.env$|\.pem$|id_rsa|credentials\.json$/i.test(fp)) {
       return {
-        action: "deny",
-        reason: `【文件门禁】禁止 AI 直接覆写敏感文件: ${fp}`
+        deny: `【文件门禁】禁止 AI 直接覆写敏感文件: ${fp}`
       };
     }
   }
@@ -95,8 +97,7 @@ export default function(ctx, sys) {
   if (ctx.cmd && /git\s+push\b.*(-f|--force)\b/.test(ctx.cmd)) {
     if (currentBranch === "master" || currentBranch === "main") {
       return {
-        action: "deny", // 或 "block", "reject"
-        reason: `【硬阻断】核心分支 '${currentBranch}' 严禁执行强制推送操作 (force-push)！`
+        deny: `【硬阻断】核心分支 '${currentBranch}' 严禁执行强制推送操作 (force-push)！`
       };
     }
   }
@@ -105,10 +106,9 @@ export default function(ctx, sys) {
   // 敏感但允许人工复核的操作，唤起现代化置顶吸附卡片弹窗，支持自定义标题、超时倒计时：
   if (ctx.cmd && /\b(migrate|wipe|reset)\b/i.test(ctx.cmd)) {
     return {
-      action: "confirm",   // 触发确认门禁
+      ask: "检测到数据库重置或变更命令，可能影响现有数据！",
       title: "数据库结构变更授权", // 自定义弹窗标题
-      reason: "检测到数据库重置或变更命令，可能影响现有数据！",
-      gui: true,           // 显式指定呼出桌面现代化吸附弹窗 (默认 true)
+      gui: true,           // 强制唤起桌面现代化吸附弹窗（穿透 --no-gui；默认不配置，跟随宿主能力）
       timeout: 45          // 自定义本次弹窗倒计时（秒），超时自动拒绝关闭
     };
   }
@@ -117,9 +117,8 @@ export default function(ctx, sys) {
   // 命令行内交互问询（如 Claude Code ask / Antigravity force_ask），不弹窗：
   if (ctx.cmd && /\b(npm\s+publish|cargo\s+publish)\b/i.test(ctx.cmd)) {
     return {
-      action: "confirm",
-      reason: "检测到版本发布命令，是否确认推送到公共制品库？",
-      gui: false           // 设置为 false 则绝不弹窗，转为终端命令行提示
+      ask: "检测到版本发布命令，是否确认推送到公共制品库？",
+      gui: false           // 不弹窗：宿主能 ask 走终端 ask，不能 ask 直接拒绝（fail-closed）
     };
   }
 
@@ -127,8 +126,7 @@ export default function(ctx, sys) {
   // 拦截特定本地执行型命令（如 /ai:balance），阻断大模型推理，reason 直接回显给用户：
   if (ctx.event === "UserPromptSubmit" && ctx.prompt && ctx.prompt.startsWith("/demo:intercept")) {
     return {
-      action: "block",
-      reason: "已命中本地拦截命令，免大模型推理，当前账户状态良好！"
+      deny: "已命中本地拦截命令，免大模型推理，当前账户状态良好！"
     };
   }
 
@@ -136,7 +134,7 @@ export default function(ctx, sys) {
   // 编辑或写入迁移文件后，向大模型注入额外规范提示：
   if (ctx.event === "PostToolUse" && ctx.file && /[/\\]migrations[/\\]/i.test(ctx.file.path || "")) {
     return {
-      additionalContext: "刚编辑了数据库迁移文件，请确认是否补充了配套业务代码与往返测试！"
+      inject: "刚编辑了数据库迁移文件，请确认是否补充了配套业务代码与往返测试！"
     };
   }
 

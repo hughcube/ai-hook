@@ -1,33 +1,24 @@
 use rquickjs::{Ctx, Function, Object, Result};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-#[derive(Default, Clone)]
-pub struct RequestCache {
-    files: Rc<RefCell<HashMap<String, Option<String>>>>,
-    exists: Rc<RefCell<HashMap<String, bool>>>,
-    git_branch: Rc<RefCell<Option<Option<String>>>>,
-}
+use crate::NoConsoleSpawn;
 
-impl RequestCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
+/// Host-capability surface handed to every rule.
+///
+/// There is deliberately **no request-level cache** here: within one hook
+/// invocation the OS page/dentry cache already turns repeated reads of the
+/// same file into pure in-memory operations, and the rule set has no
+/// shared-read pattern worth an extra concept (one request cache, its
+/// invalidation rules, and its memory bounds). Keep this object boring.
 pub struct SysContext {
     cwd: PathBuf,
-    cache: RequestCache,
 }
 
 impl SysContext {
-    pub fn new(cwd: impl Into<PathBuf>, cache: RequestCache) -> Self {
-        Self {
-            cwd: cwd.into(),
-            cache,
-        }
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: cwd.into() }
     }
 
     fn resolve_path(&self, rel: &str) -> PathBuf {
@@ -40,38 +31,15 @@ impl SysContext {
     }
 
     pub fn fs_exists(&self, path_str: &str) -> bool {
-        let full = self.resolve_path(path_str);
-        let key = full.to_string_lossy().to_string();
-        let mut cache = self.cache.exists.borrow_mut();
-        if let Some(&val) = cache.get(&key) {
-            return val;
-        }
-        let exists = full.exists();
-        cache.insert(key, exists);
-        exists
+        self.resolve_path(path_str).exists()
     }
 
-    pub fn fs_read(&self, path_str: &str) -> Option<String> {
-        let full = self.resolve_path(path_str);
-        let key = full.to_string_lossy().to_string();
-        let mut cache = self.cache.files.borrow_mut();
-        if let Some(val) = cache.get(&key) {
-            return val.clone();
-        }
-        let res = std::fs::read_to_string(&full).ok();
-        cache.insert(key, res.clone());
-        res
+    pub fn fs_read_text(&self, path_str: &str) -> Option<String> {
+        std::fs::read_to_string(self.resolve_path(path_str)).ok()
     }
 
     pub fn git_branch(&self) -> Option<String> {
-        let mut cache = self.cache.git_branch.borrow_mut();
-        if let Some(cached) = &*cache {
-            return cached.clone();
-        }
-
-        let branch = Self::find_git_branch(&self.cwd);
-        *cache = Some(branch.clone());
-        branch
+        Self::find_git_branch(&self.cwd)
     }
 
     fn find_git_branch(start_dir: &Path) -> Option<String> {
@@ -116,30 +84,22 @@ impl SysContext {
     }
 }
 
-/// Binds purely nanosecond/microsecond native primitives to the JS runtime.
-/// Deliberately avoids slow subprocess spawns.
+/// Binds the host-capability object to the JS runtime. Read-only lookups
+/// (env/fs/git) are pure in-memory native calls; `exec`/`http` are the
+/// deliberate sandbox-escape hatches — flagged at their binding sites below.
 pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Result<Object<'js>> {
     let sys = Object::new(js_ctx.clone())?;
 
-    // 1. sys.env: Pure memory environment lookup (< 1 µs)
-    // Supports both sys.env("KEY") and sys.env.get("KEY")
+    // 1. sys.env(key): pure in-memory environment lookup (< 1 µs).
     let env_fn = Function::new(js_ctx.clone(), |name: Option<String>| -> Option<String> {
         name.and_then(|n| std::env::var(n).ok())
     })?;
-    let env_get = Function::new(js_ctx.clone(), |name: String| -> Option<String> {
-        std::env::var(name).ok()
-    })?;
-    env_fn.set("get", env_get)?;
     sys.set("env", env_fn)?;
 
-    // 2. sys.cwd(): Current working directory
-    let sys_for_cwd = sys_ctx.clone();
-    let cwd_fn = Function::new(js_ctx.clone(), move || -> String {
-        sys_for_cwd.cwd.to_string_lossy().to_string()
-    })?;
-    sys.set("cwd", cwd_fn)?;
+    // (sys.cwd() does not exist: the working directory is `ctx.cwd`, and
+    // SysContext resolves every relative path passed to fs/exec against it.)
 
-    // 3. sys.fs: Rust native file I/O with request-scoped caching (~ 0.01 ms)
+    // 2. sys.fs: Rust-native file I/O. One name per operation.
     let fs_obj = Object::new(js_ctx.clone())?;
     let sys_for_exists = sys_ctx.clone();
     let exists_fn = Function::new(js_ctx.clone(), move |path: String| -> bool {
@@ -149,9 +109,8 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
 
     let sys_for_read = sys_ctx.clone();
     let read_fn = Function::new(js_ctx.clone(), move |path: String| -> Option<String> {
-        sys_for_read.fs_read(&path)
+        sys_for_read.fs_read_text(&path)
     })?;
-    fs_obj.set("read", read_fn.clone())?;
     fs_obj.set("readText", read_fn)?;
 
     let sys_for_list = sys_ctx.clone();
@@ -175,7 +134,8 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     fs_obj.set("list", list_fn)?;
     sys.set("fs", fs_obj)?;
 
-    // 4. sys.git: Pure-memory .git/HEAD parser (~ 0.02 ms, 0 git.exe processes)
+    // 3. sys.git: pure-memory .git/HEAD parser (~ 0.02 ms, 0 git.exe
+    //    processes). Branch and repo root are the whole surface.
     let git_obj = Object::new(js_ctx.clone())?;
     let sys_for_branch = sys_ctx.clone();
     let branch_fn = Function::new(js_ctx.clone(), move || -> Option<String> {
@@ -195,19 +155,23 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
         None
     })?;
     git_obj.set("root", root_fn)?;
-
-    let sys_for_git_status = sys_ctx.clone();
-    let status_fn = Function::new(js_ctx.clone(), move || -> String {
-        if let Some(b) = sys_for_git_status.git_branch() {
-            format!("branch: {}", b)
-        } else {
-            "not a git repository".to_string()
-        }
-    })?;
-    git_obj.set("status", status_fn)?;
     sys.set("git", git_obj)?;
 
-    // 5. sys.exec(cmd, args?, options?): Execute external command or script
+    // 4. sys.exec(cmd, args?, options?): Execute external command or script.
+    //
+    //    ⚠️ SANDBOX ESCAPE: this runs arbitrary processes with the hook's full
+    //    permissions — the QuickJS sandbox does not contain it. `sys` is the
+    //    only escape hatch (plain JS has zero I/O primitives), which is why it
+    //    lives here visibly instead of being spread across rules. The result
+    //    carries one exit-code field (`code`) and one success flag (`ok`,
+    //    matching `sys.http`).
+    //
+    //    Liveness bound: the JS watchdog interrupt cannot fire while a native
+    //    call blocks, so the execution is bounded here instead — `timeout`
+    //    (ms, default 10 000) after which the whole process group is killed
+    //    and the result reports `ok: false`. Without it a hanging child would
+    //    stall the entire hook until the host's own (much longer) hook
+    //    timeout kicks in.
     let sys_for_exec = sys_ctx.clone();
     let exec_fn = Function::new(
         js_ctx.clone(),
@@ -219,6 +183,7 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             let raw_args = args.0.unwrap_or_default();
             let mut opt_input = None;
             let mut target_cwd = sys_for_exec.cwd.clone();
+            let mut timeout_ms: u64 = 10_000;
 
             if let Some(ref opt) = options.0 {
                 if let Ok(cwd_val) = opt.get::<_, String>("cwd") {
@@ -227,12 +192,16 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                 if let Ok(inp) = opt.get::<_, String>("input") {
                     opt_input = Some(inp);
                 }
+                if let Ok(t) = opt.get::<_, u64>("timeout") {
+                    timeout_ms = t;
+                }
             }
 
             let resolved = resolve_executable(&cmd, raw_args, &target_cwd);
             let mut cmd_obj = std::process::Command::new(&resolved.program);
             cmd_obj.args(&resolved.args);
             cmd_obj.current_dir(&target_cwd);
+            cmd_obj.no_console_window();
 
             if let Some(ref opt) = options.0
                 && let Ok(env_obj) = opt.get::<_, Object<'js>>("env")
@@ -256,41 +225,96 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             let result_obj = Object::new(ctx)?;
             match cmd_obj.group_spawn() {
                 Ok(mut group_child) => {
-                    if let (Some(input_str), Some(mut stdin)) =
-                        (opt_input, group_child.inner().stdin.take())
+                    // Feed stdin from a thread: a child that never reads must
+                    // not block us on write_all before we even start polling.
+                    if let Some(input_str) = opt_input
+                        && let Some(mut stdin) = group_child.inner().stdin.take()
                     {
                         use std::io::Write;
-                        let _ = stdin.write_all(input_str.as_bytes());
+                        std::thread::spawn(move || {
+                            let _ = stdin.write_all(input_str.as_bytes());
+                        });
                     }
-                    match group_child.wait_with_output() {
-                        Ok(output) => {
-                            let code = output.status.code().unwrap_or(-1);
-                            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                            result_obj.set("code", code)?;
-                            result_obj.set("status", code)?;
-                            result_obj.set("exitCode", code)?;
-                            result_obj.set("stdout", stdout)?;
-                            result_obj.set("stderr", stderr)?;
-                            result_obj.set("success", output.status.success())?;
+                    // Drain both pipes from threads so a chatty child cannot
+                    // deadlock on a full pipe buffer while we poll for exit.
+                    let stdout_pipe = group_child.inner().stdout.take();
+                    let stderr_pipe = group_child.inner().stderr.take();
+                    let out_handle = std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        if let Some(mut p) = stdout_pipe {
+                            use std::io::Read;
+                            let _ = p.read_to_end(&mut buf);
                         }
-                        Err(e) => {
-                            result_obj.set("code", -1)?;
-                            result_obj.set("status", -1)?;
-                            result_obj.set("exitCode", -1)?;
-                            result_obj.set("stdout", "")?;
-                            result_obj.set("stderr", format!("wait failed: {}", e))?;
-                            result_obj.set("success", false)?;
+                        buf
+                    });
+                    let err_handle = std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        if let Some(mut p) = stderr_pipe {
+                            use std::io::Read;
+                            let _ = p.read_to_end(&mut buf);
                         }
+                        buf
+                    });
+
+                    // Poll for exit with a hard deadline; on expiry kill the
+                    // whole group (children included) and reap it.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                    let mut status = group_child.try_wait().ok().flatten();
+                    let mut timed_out = false;
+                    while status.is_none() {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = group_child.kill();
+                            let _ = group_child.wait();
+                            timed_out = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        status = group_child.try_wait().ok().flatten();
+                    }
+
+                    let stdout_bytes = out_handle.join().unwrap_or_default();
+                    let stderr_bytes = err_handle.join().unwrap_or_default();
+                    let stderr_text = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+                    if timed_out {
+                        result_obj.set("code", -1)?;
+                        result_obj.set("ok", false)?;
+                        result_obj
+                            .set("stdout", String::from_utf8_lossy(&stdout_bytes).to_string())?;
+                        result_obj.set(
+                            "stderr",
+                            format!(
+                                "timed out after {} ms{}",
+                                timeout_ms,
+                                if stderr_text.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n{}", stderr_text)
+                                }
+                            ),
+                        )?;
+                    } else if let Some(exit) = status {
+                        let code = exit.code().unwrap_or(-1);
+                        result_obj.set("code", code)?;
+                        result_obj.set("ok", exit.success())?;
+                        result_obj
+                            .set("stdout", String::from_utf8_lossy(&stdout_bytes).to_string())?;
+                        result_obj.set("stderr", stderr_text)?;
+                    } else {
+                        // try_wait error path (failed to poll)
+                        result_obj.set("code", -1)?;
+                        result_obj.set("ok", false)?;
+                        result_obj
+                            .set("stdout", String::from_utf8_lossy(&stdout_bytes).to_string())?;
+                        result_obj.set("stderr", stderr_text)?;
                     }
                 }
                 Err(e) => {
                     result_obj.set("code", -1)?;
-                    result_obj.set("status", -1)?;
-                    result_obj.set("exitCode", -1)?;
+                    result_obj.set("ok", false)?;
                     result_obj.set("stdout", "")?;
                     result_obj.set("stderr", format!("spawn failed: {}", e))?;
-                    result_obj.set("success", false)?;
                 }
             }
             Ok(result_obj)
@@ -298,7 +322,11 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     )?;
     sys.set("exec", exec_fn)?;
 
-    // 6. sys.http: Light HTTP client
+    // 5. sys.http: light HTTP client.
+    //
+    //    ⚠️ SANDBOX ESCAPE: arbitrary network access, same trust level as
+    //    `sys.exec`. Requests default to a 10 s timeout; `ok` mirrors the
+    //    2xx range so rules never hand-roll `status >= 200 && status < 300`.
     let http_obj = Object::new(js_ctx.clone())?;
 
     fn execute_http_request<'js>(

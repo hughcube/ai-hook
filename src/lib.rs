@@ -60,6 +60,33 @@ pub use engine::{
 pub use fast_path::check_fast_path;
 pub use i18n::{Lang, lang};
 pub use protocol::{
-    ConversationInfo, FileAction, FileContext, HookContext, HookDecision, Platform, env_flag_true,
+    AgentContext, AgentKind, ConversationInfo, FileAction, FileContext, HookContext, HookDecision,
+    McpContext, Platform, SearchContext, SearchKind, WebAction, WebContext, env_flag_true,
 };
 pub use ui::GuiDialog;
+
+/// Spawns console children without a visible console window.
+///
+/// ai-hook is a GUI-subsystem binary on Windows, so every console child
+/// (git, node, powershell, …) allocates a fresh conhost window unless
+/// CREATE_NO_WINDOW is passed — a visible flash on every `sys.exec` call and
+/// every dialog spawn. No-op on other platforms.
+pub trait NoConsoleSpawn {
+    fn no_console_window(&mut self) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl NoConsoleSpawn for std::process::Command {
+    fn no_console_window(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NO_WINDOW)
+    }
+}
+
+#[cfg(not(windows))]
+impl NoConsoleSpawn for std::process::Command {
+    fn no_console_window(&mut self) -> &mut Self {
+        self
+    }
+}

@@ -9,12 +9,13 @@
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
-use ai_hook::i18n::{Msg, t, tf};
+use ai_hook::i18n::{Msg, t};
 use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{ConfirmPath, HookContext, HookDecision, confirm_path};
 use ai_hook::ui::GuiDialog;
 use ai_hook::{errln, outln};
 use clap::FromArgMatches;
+use serde_json::json;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -120,8 +121,8 @@ fn attach_parent_console() {
     }
 }
 
-/// Timestamped stderr log line: `[2026-09-05 02:46:12] message…`.
-/// All diagnostics carry a human-readable local time (2026-09-05 需求).
+/// Timestamped stderr log line: `[YYYY-MM-DD HH:MM:SS] message…`.
+/// All diagnostics carry a human-readable local time.
 macro_rules! eprint_ts {
     ($($arg:tt)*) => {
         errln!("[{}] {}", ai_hook::engine::local_now_str(), format_args!($($arg)*))
@@ -450,13 +451,15 @@ fn main() {
             ref command,
             ref tool,
             ref file,
+            ref platform,
             ref scripts,
-        }) => handle_test(&args, command, tool, file, scripts),
+        }) => handle_test(&args, command, tool, file, platform, scripts),
         Some(Commands::Bench {
             iterations,
             ref command,
+            ref platform,
             ref scripts,
-        }) => handle_bench(&args, iterations, command, scripts),
+        }) => handle_bench(&args, iterations, command, platform, scripts),
         Some(Commands::Install { ref target_dir }) => handle_install(target_dir.clone()),
         Some(Commands::Update { force, ref repo }) => {
             if let Err(e) = ai_hook::update::handle_update(force, repo) {
@@ -499,12 +502,23 @@ fn print_output(output: &str) {
         outln!("{}", output);
     }
     use std::io::Write;
-    let _ = std::io::stdout().flush();
+    let flush = std::io::stdout().flush();
     // Final mark is taken after flushing the decision, so it reflects the
     // whole lifecycle; everything after it is `exit()` teardown.
     prof_mark!("⑦ 输出已写出");
     prof_flush!();
     let _ = std::io::stderr().flush();
+    if flush.is_err() && !output.is_empty() {
+        // The decision could not be delivered: the host will read empty
+        // stdout and treat it as "allow". Exit 2 so blocking hosts (Claude
+        // Code / Codex) still stop the action — the one outcome code no JSON
+        // can override. Non-blocking hosts lose nothing: they were going to
+        // read nothing anyway.
+        errln!(
+            "[ai-hook] decision output could not be flushed to stdout (host pipe closed?); exiting 2 so blocking hosts still deny"
+        );
+        std::process::exit(2);
+    }
     std::process::exit(0);
 }
 
@@ -608,9 +622,14 @@ fn handle_dispatch(args: &Cli) {
                 print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
             }
         } else {
-            // No dialog: emit a terminal "ask" so ask-capable hosts let the
-            // user decide. The plain Deny path would silently block a host
-            // that may simply use an envelope shape we have not seen yet.
+            // No dialog: hand the decision to the renderer as a Confirm.
+            // An unparseable payload has no host identity at all
+            // (`Platform::Generic` + `HookEvent::Other`), which the capability
+            // matrix scores as NONE, so this degrades to `Op::Deny` rather
+            // than emitting a protocol `ask`. That is the intended direction:
+            // an unreadable payload is not a verified allow. Ask-capable hosts
+            // would only see an `ask` here if the payload named a platform the
+            // matrix actually grants `ask` to — it cannot, by construction.
             print_output(
                 &HookDecision::Confirm {
                     reason,
@@ -647,10 +666,13 @@ fn handle_dispatch(args: &Cli) {
     prof_mark!("⑤ 规则文件加载");
 
     if rules.is_empty() {
-        // No gate at all. If the operator pointed at paths that loaded nothing
-        // (typo, wrong extension), this is a silent full bypass - warn loudly.
-        if !explicit_paths.is_empty() {
-            eprint_ts!("[ai-hook] {}", tf(Msg::M137, &[&explicit_paths.len()]));
+        // No gate at all. If rules were configured (explicit CLI paths or
+        // AI_HOOK_RULES) but nothing loaded (typo, wrong extension, filtered
+        // directory rules), this is a silent full bypass - warn loudly so the
+        // operator hears it even when the host only surfaces stderr in its
+        // debug log.
+        if rules_configured(&explicit_paths) {
+            eprint_ts!("[ai-hook] {}", t(Msg::M160));
         }
         print_output(&HookDecision::Allow.to_json_output(&ctx, None));
         return;
@@ -675,7 +697,7 @@ fn handle_dispatch(args: &Cli) {
         let (decision, _) = runner.evaluate_all(&rules, &ctx, policy);
         prof_mark!("⑥ 规则执行完成");
 
-        // 4. Handle confirmation & GUI prompt (gui 三态语义,2026-09-05 约定):
+        // 4. Handle confirmation & GUI prompt (gui 三态语义):
         //    gui:true / force_gui → 强制弹窗(穿透 --no-gui,仅 dry-run 演练除外);
         //    缺省(不配置)→ 宿主能 ask 走协议 ask;不能 ask 时 GUI 兜底(不可用则自动拒绝);
         //    gui:false → 能 ask 走 ask;不能 ask 自动拒绝(规则禁弹窗 → fail-closed)。
@@ -698,7 +720,16 @@ fn handle_dispatch(args: &Cli) {
                 || env_flag_true("AI_HOOK_FORCE_GUI")
                 || rule_force_gui.unwrap_or(false);
 
-            match confirm_path(*gui, forced, ctx.can_ask(), gui_enabled, args.dry_run) {
+            // The protocol-ask channel needs BOTH gates: the platform still
+            // prompts in this mode (`can_ask`) AND the (platform, event) pair
+            // has an ask slot (`caps.ask`). Using only `can_ask` here used to
+            // pick `ConfirmPath::Ask` on events whose capability row has no
+            // ask (UserPromptSubmit / PermissionRequest / PreCompact), so the
+            // dialog fallback never ran and the confirm degraded to a hard
+            // deny with no way to authorize. The renderer applies the same
+            // conjunction, so both layers now agree.
+            let ask_ok = ctx.can_ask() && ctx.capabilities().ask;
+            match confirm_path(*gui, forced, ask_ok, gui_enabled, args.dry_run) {
                 ConfirmPath::Popup => {
                     let prompt_target = ctx
                         .cmd
@@ -719,7 +750,7 @@ fn handle_dispatch(args: &Cli) {
                 }
                 ConfirmPath::Ask => {
                     // 不弹窗:gui_approved 保持 None → 输出层按宿主协议输出
-                    // ask(CC/CB)、ask(Codex 0.152+ 普通)、force_ask(AGY 交互)
+                    // ask(CC/CB)、force_ask(AGY 交互)。Codex 不支持 ask（由能力矩阵和 auto_deny 兜底）
                 }
                 ConfirmPath::AutoDeny => auto_deny = true,
             }
@@ -777,12 +808,114 @@ fn handle_list(args: &Cli, scripts: &[PathBuf]) {
     }
 }
 
-fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[PathBuf]) {
+/// Hosts whose envelope `test` / `bench` knows how to synthesize.
+const TEST_PLATFORMS: &[&str] = &[
+    "claude_code",
+    "codex",
+    "codebuddy",
+    "workbuddy",
+    "gemini",
+    "antigravity",
+    "opencode",
+];
+
+/// Builds the envelope a host would really deliver for a command tool call.
+///
+/// `test` / `bench` used to hard-code one Antigravity shape, so the simulated
+/// `ctx.platform` was always `antigravity` and no other host's rendering could
+/// be inspected — a rule could pass `test` and still emit the wrong JSON in
+/// production. The shape is host-specific in ways that matter: only
+/// Antigravity nests the tool under `toolCall`, only Gemini spells the event
+/// `BeforeTool`, and `transcript_path` is what carries the product name.
+fn synthetic_payload(platform: &str, command: &str, tool: &str, file: &str, cwd: &str) -> String {
+    match platform {
+        "antigravity" => {
+            let mut args = serde_json::Map::new();
+            args.insert("CommandLine".into(), json!(command));
+            args.insert("Cwd".into(), json!(cwd));
+            if !file.is_empty() {
+                args.insert("TargetFile".into(), json!(file));
+            }
+            // `name` lives inside toolCall for the Antigravity envelope;
+            // omitting it made `ctx.cmd` always null and silently disabled
+            // every command rule.
+            json!({ "toolCall": { "name": tool, "args": args }, "conversationId": "test-session" })
+                .to_string()
+        }
+        "gemini" => {
+            let mut input = serde_json::Map::new();
+            input.insert("command".into(), json!(command));
+            if !file.is_empty() {
+                input.insert("file_path".into(), json!(file));
+            }
+            json!({
+                "hook_event_name": "BeforeTool",
+                "tool_name": tool,
+                "tool_input": input,
+                "session_id": "test-session",
+                "transcript_path": format!("{cwd}/.gemini/tmp/test-session.json"),
+                "cwd": cwd,
+            })
+            .to_string()
+        }
+        // Claude-Code-shaped envelope: Claude Code, Codex, CodeBuddy,
+        // WorkBuddy and the OpenCode bridge. `transcript_path` carries the
+        // product directory, which is what lets the simulated platform resolve.
+        _ => {
+            let dir = match platform {
+                "codex" => ".codex",
+                "codebuddy" => ".codebuddy",
+                "workbuddy" => ".workbuddy",
+                _ => ".claude",
+            };
+            let mut input = serde_json::Map::new();
+            input.insert("command".into(), json!(command));
+            if !file.is_empty() {
+                input.insert("file_path".into(), json!(file));
+            }
+            let mut obj = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": input,
+                "session_id": "test-session",
+                "transcript_path": format!("{cwd}/{dir}/projects/test-session.jsonl"),
+                "cwd": cwd,
+            });
+            if platform == "codex" {
+                obj["turn_id"] = json!("test-turn");
+            }
+            obj.to_string()
+        }
+    }
+}
+
+/// Prints the JSON the host would really receive. Empty output means "allow"
+/// in every host protocol, so an empty render is named rather than left blank.
+fn print_rendered(decision: &HookDecision, ctx: &HookContext) {
+    let rendered = decision.to_json_output(ctx, None);
+    if rendered.is_empty() {
+        outln!("{}: {}", t(Msg::M156), t(Msg::M077));
+    } else {
+        outln!("{}: {}", t(Msg::M156), rendered);
+    }
+}
+
+fn handle_test(
+    args: &Cli,
+    command: &str,
+    tool: &str,
+    file: &str,
+    platform: &str,
+    scripts: &[PathBuf],
+) {
     outln!("{}...", t(Msg::M066));
     outln!("{}: {}", t(Msg::M067), command);
     outln!("{}: {}", t(Msg::M068), tool);
     if !file.is_empty() {
         outln!("{}: {}", t(Msg::M069), file);
+    }
+    if !TEST_PLATFORMS.contains(&platform) {
+        outln!("⚠️  {}: {}", t(Msg::M155), platform);
     }
     outln!("------------------------------------------------------------");
 
@@ -790,22 +923,19 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // `name` lives inside toolCall for the Antigravity envelope; omitting it
-    // made `ctx.cmd` always null and silently disabled every command rule.
-    let raw_payload = serde_json::json!({
-        "toolCall": {
-            "name": tool,
-            "args": {
-                "CommandLine": command,
-                "TargetFile": file,
-                "Cwd": cwd,
-            }
-        },
-        "conversationId": "test-session"
-    })
-    .to_string();
+    // The OpenCode bridge marks its envelopes with OPENCODE_COMPAT=1; without
+    // the marker the synthesized payload would be classified as claude_code
+    // and `test --platform opencode` could never exercise the OpenCode
+    // renderer. The env is process-local and this process exits right after,
+    // so nothing leaks.
+    if platform == "opencode" {
+        unsafe { std::env::set_var("OPENCODE_COMPAT", "1") };
+    }
 
+    let raw_payload = synthetic_payload(platform, command, tool, file, &cwd);
     let ctx = HookContext::parse(&raw_payload);
+    outln!("{}: {}", t(Msg::M157), ctx.platform);
+    outln!("------------------------------------------------------------");
 
     // Fast path check. Skipped when the bypass is disabled so whitelisted
     // commands can still be traced through the rules with `test`.
@@ -814,6 +944,7 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
         if let Some(decision) = check_fast_path(&ctx) {
             outln!("⚡ {} {:?}", t(Msg::M070), start_fast.elapsed());
             outln!("{}: {:?}", t(Msg::M071), decision);
+            print_rendered(&decision, &ctx);
             outln!("ℹ️  {}", t(Msg::M138));
             return;
         }
@@ -852,13 +983,24 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
             Some(HookDecision::Deny { ref reason }) => {
                 format!("{} ({})", t(Msg::M076), reason)
             }
-            Some(HookDecision::Block { ref reason }) => {
-                format!("BLOCK ({})", reason)
+            Some(HookDecision::Modify(ref m)) => {
+                if let Some(text) = &m.inject {
+                    format!("{} ({})", t(Msg::M151), text)
+                } else if m.mutate_input.is_some() {
+                    format!("{} (mutateInput)", t(Msg::M153))
+                } else if let Some(out) = &m.replace_output {
+                    match out {
+                        serde_json::Value::String(s) => {
+                            format!("{} ({})", t(Msg::M152), s)
+                        }
+                        other => format!("{} ({})", t(Msg::M152), other),
+                    }
+                } else {
+                    t(Msg::M151).to_string()
+                }
             }
-            Some(HookDecision::PostContext {
-                ref additional_context,
-            }) => {
-                format!("POST_CONTEXT ({})", additional_context)
+            Some(HookDecision::KeepGoing { ref reason }) => {
+                format!("KEEP_GOING ({})", reason)
             }
             Some(HookDecision::Allow) => t(Msg::M077).to_string(),
             None => t(Msg::M078).to_string(),
@@ -885,10 +1027,12 @@ fn handle_test(args: &Cli, command: &str, tool: &str, file: &str, scripts: &[Pat
 
     outln!("------------------------------------------------------------");
     outln!("{}: {:?}", t(Msg::M071), final_decision);
+    // The Debug form above is the rule's intent; this is what the host parses.
+    print_rendered(&final_decision, &ctx);
     outln!("{}: {:?}", t(Msg::M080), total_elapsed);
 }
 
-fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf]) {
+fn handle_bench(args: &Cli, iterations: usize, command: &str, platform: &str, scripts: &[PathBuf]) {
     outln!(
         "{}: {} {} '{}'",
         t(Msg::M081),
@@ -901,19 +1045,19 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, scripts: &[PathBuf
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let raw_payload = serde_json::json!({
-        "toolCall": {
-            "name": "run_command",
-            "args": {
-                "CommandLine": command,
-                "Cwd": cwd,
-            }
-        },
-        "conversationId": "bench-session"
-    })
-    .to_string();
+    if !TEST_PLATFORMS.contains(&platform) {
+        outln!("⚠️  {}: {}", t(Msg::M155), platform);
+    }
 
+    // Same OpenCode marker as `test` (see handle_test): the synthesized
+    // envelope only classifies as opencode when OPENCODE_COMPAT is set.
+    if platform == "opencode" {
+        unsafe { std::env::set_var("OPENCODE_COMPAT", "1") };
+    }
+
+    let raw_payload = synthetic_payload(platform, command, "Bash", "", &cwd);
     let ctx = HookContext::parse(&raw_payload);
+    outln!("{}: {}", t(Msg::M157), ctx.platform);
     let explicit_paths = collect_target_rules(args, Some(scripts));
     let rules = RuleLoader::load_rules(&explicit_paths);
 
@@ -969,9 +1113,8 @@ fn is_dir_writable(dir: &std::path::Path) -> bool {
 /// Parses $PATH into entries, tolerating the MSYS/Git-Bash shape that is
 /// injected into native Windows children: ':'-separated entries with '/c/…'
 /// drive-mount prefixes. std::env::split_paths() alone mis-parses that shape
-/// on Windows (it splits on ';'), which used to silently defeat automatic
-/// install placement (2026-09-05: an `install` from Git Bash fell back to
-/// ~/bin instead of honoring the first writable PATH entry).
+/// on Windows (it splits on ';'), so this parser is what keeps automatic
+/// install placement working when the hook is driven from Git Bash.
 fn path_entries_from_env() -> Vec<PathBuf> {
     let Some(raw) = std::env::var_os("PATH") else {
         return Vec::new();
