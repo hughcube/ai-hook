@@ -5,6 +5,33 @@ use std::rc::Rc;
 
 use crate::NoConsoleSpawn;
 
+/// Windows: CREATE_NO_WINDOW (see NoConsoleSpawn docs).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Spawn `cmd` inside a job/process-group with stdout/stderr piped, keeping
+/// the console hidden on Windows.
+///
+/// ⚠️ Must go through `CommandGroupBuilder::creation_flags`, NOT
+/// `std::process::Command::creation_flags`: command-group 5.x overwrites the
+/// std Command flags with `builder.creation_flags | CREATE_SUSPENDED` at
+/// spawn time, silently dropping CREATE_NO_WINDOW — on this GUI-subsystem
+/// binary every console child then allocates a fresh conhost window (a
+/// visible new-terminal flash on every sys.exec call).
+#[cfg(windows)]
+fn group_spawn_hidden(cmd: &mut std::process::Command) -> std::io::Result<command_group::GroupChild> {
+    use command_group::CommandGroup;
+    cmd.group()
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+}
+
+#[cfg(not(windows))]
+fn group_spawn_hidden(cmd: &mut std::process::Command) -> std::io::Result<command_group::GroupChild> {
+    use command_group::CommandGroup;
+    cmd.group_spawn()
+}
+
 /// Host-capability surface handed to every rule.
 ///
 /// There is deliberately **no request-level cache** here: within one hook
@@ -221,9 +248,8 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                 cmd_obj.stdin(std::process::Stdio::null());
             }
 
-            use command_group::CommandGroup;
             let result_obj = Object::new(ctx)?;
-            match cmd_obj.group_spawn() {
+            match group_spawn_hidden(&mut cmd_obj) {
                 Ok(mut group_child) => {
                     // Feed stdin from a thread: a child that never reads must
                     // not block us on write_all before we even start polling.
