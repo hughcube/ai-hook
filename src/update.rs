@@ -668,15 +668,14 @@ pub fn clean_old_temp_files(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if file_name.starts_with("ai-hook")
-                    && (file_name.contains(".old")
-                        || file_name.contains(".bak")
-                        || file_name.contains(".tmp")
-                        || file_name.contains(".new"))
-                {
-                    let _ = std::fs::remove_file(&path);
-                }
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && file_name.starts_with("ai-hook")
+                && (file_name.contains(".old")
+                    || file_name.contains(".bak")
+                    || file_name.contains(".tmp")
+                    || file_name.contains(".new"))
+            {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -764,13 +763,8 @@ fn apply_self_replace(new_binary_path: &Path) -> Result<PathBuf, String> {
 
         let staging_path = parent_dir.join(format!(".{}.new-{}.tmp", exe_name, nonce));
 
-        std::fs::copy(new_binary_path, &staging_path).map_err(|e| {
-            format!(
-                "无法暂存新版本到 '{}': {}",
-                staging_path.display(),
-                e
-            )
-        })?;
+        std::fs::copy(new_binary_path, &staging_path)
+            .map_err(|e| format!("无法暂存新版本到 '{}': {}", staging_path.display(), e))?;
 
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o755));

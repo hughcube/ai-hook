@@ -1136,7 +1136,9 @@ impl Msg {
                 Lang::En => "Simulated lifecycle event name (default: PreToolUse)",
             },
             Msg::M166 => match l {
-                Lang::Zh => "用户输入的提示词内容(仅在 event 为 UserPromptSubmit/BeforeAgent 时有效)",
+                Lang::Zh => {
+                    "用户输入的提示词内容(仅在 event 为 UserPromptSubmit/BeforeAgent 时有效)"
+                }
                 Lang::En => {
                     "User prompt text (only evaluated when event is UserPromptSubmit/BeforeAgent)"
                 }

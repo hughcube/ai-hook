@@ -222,17 +222,42 @@ impl From<&HookContext> for ContextView {
             event_raw: ctx.event_raw.clone(),
             tool: ctx.tool_name.clone(),
             cmd: sanitized_cmd,
-            file: ctx.file.as_ref().and_then(|f| serde_json::to_value(f).ok()),
+            // Semantic views are built by hand (instead of serde on the context
+            // structs) so that enum spellings match the JS rule contract:
+            // runner.rs injects `action`/`kind` via `as_str()` (lowercase
+            // "read" | "write" | "fetch" | "glob" | "agent" | ...), while the
+            // derived Serialize would emit the Rust variant name ("Read",
+            // "Fetch", ...). The debug log is the place people compare against
+            // the tutorial ctx schema, so it must show exactly what rules see.
+            file: ctx.file.as_ref().map(|f| {
+                serde_json::json!({
+                    "path": f.path,
+                    "paths": f.paths,
+                    "action": f.action.as_str(),
+                })
+            }),
             mcp: ctx.mcp.as_ref().and_then(|m| serde_json::to_value(m).ok()),
-            web: ctx.web.as_ref().and_then(|w| serde_json::to_value(w).ok()),
-            search: ctx
-                .search
-                .as_ref()
-                .and_then(|s| serde_json::to_value(s).ok()),
-            agent: ctx
-                .agent
-                .as_ref()
-                .and_then(|a| serde_json::to_value(a).ok()),
+            web: ctx.web.as_ref().map(|w| {
+                serde_json::json!({
+                    "action": w.action.as_str(),
+                    "url": w.url,
+                    "query": w.query,
+                })
+            }),
+            search: ctx.search.as_ref().map(|s| {
+                serde_json::json!({
+                    "kind": s.kind.as_str(),
+                    "path": s.path,
+                    "pattern": s.pattern,
+                })
+            }),
+            agent: ctx.agent.as_ref().map(|a| {
+                serde_json::json!({
+                    "kind": a.kind.as_str(),
+                    "description": a.description,
+                    "prompt": a.prompt,
+                })
+            }),
             args: sanitized_args,
             cwd: ctx.cwd.clone(),
             model: ctx.model.clone(),

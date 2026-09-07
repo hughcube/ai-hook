@@ -600,10 +600,10 @@ fn main() {
     // any output happens when the GUI-subsystem binary lacks handles.
     #[cfg(windows)]
     attach_parent_console();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            ai_hook::update::clean_old_temp_files(parent);
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        ai_hook::update::clean_old_temp_files(parent);
     }
     prof_init!();
     // First mark = the invisible prefix: PE mapping, DLL loading, relocations,
@@ -661,12 +661,12 @@ fn main() {
             let mut cmd = localized_command();
             let help_info = get_binary_info_help();
             cmd = cmd.after_help(help_info.clone()).after_long_help(help_info);
-            if let Some(sub) = subcommand {
-                if let Some(subcmd) = cmd.find_subcommand_mut(sub) {
-                    let _ = subcmd.print_help();
-                    outln!();
-                    return;
-                }
+            if let Some(sub) = subcommand
+                && let Some(subcmd) = cmd.find_subcommand_mut(sub)
+            {
+                let _ = subcmd.print_help();
+                outln!();
+                return;
             }
             let _ = cmd.print_help();
             outln!();
