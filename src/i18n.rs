@@ -318,6 +318,14 @@ pub enum Msg {
     /// Rules were configured (explicit CLI paths or AI_HOOK_RULES) but none
     /// loaded: warn that every command will pass.
     M160,
+    /// CLI help text for --debug.
+    M161,
+    /// Subcommand clean description.
+    M162,
+    /// CLI help text for clean --max-files.
+    M163,
+    /// CLI help text for clean --dry-run.
+    M164,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -1092,6 +1100,30 @@ impl Msg {
                 Lang::En => {
                     "Warning: rules were configured (AI_HOOK_RULES or explicit paths) but 0 loaded; every command will now pass. Check that the paths exist, use .js files, and remember directory rules skip _-prefixed, *.tmp.js and *.test.js files."
                 }
+            },
+            Msg::M161 => match l {
+                Lang::Zh => {
+                    "启用 Debug 模式:将完整的原生宿主输入、规则上下文、执行轨迹与最终决策记录至日志文件"
+                }
+                Lang::En => {
+                    "Enable debug mode: record full raw input, normalized context, rule trace and decisions to log"
+                }
+            },
+            Msg::M162 => match l {
+                Lang::Zh => "清理历史日志文件(默认按分类保留最新的 14 个文件)",
+                Lang::En => {
+                    "Clean and prune historical log files (keeps the latest 14 files per category by default)"
+                }
+            },
+            Msg::M163 => match l {
+                Lang::Zh => "每类日志保留的最大文件数(默认 14,亦受 AI_HOOK_LOG_MAX_FILES 控制)",
+                Lang::En => {
+                    "Maximum log files to retain per category (default: 14, or via AI_HOOK_LOG_MAX_FILES)"
+                }
+            },
+            Msg::M164 => match l {
+                Lang::Zh => "仅预览拟清理的文件而不实际执行删除",
+                Lang::En => "Preview files to be cleaned without deleting them",
             },
             Msg::AllowWord => match l {
                 Lang::Zh => "允许",

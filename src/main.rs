@@ -7,6 +7,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use ai_hook::cli::{Cli, Commands, localized_command};
+use ai_hook::engine::debug::{
+    DebugCollector, InteractionTrace, RuleTrace, decision_to_value, is_debug_enabled,
+};
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
 use ai_hook::i18n::{Msg, t};
@@ -275,8 +278,8 @@ fn get_binary_info_help() -> String {
 
 /// Subcommand names defined by the derive macro. When the first positional
 /// argument is one of these, argument handling belongs to clap.
-const SUBCOMMANDS: [&str; 7] = [
-    "list", "test", "bench", "install", "update", "tutorial", "guide",
+const SUBCOMMANDS: [&str; 9] = [
+    "list", "test", "bench", "install", "update", "tutorial", "guide", "clean", "prune",
 ];
 
 /// Hand-rolled parse of the argument shapes a hook configuration produces.
@@ -318,6 +321,7 @@ fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
                 "dry-run" if inline.is_none() => cli.dry_run = true,
                 "allow-on-error" if inline.is_none() => cli.allow_on_error = true,
                 "no-fast-path" if inline.is_none() => cli.no_fast_path = true,
+                "debug" if inline.is_none() => cli.debug = true,
                 "rule" => {
                     let value = match inline {
                         Some(v) => v.to_string(),
@@ -481,6 +485,7 @@ fn main() {
             };
             ai_hook::tutorial::print_tutorial(&resolved);
         }
+        Some(Commands::Clean { max_files, dry_run }) => handle_clean(max_files, dry_run),
         None => handle_dispatch(&args),
     }
 }
@@ -561,6 +566,13 @@ fn handle_dispatch(args: &Cli) {
         return;
     }
 
+    let is_debug = is_debug_enabled(args.debug);
+    let mut debug_collector = if is_debug {
+        Some(DebugCollector::new())
+    } else {
+        None
+    };
+
     let mut buffer = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buffer) {
         // Unreadable stdin (broken pipe / invalid UTF-8) yields no reliable
@@ -569,7 +581,13 @@ fn handle_dispatch(args: &Cli) {
         eprint_ts!("[ai-hook] {}: {}", t(Msg::M055), e);
         let ctx = HookContext::parse("");
         let reason = t(Msg::M135).to_string();
-        print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
+        let dec = HookDecision::Deny { reason };
+        let out = dec.to_json_output(&ctx, None);
+        if let Some(mut col) = debug_collector {
+            col.parse_failed = true;
+            col.record("generic", Some(&ctx), &dec, &out, 0);
+        }
+        print_output(&out);
         return;
     }
 
@@ -582,11 +600,21 @@ fn handle_dispatch(args: &Cli) {
         buffer.drain(..'\u{feff}'.len_utf8());
     }
 
+    if let Some(ref mut col) = debug_collector {
+        col.t_read_done = Some(Instant::now());
+        col.raw_input = buffer.clone();
+    }
+
     if buffer.trim().is_empty() {
         // Same reasoning: an empty hook payload is not a verified allow.
         let ctx = HookContext::parse("");
         let reason = t(Msg::M136).to_string();
-        print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
+        let dec = HookDecision::Deny { reason };
+        let out = dec.to_json_output(&ctx, None);
+        if let Some(col) = debug_collector {
+            col.record("generic", Some(&ctx), &dec, &out, 0);
+        }
+        print_output(&out);
         return;
     }
 
@@ -599,6 +627,11 @@ fn handle_dispatch(args: &Cli) {
     let ctx = HookContext::parse(&buffer);
     prof_mark!("④ payload 解析完成");
 
+    if let Some(ref mut col) = debug_collector {
+        col.t_parse_done = Some(Instant::now());
+        col.parse_failed = ctx.parse_failed;
+    }
+
     // A payload that is not valid JSON carries no tool semantics at all.
     // Failing silently (empty output would read as "allow") or running rules
     // against an empty view would almost always end in an accidental Allow,
@@ -609,6 +642,7 @@ fn handle_dispatch(args: &Cli) {
         let gui_enabled = GuiDialog::is_enabled(args.no_gui) && !args.dry_run;
         if gui_enabled {
             let prompt_agent = ctx.platform.to_string();
+            let t_dlg = Instant::now();
             let approved = GuiDialog::confirm(
                 t(Msg::M058),
                 &reason,
@@ -616,11 +650,25 @@ fn handle_dispatch(args: &Cli) {
                 &prompt_agent,
                 GuiDialog::resolve_timeout(args.timeout),
             );
-            if approved {
-                print_output(&HookDecision::Allow.to_json_output(&ctx, None));
+            let dlg_dur = t_dlg.elapsed().as_secs_f64() * 1000.0;
+            let (dec, out) = if approved {
+                let d = HookDecision::Allow;
+                let o = d.to_json_output(&ctx, None);
+                (d, o)
             } else {
-                print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
+                let d = HookDecision::Deny { reason };
+                let o = d.to_json_output(&ctx, None);
+                (d, o)
+            };
+            if let Some(mut col) = debug_collector {
+                col.interaction = Some(InteractionTrace {
+                    confirm_path: "Popup".to_string(),
+                    gui_approved: Some(approved),
+                    dialog_duration_ms: Some(dlg_dur),
+                });
+                col.record(&prompt_agent, Some(&ctx), &dec, &out, 0);
             }
+            print_output(&out);
         } else {
             // No dialog: hand the decision to the renderer as a Confirm.
             // An unparseable payload has no host identity at all
@@ -630,16 +678,23 @@ fn handle_dispatch(args: &Cli) {
             // an unreadable payload is not a verified allow. Ask-capable hosts
             // would only see an `ask` here if the payload named a platform the
             // matrix actually grants `ask` to — it cannot, by construction.
-            print_output(
-                &HookDecision::Confirm {
-                    reason,
-                    title: None,
-                    gui: None,
-                    timeout: None,
-                    force_gui: None,
-                }
-                .to_json_output(&ctx, None),
-            );
+            let dec = HookDecision::Confirm {
+                reason,
+                title: None,
+                gui: None,
+                timeout: None,
+                force_gui: None,
+            };
+            let out = dec.to_json_output(&ctx, None);
+            if let Some(mut col) = debug_collector {
+                col.interaction = Some(InteractionTrace {
+                    confirm_path: "Ask".to_string(),
+                    gui_approved: None,
+                    dialog_duration_ms: None,
+                });
+                col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
+            }
+            print_output(&out);
         }
         return;
     }
@@ -657,7 +712,16 @@ fn handle_dispatch(args: &Cli) {
         if rules_configured(&explicit_paths) {
             eprint_ts!("[ai-hook] {}", t(Msg::M138));
         }
-        print_output(&decision.to_json_output(&ctx, None));
+        let out = decision.to_json_output(&ctx, None);
+        if let Some(mut col) = debug_collector {
+            col.fast_path_hit = true;
+            col.fast_path_prefix = ctx
+                .cmd
+                .as_deref()
+                .and_then(|c| c.split_whitespace().next().map(str::to_string));
+            col.record(&ctx.platform.to_string(), Some(&ctx), &decision, &out, 0);
+        }
+        print_output(&out);
         return;
     }
 
@@ -674,9 +738,19 @@ fn handle_dispatch(args: &Cli) {
         if rules_configured(&explicit_paths) {
             eprint_ts!("[ai-hook] {}", t(Msg::M160));
         }
-        print_output(&HookDecision::Allow.to_json_output(&ctx, None));
+        let dec = HookDecision::Allow;
+        let out = dec.to_json_output(&ctx, None);
+        if let Some(col) = debug_collector {
+            col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
+        }
+        print_output(&out);
         return;
     }
+
+    let agent_str = ctx.platform.to_string();
+    let debug_col_cell = std::rc::Rc::new(std::cell::RefCell::new(debug_collector));
+    let debug_col_panic = debug_col_cell.clone();
+    let ctx_panic = ctx.clone();
 
     // 3. Evaluate rules + optional GUI inside catch_unwind: an internal panic
     //    (e.g. embedded JS runtime fault) must still yield a deny decision —
@@ -689,13 +763,35 @@ fn handle_dispatch(args: &Cli) {
                 // Gate is broken: rules cannot run, so do NOT silently allow.
                 eprint_ts!("[ai-hook] {}: {}", t(Msg::M056), e);
                 let reason = t(Msg::M057).to_string();
-                print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
+                let dec = HookDecision::Deny { reason };
+                let out = dec.to_json_output(&ctx, None);
+                if let Some(col) = debug_col_cell.borrow_mut().take() {
+                    col.record(&agent_str, Some(&ctx), &dec, &out, 0);
+                }
+                print_output(&out);
                 return;
             }
         };
 
-        let (decision, _) = runner.evaluate_all(&rules, &ctx, policy);
+        let (decision, results) = runner.evaluate_all(&rules, &ctx, policy);
         prof_mark!("⑥ 规则执行完成");
+
+        if let Some(ref mut col) = *debug_col_cell.borrow_mut() {
+            col.t_rules_done = Some(Instant::now());
+            for r in &results {
+                col.rules_evaluated.push(RuleTrace {
+                    id: r.rule_id.clone(),
+                    path: r.rule_path.to_string_lossy().to_string(),
+                    duration_ms: r.duration.as_secs_f64() * 1000.0,
+                    decision: r.decision.as_ref().map(decision_to_value),
+                    error: r.error.clone(),
+                });
+            }
+            col.hit_rule = results
+                .iter()
+                .find(|r| r.decision.is_some() || r.error.is_some())
+                .map(|r| r.rule_id.clone());
+        }
 
         // 4. Handle confirmation & GUI prompt (gui 三态语义):
         //    gui:true / force_gui → 强制弹窗(穿透 --no-gui,仅 dry-run 演练除外);
@@ -729,7 +825,10 @@ fn handle_dispatch(args: &Cli) {
             // deny with no way to authorize. The renderer applies the same
             // conjunction, so both layers now agree.
             let ask_ok = ctx.can_ask() && ctx.capabilities().ask;
-            match confirm_path(*gui, forced, ask_ok, gui_enabled, args.dry_run) {
+            let c_path = confirm_path(*gui, forced, ask_ok, gui_enabled, args.dry_run);
+
+            let mut dialog_dur = None;
+            match c_path {
                 ConfirmPath::Popup => {
                     let prompt_target = ctx
                         .cmd
@@ -739,6 +838,7 @@ fn handle_dispatch(args: &Cli) {
                         .unwrap_or("");
                     let prompt_title = title.as_deref().unwrap_or_else(|| t(Msg::M058));
                     let prompt_agent = ctx.platform.to_string();
+                    let t_gui = Instant::now();
                     let approved = GuiDialog::confirm(
                         prompt_title,
                         reason,
@@ -746,6 +846,7 @@ fn handle_dispatch(args: &Cli) {
                         &prompt_agent,
                         timeout,
                     );
+                    dialog_dur = Some(t_gui.elapsed().as_secs_f64() * 1000.0);
                     gui_approved = Some(approved);
                 }
                 ConfirmPath::Ask => {
@@ -753,6 +854,18 @@ fn handle_dispatch(args: &Cli) {
                     // ask(CC/CB)、force_ask(AGY 交互)。Codex 不支持 ask（由能力矩阵和 auto_deny 兜底）
                 }
                 ConfirmPath::AutoDeny => auto_deny = true,
+            }
+
+            if let Some(ref mut col) = *debug_col_cell.borrow_mut() {
+                col.interaction = Some(InteractionTrace {
+                    confirm_path: match c_path {
+                        ConfirmPath::Popup => "Popup".to_string(),
+                        ConfirmPath::Ask => "Ask".to_string(),
+                        ConfirmPath::AutoDeny => "AutoDeny".to_string(),
+                    },
+                    gui_approved,
+                    dialog_duration_ms: dialog_dur,
+                });
             }
         }
 
@@ -772,13 +885,22 @@ fn handle_dispatch(args: &Cli) {
             decision
         };
 
-        print_output(&decision.to_json_output(&ctx, gui_approved));
+        let out = decision.to_json_output(&ctx, gui_approved);
+        if let Some(col) = debug_col_cell.borrow_mut().take() {
+            col.record(&agent_str, Some(&ctx), &decision, &out, 0);
+        }
+        print_output(&out);
     }));
 
     if outcome.is_err() {
         eprint_ts!("[ai-hook] {}", t(Msg::M059));
         let reason = t(Msg::M060).to_string();
-        print_output(&HookDecision::Deny { reason }.to_json_output(&ctx, None));
+        let dec = HookDecision::Deny { reason };
+        let out = dec.to_json_output(&ctx_panic, None);
+        if let Some(col) = debug_col_panic.borrow_mut().take() {
+            col.record(&agent_str, Some(&ctx_panic), &dec, &out, 0);
+        }
+        print_output(&out);
     }
 }
 
@@ -1278,6 +1400,139 @@ fn handle_install(target_dir: Option<PathBuf>) {
     }
 }
 
+fn handle_clean(max_files: Option<usize>, dry_run: bool) {
+    let limit = max_files.unwrap_or_else(ai_hook::engine::debug::resolve_max_log_files);
+
+    let Some(home) = ai_hook::paths::home_dir() else {
+        eprintln!("[ai-hook] Could not determine user home directory.");
+        std::process::exit(1);
+    };
+    let logs_dir = home.join(".ai-hook").join("logs");
+    let lang = ai_hook::i18n::lang();
+
+    if !logs_dir.is_dir() {
+        match lang {
+            ai_hook::i18n::Lang::Zh => {
+                outln!("日志目录不存在或为空: {} (无需清理)", logs_dir.display());
+            }
+            ai_hook::i18n::Lang::En => {
+                outln!(
+                    "Log directory does not exist or is empty: {} (nothing to clean)",
+                    logs_dir.display()
+                );
+            }
+        }
+        return;
+    }
+
+    let report = ai_hook::engine::debug::clean_all_logs(&logs_dir, limit, dry_run);
+    let mb_freed = report.bytes_freed as f64 / (1024.0 * 1024.0);
+
+    if dry_run {
+        match lang {
+            ai_hook::i18n::Lang::Zh => {
+                outln!("[dry-run] 扫描日志目录: {}", logs_dir.display());
+                outln!(
+                    "共扫描到 {} 个日志文件 (涉及 {} 个分类)",
+                    report.total_scanned,
+                    report.categories.len()
+                );
+                outln!(
+                    "拟清理超期文件: {} 个 (释放空间约 {:.2} MB)",
+                    report.files_deleted,
+                    mb_freed
+                );
+                outln!(
+                    "拟保留活跃文件: {} 个 (每类上限保留最后 {} 个)",
+                    report.files_retained,
+                    limit
+                );
+                if !report.deleted_files.is_empty() {
+                    outln!("\n拟删除的文件列表:");
+                    for f in &report.deleted_files {
+                        outln!("  - {}", f);
+                    }
+                }
+            }
+            ai_hook::i18n::Lang::En => {
+                outln!("[dry-run] Scanned log directory: {}", logs_dir.display());
+                outln!(
+                    "Found {} log files across {} categories",
+                    report.total_scanned,
+                    report.categories.len()
+                );
+                outln!(
+                    "Would delete: {} old log files (~{:.2} MB freed)",
+                    report.files_deleted,
+                    mb_freed
+                );
+                outln!(
+                    "Would retain: {} active files (limit: {} per category)",
+                    report.files_retained,
+                    limit
+                );
+                if !report.deleted_files.is_empty() {
+                    outln!("\nFiles that would be deleted:");
+                    for f in &report.deleted_files {
+                        outln!("  - {}", f);
+                    }
+                }
+            }
+        }
+    } else {
+        match lang {
+            ai_hook::i18n::Lang::Zh => {
+                outln!("✅ 日志清理完成: {}", logs_dir.display());
+                outln!(
+                    "共扫描到 {} 个日志文件 (涉及 {} 个分类)",
+                    report.total_scanned,
+                    report.categories.len()
+                );
+                outln!(
+                    "已清理超期文件: {} 个 (共释放 {:.2} MB)",
+                    report.files_deleted,
+                    mb_freed
+                );
+                outln!(
+                    "保留活跃文件: {} 个 (每类上限保留最后 {} 个)",
+                    report.files_retained,
+                    limit
+                );
+                if !report.deleted_files.is_empty() {
+                    outln!("\n已清理的文件列表:");
+                    for f in &report.deleted_files {
+                        outln!("  - {}", f);
+                    }
+                }
+            }
+            ai_hook::i18n::Lang::En => {
+                outln!("✅ Log cleanup complete: {}", logs_dir.display());
+                outln!(
+                    "Scanned {} log files across {} categories",
+                    report.total_scanned,
+                    report.categories.len()
+                );
+                outln!(
+                    "Deleted: {} old log files ({:.2} MB freed)",
+                    report.files_deleted,
+                    mb_freed
+                );
+                outln!(
+                    "Retained: {} active log files (up to {} per category)",
+                    report.files_retained,
+                    limit
+                );
+                if !report.deleted_files.is_empty() {
+                    outln!("\nDeleted files:");
+                    for f in &report.deleted_files {
+                        outln!("  - {}", f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,6 +1556,7 @@ mod tests {
             &["--dry-run"],
             &["--allow-on-error"],
             &["--no-fast-path"],
+            &["--debug"],
             &["--rule", "rules/a.js"],
             &["--rule=rules/a.js"],
             &["-r", "rules/a.js"],

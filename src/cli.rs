@@ -51,6 +51,10 @@ pub struct Cli {
     /// (git status, ls, cat, ...) are also evaluated by the rule engine
     #[arg(long, global = true)]
     pub no_fast_path: bool,
+
+    /// Enable debug mode: record full raw input, normalized context, rule trace and decisions to log
+    #[arg(long, global = true)]
+    pub debug: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,6 +133,18 @@ pub enum Commands {
         #[arg(short, long)]
         lang: Option<String>,
     },
+
+    /// Clean and prune old log files (keeps the latest 14 files by default)
+    #[command(alias = "prune")]
+    Clean {
+        /// Maximum log files to retain per category (default: 14, or from AI_HOOK_LOG_MAX_FILES)
+        #[arg(short = 'n', long)]
+        max_files: Option<usize>,
+
+        /// Preview files that would be deleted without actually deleting them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Registers a localized `-h/--help` flag on `cmd`. Every command and
@@ -199,6 +215,7 @@ pub fn localized_command() -> Command {
             ("dry_run", M112),
             ("allow_on_error", M113),
             ("no_fast_path", M139),
+            ("debug", M161),
         ]
     );
 
@@ -228,5 +245,6 @@ pub fn localized_command() -> Command {
     );
     let cmd = sub_help!(cmd, "install", M127, [("target_dir", M128)]);
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
-    sub_help!(cmd, "tutorial", M132, [("lang", M133)])
+    let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
+    sub_help!(cmd, "clean", M162, [("max_files", M163), ("dry_run", M164)])
 }

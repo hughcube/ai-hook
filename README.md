@@ -195,6 +195,9 @@ Configure in your hooks configuration:
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Default countdown timeout in seconds (auto-denies on expiration) |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (enabled) | Set to `0` or `false` to disable the GUI dialog completely |
 | `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (disabled) | **Forced Popup**: Forces GUI popup confirmation even if agent supports native terminal ask (except hard deny) |
+| `AI_HOOK_DEBUG` / `--debug` | `0` (disabled) | **Debug Mode**: Record raw host input, context, execution chain, and result to `~/.ai-hook/logs/ai-hook-debug-{agent}-{YYYYMMDD}.log` |
+| `AI_HOOK_DEBUG_MAX_FILES` | `14` | Maximum log files retained (defaults to keeping the latest 14 files, older ones pruned automatically) |
+| `AI_HOOK_DEBUG_FILE` | (auto) | Custom debug log file path (overrides default naming/path) |
 
 ---
 
@@ -419,7 +422,7 @@ Subprocess spawning is eliminated for standard reads. In addition, command execu
 | `sys.http.get(url, opt?)` | `object` | **Lightweight HTTP GET**: supports `headers`/`timeout`, returns `{ status, ok, headers, body }` |
 | `sys.http.post(url, opt?)` | `object` | **Lightweight HTTP POST**: supports `headers`/`body`/`timeout`, returns `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | Debug logging to stderr (never corrupts decision JSON) |
-| `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; disable `AI_HOOK_LOG=0`, override `AI_HOOK_LOG_FILE`) |
+| `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; keeps latest 14 files by default; disable `AI_HOOK_LOG=0`, override `AI_HOOK_LOG_FILE`, configure retention via `AI_HOOK_LOG_MAX_FILES`) |
 | **Standard JS builtins** | - | `new Date()` clock (days, hours, freeze windows), `JSON` / `RegExp` / `Math` / `Map` / `Set` are QuickJS builtins — no sys needed; sys only adds the I/O that JS has no primitive for |
 
 ### 3. Controlling Decisions: Hard Block vs GUI Prompt vs Zero-Token Intercept
@@ -671,6 +674,11 @@ ai-hook update
 # 6. View built-in interactive tutorial and rule authoring guide
 ai-hook tutorial
 ai-hook tutorial --lang en
+
+# 7. Actively clean and prune historical log files (keeps latest 14 files per category by default; alias: ai-hook prune)
+ai-hook clean
+ai-hook clean --max-files 7
+ai-hook clean --dry-run
 
 # Force download and replace even if on the same version
 ai-hook update --force

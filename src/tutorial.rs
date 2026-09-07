@@ -270,10 +270,17 @@ fn chinese_tutorial_body() -> String {
                                     workbuddy/gemini/antigravity/opencode)
   ai-hook bench -i 1000 -c <命令>   压测
   ai-hook list [<rules…>]           列出实际加载的规则
+  ai-hook clean [-n 14] [--dry-run] 主动清理历史日志文件(每类日志默认保留最新 14 个文件;
+                                    支持别名 ai-hook prune)
   ai-hook tutorial --lang en        英文版本文档
   --dry-run 不弹窗;--no-gui 禁用弹窗;--force-gui 强制弹窗;
   --allow-on-error 规则出错放行;--no-fast-path 关闭只读白名单旁路;
+  --debug 开启调试模式;
   AI_HOOK_LANG=zh|en 固定语言;
+  AI_HOOK_DEBUG=1|true|on:全量记录原生宿主输入(raw_input)、规则上下文(context)、
+  执行链与处理结果到 ~/.ai-hook/logs/ai-hook-debug-{agent}-{YYYYMMDD}.log
+  (JSONL, 20MB 轮转, 零热路径删除开销;可用 ai-hook clean 清理并保留最后 14 个文件;
+  可通过 AI_HOOK_DEBUG_MAX_FILES 或 AI_HOOK_LOG_MAX_FILES 调整保留数量,或用 AI_HOOK_DEBUG_FILE 覆盖写入路径);
   AI_HOOK_LOG_EXTERNAL=1|true:把每次宿主传入的原始 payload(stdin 原文,解析
   前)记入 ~/.ai-hook/logs/ai-hook-inbound-{日期}.log(JSONL,>1MiB 截断头部,
   20MB 轮转)——调试 payload 形状/平台判别/解析问题用;默认关闭,关闭时零 IO;
@@ -589,10 +596,18 @@ VII. Debug & operations
                                      antigravity / opencode)
   ai-hook bench -i 1000 -c <command> benchmark
   ai-hook list [<rules…>]            show actually loaded rules
+  ai-hook clean [-n 14] [--dry-run]  actively clean and prune historical log files
+                                     (keeps latest 14 files per category by default;
+                                     alias ai-hook prune)
   ai-hook tutorial --lang zh         this document in Chinese
   --dry-run no dialogs; --no-gui disable dialogs; --force-gui force dialogs;
   --allow-on-error allow on rule failure; --no-fast-path disable the read-only
-  whitelist bypass; AI_HOOK_LANG=zh|en pins language.
+  whitelist bypass; --debug enable debug mode; AI_HOOK_LANG=zh|en pins language.
+  AI_HOOK_DEBUG=1|true|on: record full raw host input, rule context,
+  execution chain, and result to ~/.ai-hook/logs/ai-hook-debug-{agent}-{YYYYMMDD}.log
+  (JSONL, 20MB rotation, zero hot-path deletion overhead; use ai-hook clean to prune
+  and retain the latest 14 files; configure via AI_HOOK_DEBUG_MAX_FILES or
+  AI_HOOK_LOG_MAX_FILES, or override destination with AI_HOOK_DEBUG_FILE).
   AI_HOOK_LOG_EXTERNAL=1|true: record every host stdin payload verbatim
   (before parsing) to ~/.ai-hook/logs/ai-hook-inbound-{YYYYMMDD}.log as JSONL
   (head-truncated over 1MiB, 20MB rotation) — for debugging payload shape,

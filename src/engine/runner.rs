@@ -89,6 +89,9 @@ pub struct RuleExecutionResult {
 // ---------------------------------------------------------------------------
 
 fn log_file_disabled() -> bool {
+    if std::env::var("AI_HOOK_LOG_FILE").is_ok_and(|f| !f.trim().is_empty()) {
+        return false;
+    }
     std::env::var("AI_HOOK_LOG")
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
@@ -130,7 +133,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Current UTC date as `YYYYMMDD` (file-name granularity; line timestamps are
 /// epoch millis, so UTC-vs-local day boundaries only affect file splitting).
-fn utc_date_ymd() -> String {
+pub fn utc_date_ymd() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i128)
@@ -143,6 +146,11 @@ fn utc_date_ymd() -> String {
 /// (JSONL "time" field and stderr prefixes).
 pub fn local_now_str() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Human-readable local date `YYYY-MM-DD` for log lines.
+pub fn local_date_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 /// Appends one JSONL line to the rule log (opened on demand, then closed).
@@ -160,20 +168,22 @@ fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: 
         && meta.len() > MAX_LOG_BYTES
         && let Some(name) = path.file_name()
     {
-        let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-        let _ = std::fs::rename(&path, &rotated);
+        let rotated_path = path.with_file_name(format!("{}.1", name.to_string_lossy()));
+        let _ = std::fs::rename(&path, &rotated_path);
     }
 
     let line = serde_json::json!({
+        "time": local_now_str(),
+        "date": local_date_str(),
         "ts": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
-        "time": local_now_str(),
         "agent": agent,
+        "type": "rule",
+        "level": level,
         "sessionId": session_id,
         "rule": rule_id,
-        "level": level,
         "msg": msg,
     })
     .to_string();
@@ -198,7 +208,7 @@ fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: 
 // bytes the host delivered. Defaults to off; costs zero I/O when off.
 //
 // - File:    ~/.ai-hook/logs/ai-hook-inbound-{YYYYMMDD}.log
-// - Format:  JSONL: {ts, bytes, truncated, payload}
+// - Format:  JSONL: {time, date, ts, agent, type, bytes, truncated, payload}
 // - Bounds:  payloads over 1 MiB store only their head (truncated: true) so
 //            a huge transcript cannot balloon the log; 20MB rotation like the
 //            rule log.
@@ -209,6 +219,10 @@ pub fn log_inbound_payload(raw: &str) {
     if !crate::protocol::env_flag_true("AI_HOOK_LOG_EXTERNAL") || raw.is_empty() {
         return;
     }
+
+    let agent = crate::protocol::HookContext::parse(raw)
+        .platform
+        .to_string();
 
     const MAX_RAW_BYTES: usize = 1024 * 1024;
     let truncated = raw.len() > MAX_RAW_BYTES;
@@ -228,16 +242,19 @@ pub fn log_inbound_payload(raw: &str) {
         && meta.len() > MAX_LOG_BYTES
         && let Some(name) = path.file_name()
     {
-        let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-        let _ = std::fs::rename(&path, &rotated);
+        let rotated_path = path.with_file_name(format!("{}.1", name.to_string_lossy()));
+        let _ = std::fs::rename(&path, &rotated_path);
     }
 
     let line = serde_json::json!({
+        "time": local_now_str(),
+        "date": local_date_str(),
         "ts": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
-        "time": local_now_str(),
+        "agent": agent,
+        "type": "inbound",
         "bytes": raw.len(),
         "truncated": truncated,
         "payload": stored,

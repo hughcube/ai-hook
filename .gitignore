@@ -7,5 +7,6 @@ Thumbs.db
 .idea/
 .vscode/
 docs/*
-bench_tmp/*
+bench_tmp/
 *.html
+docs/

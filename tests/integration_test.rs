@@ -46,6 +46,8 @@ fn rule(id: &str, code: &str) -> RuleSource {
     }
 }
 
+static TEST_LOG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Fast path
 // ---------------------------------------------------------------------------
@@ -756,6 +758,7 @@ fn test_force_gui_rule() {
 
 #[test]
 fn test_rule_logging_sys_log_api() {
+    let _guard = TEST_LOG_MUTEX.lock().unwrap();
     // console.log / sys.log must not break evaluation. Disable the file
     // channel for tests (env is process-global; no other test logs).
     unsafe {
@@ -778,10 +781,14 @@ fn test_rule_logging_sys_log_api() {
         res.error
     );
     assert_eq!(res.decision, None);
+    unsafe {
+        std::env::remove_var("AI_HOOK_LOG");
+    }
 }
 
 #[test]
 fn test_log_arguments_are_js_coerced_not_strict() {
+    let _guard = TEST_LOG_MUTEX.lock().unwrap();
     // console.log / sys.log accept non-string arguments exactly like plain
     // JS: numbers, booleans, null and objects are coerced, never rejected.
     // (A bare rquickjs String param is strict and threw TypeError on
@@ -811,6 +818,9 @@ fn test_log_arguments_are_js_coerced_not_strict() {
             reason: "reached-after-logging".to_string()
         })
     );
+    unsafe {
+        std::env::remove_var("AI_HOOK_LOG");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3381,4 +3391,241 @@ fn test_loader_strips_utf8_bom() {
         matches!(&dec, HookDecision::Deny { reason } if reason == "bom-detected"),
         "带 BOM 的规则必须能被正确解析并执行: {dec:?}"
     );
+}
+
+#[test]
+fn test_debug_log_collector_and_retention() {
+    use ai_hook::engine::debug::{DebugCollector, RuleTrace, prune_old_log_files};
+
+    let tmp = std::env::temp_dir().join(format!("ai-hook-debug-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let debug_file = tmp.join("test-debug.log");
+
+    unsafe {
+        std::env::set_var("AI_HOOK_DEBUG_FILE", debug_file.to_str().unwrap());
+    }
+
+    let raw_payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "npm test" },
+        "session_id": "sess-dbg-1"
+    })
+    .to_string();
+
+    let ctx = HookContext::parse(&raw_payload);
+    let mut collector = DebugCollector::new();
+    collector.raw_input = raw_payload.clone();
+    collector.rules_evaluated.push(RuleTrace {
+        id: "rule_test".to_string(),
+        path: "/path/to/rule.js".to_string(),
+        duration_ms: 1.25,
+        decision: Some(serde_json::json!({ "type": "Allow" })),
+        error: None,
+    });
+    collector.hit_rule = Some("rule_test".to_string());
+
+    let decision = HookDecision::Allow;
+    let rendered = decision.to_json_output(&ctx, None);
+
+    collector.record("claude_code", Some(&ctx), &decision, &rendered, 0);
+
+    // Assert the debug file was created and contains expected JSON
+    assert!(debug_file.is_file(), "Debug log file must exist");
+    let content = std::fs::read_to_string(&debug_file).expect("read debug log");
+    assert!(!content.is_empty());
+
+    let json_line: serde_json::Value =
+        serde_json::from_str(content.lines().next().unwrap()).expect("parse debug jsonl");
+    assert_eq!(json_line["raw_input"], raw_payload);
+    assert_eq!(json_line["agent"], "claude_code");
+    assert_eq!(json_line["type"], "debug");
+    assert!(json_line["time"].is_string());
+    assert!(json_line["date"].is_string());
+    assert_eq!(json_line["context"]["platform"], "claude_code");
+    assert_eq!(json_line["context"]["tool"], "Bash");
+    assert_eq!(json_line["context"]["cmd"], "npm test");
+    assert_eq!(json_line["rules_evaluated"].as_array().unwrap().len(), 1);
+    assert_eq!(json_line["rules_evaluated"][0]["id"], "rule_test");
+    assert_eq!(json_line["hit_rule"], "rule_test");
+    assert_eq!(json_line["result"]["rule_decision"]["type"], "Allow");
+    assert_eq!(json_line["result"]["exit_code"], 0);
+
+    // Test retention: create 16 files with prefix, prune to 14
+    let prefix = "ai-hook-debug-claude_code-";
+    for i in 1..=16 {
+        let f = tmp.join(format!("ai-hook-debug-claude_code-202609{:02}.log", i));
+        let _ = std::fs::write(&f, "mock");
+    }
+    prune_old_log_files(&tmp, prefix, 14);
+    let count = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .count();
+    assert_eq!(count, 14, "Must retain exactly 14 files");
+
+    unsafe {
+        std::env::remove_var("AI_HOOK_DEBUG_FILE");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_rule_log_and_debug_log_namespace_isolation_and_retention() {
+    use ai_hook::engine::debug::prune_old_log_files;
+
+    let tmp = std::env::temp_dir().join(format!("ai_hook_retention_iso_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let rule_prefix = "ai-hook-claude_code-";
+    let debug_prefix = "ai-hook-debug-claude_code-";
+
+    // Create 16 rule logs and 16 debug logs
+    for i in 1..=16 {
+        let rf = tmp.join(format!("ai-hook-claude_code-202609{:02}.log", i));
+        let df = tmp.join(format!("ai-hook-debug-claude_code-202609{:02}.log", i));
+        let _ = std::fs::write(&rf, "rule log");
+        let _ = std::fs::write(&df, "debug log");
+    }
+
+    // Pruning rule logs should ONLY prune rule logs, not debug logs
+    prune_old_log_files(&tmp, rule_prefix, 14);
+
+    let rule_count = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with(rule_prefix) && !name.contains("-debug-")
+        })
+        .count();
+    let debug_count = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(debug_prefix))
+        .count();
+
+    assert_eq!(rule_count, 14, "Rule logs must be pruned to 14");
+    assert_eq!(
+        debug_count, 16,
+        "Debug logs must not be affected by rule log pruning"
+    );
+
+    // Now prune debug logs
+    prune_old_log_files(&tmp, debug_prefix, 14);
+    let debug_count_after = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(debug_prefix))
+        .count();
+    assert_eq!(debug_count_after, 14, "Debug logs must be pruned to 14");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_clean_all_logs_multi_category_and_dry_run() {
+    use ai_hook::engine::debug::clean_all_logs;
+
+    let tmp = std::env::temp_dir().join(format!("ai_hook_clean_all_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // Create 18 rule logs for claude_code, 18 debug logs for claude_code, 18 inbound logs
+    for i in 1..=18 {
+        let _ = std::fs::write(
+            tmp.join(format!("ai-hook-claude_code-202609{:02}.log", i)),
+            "content",
+        );
+        let _ = std::fs::write(
+            tmp.join(format!("ai-hook-debug-claude_code-202609{:02}.log", i)),
+            "content",
+        );
+        let _ = std::fs::write(
+            tmp.join(format!("ai-hook-inbound-202609{:02}.log", i)),
+            "content",
+        );
+    }
+
+    // Dry-run first with max_files = 14
+    let report_dry = clean_all_logs(&tmp, 14, true);
+    assert_eq!(report_dry.total_scanned, 18 * 3);
+    assert_eq!(report_dry.files_deleted, 4 * 3); // 4 per category
+    assert_eq!(report_dry.files_retained, 14 * 3); // 14 per category
+    assert_eq!(report_dry.categories.len(), 3);
+
+    // Verify all 54 files still exist because it was dry-run
+    let actual_count_dry = std::fs::read_dir(&tmp).unwrap().flatten().count();
+    assert_eq!(actual_count_dry, 54);
+
+    // Actual execution
+    let report_real = clean_all_logs(&tmp, 14, false);
+    assert_eq!(report_real.files_deleted, 4 * 3);
+    assert_eq!(report_real.files_retained, 14 * 3);
+
+    // Verify directory has exactly 14 * 3 = 42 files remaining
+    let actual_count_real = std::fs::read_dir(&tmp).unwrap().flatten().count();
+    assert_eq!(actual_count_real, 42);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_all_logs_contain_datetime_single_line_agent_type() {
+    let _guard = TEST_LOG_MUTEX.lock().unwrap();
+    let tmp = std::env::temp_dir().join(format!("ai_hook_log_format_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let rule_log_file = tmp.join("test-rule.log");
+    unsafe {
+        std::env::set_var("AI_HOOK_LOG_FILE", rule_log_file.to_str().unwrap());
+        std::env::set_var("AI_HOOK_LOG", "1");
+    }
+
+    // 1. Trigger rule log
+    let runner = RuleRunner::new().expect("init runner");
+    let rule_code = r#"
+        export default function(ctx, sys) {
+            sys.log("info", "test message 1");
+            return null;
+        }
+    "#;
+    let ctx = ctx_for("git status");
+    let _ = runner.execute_rule(&rule("logger-fmt-test", rule_code), &ctx);
+
+    assert!(rule_log_file.is_file());
+    let rule_content = std::fs::read_to_string(&rule_log_file).unwrap();
+    let non_empty_lines: Vec<&str> = rule_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert!(!non_empty_lines.is_empty(), "Rule log must not be empty");
+
+    // Verify every line is valid single-line JSONL with timestamp fields
+    for line in &non_empty_lines {
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("Every line in rule log must be single-line JSONL");
+        assert!(v["time"].is_string());
+        assert!(v["date"].is_string());
+        assert!(v["ts"].is_number());
+    }
+
+    let target_line = non_empty_lines
+        .iter()
+        .find(|l| l.contains("test message 1"))
+        .expect("Should contain our test message");
+    let rule_json: serde_json::Value = serde_json::from_str(target_line).unwrap();
+    assert_eq!(rule_json["type"], "rule");
+    assert_eq!(rule_json["agent"], "antigravity");
+    assert!(rule_json["time"].is_string());
+    assert!(rule_json["date"].is_string());
+    assert!(rule_json["ts"].is_number());
+    assert_eq!(rule_json["level"], "info");
+    assert_eq!(rule_json["msg"], "test message 1");
+
+    unsafe {
+        std::env::remove_var("AI_HOOK_LOG_FILE");
+        std::env::remove_var("AI_HOOK_LOG");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }
