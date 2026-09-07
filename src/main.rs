@@ -16,7 +16,7 @@ use ai_hook::i18n::{Msg, t};
 use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{ConfirmPath, HookContext, HookDecision, confirm_path};
 use ai_hook::ui::GuiDialog;
-use ai_hook::{errln, outln};
+use ai_hook::{eprint_ts, errln, outln};
 use clap::FromArgMatches;
 use serde_json::json;
 use std::ffi::OsString;
@@ -122,14 +122,6 @@ fn attach_parent_console() {
             }
         }
     }
-}
-
-/// Timestamped stderr log line: `[YYYY-MM-DD HH:MM:SS] message…`.
-/// All diagnostics carry a human-readable local time.
-macro_rules! eprint_ts {
-    ($($arg:tt)*) => {
-        errln!("[{}] {}", ai_hook::engine::local_now_str(), format_args!($($arg)*))
-    };
 }
 
 // --- Startup profiler (AI_HOOK_PROFILE=1): stage timings to stderr. ---
@@ -464,7 +456,10 @@ fn main() {
             ref platform,
             ref scripts,
         }) => handle_bench(&args, iterations, command, platform, scripts),
-        Some(Commands::Install { ref target_dir }) => handle_install(target_dir.clone()),
+        Some(Commands::Install {
+            ref target_dir,
+            force,
+        }) => ai_hook::install::handle_install(target_dir.clone(), force),
         Some(Commands::Update { force, ref repo }) => {
             if let Err(e) = ai_hook::update::handle_update(force, repo) {
                 eprint_ts!("[ai-hook update] {}: {}", t(Msg::M054), e);
@@ -1216,219 +1211,6 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, platform: &str, sc
         t(Msg::M091)
     );
     outln!("============================================================");
-}
-
-/// Checks whether a directory is writable by attempting a quick probe file
-fn is_dir_writable(dir: &std::path::Path) -> bool {
-    if !dir.exists() {
-        return false;
-    }
-    let test_file = dir.join(format!(".ai_hook_perm_test_{}", std::process::id()));
-    if std::fs::write(&test_file, b"").is_ok() {
-        let _ = std::fs::remove_file(&test_file);
-        true
-    } else {
-        false
-    }
-}
-
-/// Parses $PATH into entries, tolerating the MSYS/Git-Bash shape that is
-/// injected into native Windows children: ':'-separated entries with '/c/…'
-/// drive-mount prefixes. std::env::split_paths() alone mis-parses that shape
-/// on Windows (it splits on ';'), so this parser is what keeps automatic
-/// install placement working when the hook is driven from Git Bash.
-fn path_entries_from_env() -> Vec<PathBuf> {
-    let Some(raw) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    let raw = raw.to_string_lossy();
-
-    #[cfg(windows)]
-    if !raw.contains(';') && raw.contains(':') {
-        return raw
-            .split(':')
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                // '/c/Users/…' -> 'C:\Users\…'; non-drive entries (e.g. /usr/bin)
-                // stay as-is and are skipped later by exists()/writability probes.
-                let b = p.as_bytes();
-                if p.starts_with('/') && b.len() >= 3 && b[1].is_ascii_alphabetic() && b[2] == b'/'
-                {
-                    let drive = (b[1] as char).to_ascii_uppercase();
-                    PathBuf::from(format!("{}:\\{}", drive, &p[3..]).replace('/', "\\"))
-                } else {
-                    PathBuf::from(p)
-                }
-            })
-            .collect();
-    }
-
-    std::env::split_paths(raw.as_ref()).collect()
-}
-
-/// Automatically detects an existing directory already in PATH to avoid adding any new environment variables.
-fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
-    if let Some(explicit) = target_dir {
-        return explicit;
-    }
-
-    let existing_paths = path_entries_from_env();
-
-    let norm_cmp = |p1: &std::path::Path, p2: &std::path::Path| -> bool {
-        let s1 = p1
-            .to_string_lossy()
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_lowercase();
-        let s2 = p2
-            .to_string_lossy()
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_lowercase();
-        s1 == s2
-    };
-
-    // 1. Unix: standard system-wide /usr/local/bin first when writable and in PATH
-    #[cfg(not(windows))]
-    {
-        let usr_local_bin = PathBuf::from("/usr/local/bin");
-        if existing_paths.iter().any(|p| norm_cmp(p, &usr_local_bin))
-            && is_dir_writable(&usr_local_bin)
-        {
-            return usr_local_bin;
-        }
-    }
-
-    // 2. Preferred standard user bin directories in PATH: ~/.local/bin, ~/.cargo/bin
-    if let Some(home) = ai_hook::paths::home_dir() {
-        let local_bin = home.join(".local").join("bin");
-        if existing_paths.iter().any(|p| norm_cmp(p, &local_bin)) && is_dir_writable(&local_bin) {
-            return local_bin;
-        }
-        let cargo_bin = home.join(".cargo").join("bin");
-        if existing_paths.iter().any(|p| norm_cmp(p, &cargo_bin)) && is_dir_writable(&cargo_bin) {
-            return cargo_bin;
-        }
-    }
-
-    // 3. Walk PATH left-to-right, skipping special/temporary paths
-    let is_ignored_path = |p: &std::path::Path| -> bool {
-        let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
-        (cfg!(windows) && s.contains("microsoft") && s.contains("windowsapps"))
-            || s.contains("/target/")
-            || s.contains("/node_modules/")
-            || s.contains("/build/")
-    };
-
-    for path in &existing_paths {
-        if path.as_os_str().is_empty() || is_ignored_path(path) {
-            continue;
-        }
-        if path.exists() && is_dir_writable(path) {
-            return path.clone();
-        }
-    }
-
-    // 4. Fallback default: ~/.local/bin (Standard cross-platform convention)
-    if let Some(home) = ai_hook::paths::home_dir() {
-        home.join(".local").join("bin")
-    } else {
-        PathBuf::from("/usr/local/bin")
-    }
-}
-
-fn handle_install(target_dir: Option<PathBuf>) {
-    let current_exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            eprint_ts!("{}: {}", t(Msg::M092), e);
-            return;
-        }
-    };
-
-    let dest_dir = resolve_global_install_dir(target_dir);
-
-    if !dest_dir.exists() {
-        let _ = std::fs::create_dir_all(&dest_dir);
-    }
-
-    let exe_name = if cfg!(windows) {
-        "ai-hook.exe"
-    } else {
-        "ai-hook"
-    };
-
-    let dest_file = dest_dir.join(exe_name);
-    let norm = |p: &std::path::Path| {
-        p.canonicalize()
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .trim_start_matches(r"\\?\")
-            .to_lowercase()
-    };
-    let already_there = norm(&current_exe) == norm(&dest_file);
-
-    if !already_there {
-        if let Err(e) = std::fs::copy(&current_exe, &dest_file) {
-            eprint_ts!("{} {}: {}", t(Msg::M093), dest_file.display(), e);
-            #[cfg(windows)]
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                eprint_ts!("   {}", t(Msg::M094));
-            }
-            return;
-        }
-        // Verify the copy actually landed (size matches the source).
-        let src_len = std::fs::metadata(&current_exe).map(|m| m.len()).ok();
-        let dest_len = std::fs::metadata(&dest_file).map(|m| m.len()).ok();
-        if src_len.is_some() && src_len != dest_len {
-            eprint_ts!(
-                "{} {} ({}).",
-                t(Msg::M095),
-                dest_file.display(),
-                t(Msg::M096)
-            );
-            let _ = std::fs::remove_file(&dest_file);
-            return;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o755));
-        }
-        outln!("{}:", t(Msg::M097));
-        outln!("   {}", dest_file.display());
-    } else {
-        outln!("{}:", t(Msg::M098));
-        outln!("   {}", dest_file.display());
-    }
-    outln!();
-
-    // Check if the destination is already in PATH (no environment variables modified)
-    let norm_dest = dest_dir
-        .to_string_lossy()
-        .trim_end_matches(['\\', '/'])
-        .to_lowercase();
-    let in_path = path_entries_from_env().iter().any(|p| {
-        p.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
-            == norm_dest
-    });
-
-    if in_path {
-        outln!("✓ {}", t(Msg::M099));
-        outln!("  '{}' {}.", dest_dir.display(), t(Msg::M100));
-        outln!("  {}", t(Msg::M101));
-    } else {
-        outln!(
-            "ℹ️  {} '{}' {}.",
-            t(Msg::M102),
-            dest_dir.display(),
-            t(Msg::M103)
-        );
-        outln!("   {}:", t(Msg::M104));
-        outln!("     {}", dest_file.display());
-    }
 }
 
 fn handle_clean(max_files: Option<usize>, dry_run: bool) {

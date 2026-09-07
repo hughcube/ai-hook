@@ -112,6 +112,10 @@ pub enum Commands {
         /// Target bin directory (default: auto-detected existing PATH directory)
         #[arg(short, long)]
         target_dir: Option<PathBuf>,
+
+        /// Force overwrite even if the binary already exists at target location
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Update ai-hook to the latest release from GitHub
@@ -243,7 +247,12 @@ pub fn localized_command() -> Command {
             ("scripts", M126),
         ]
     );
-    let cmd = sub_help!(cmd, "install", M127, [("target_dir", M128)]);
+    let cmd = sub_help!(
+        cmd,
+        "install",
+        M127,
+        [("target_dir", M128), ("force", M130)]
+    );
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
     let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
     sub_help!(cmd, "clean", M162, [("max_files", M163), ("dry_run", M164)])

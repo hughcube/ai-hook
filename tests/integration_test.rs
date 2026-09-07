@@ -3629,3 +3629,158 @@ fn test_all_logs_contain_datetime_single_line_agent_type() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_install_command_lifecycle_and_force_flag() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai_hook_test_install_cli_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let bin_path = env!("CARGO_BIN_EXE_ai-hook");
+    let exe_name = if cfg!(windows) {
+        "ai-hook.exe"
+    } else {
+        "ai-hook"
+    };
+    let target_file = tmp.join(exe_name);
+
+    // 1. First install without -f into empty directory: succeeds
+    let out1 = Command::new(bin_path)
+        .args(["install", "-t", &tmp.to_string_lossy()])
+        .output()
+        .expect("Failed to run install");
+    assert!(out1.status.success(), "First install should succeed");
+    assert!(
+        target_file.exists(),
+        "Target file should exist after install"
+    );
+
+    // Verify the newly installed binary is functional
+    let ver_out = Command::new(&target_file)
+        .arg("--version")
+        .output()
+        .expect("Installed binary should execute");
+    assert!(ver_out.status.success());
+    let ver_str = String::from_utf8_lossy(&ver_out.stdout);
+    assert!(
+        ver_str.contains("ai-hook"),
+        "Version output should contain ai-hook: {ver_str}"
+    );
+
+    // 2. Second install without -f: detects existing file and hints -f/--force
+    let out2 = Command::new(bin_path)
+        .args(["install", "-t", &tmp.to_string_lossy()])
+        .output()
+        .expect("Failed to run install without force");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("force") || stdout2.contains("-f"),
+        "Second install without force should advise using -f / --force: {stdout2}"
+    );
+
+    // 3. Force install with -f: succeeds and overwrites safely
+    let out3 = Command::new(bin_path)
+        .args(["install", "-f", "-t", &tmp.to_string_lossy()])
+        .output()
+        .expect("Failed to run install with force");
+    assert!(out3.status.success(), "Force install should succeed");
+    assert!(target_file.exists());
+
+    // 4. Force install with --force: succeeds
+    let out4 = Command::new(bin_path)
+        .args(["install", "--force", "-t", &tmp.to_string_lossy()])
+        .output()
+        .expect("Failed to run install with --force");
+    assert!(
+        out4.status.success(),
+        "Force install with --force should succeed"
+    );
+    assert!(target_file.exists());
+
+    // Clean up
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_install_binary_file_safety_rollback_on_broken_source() {
+    use ai_hook::install::{InstallOutcome, install_binary_file};
+    let tmp = std::env::temp_dir().join(format!(
+        "ai_hook_test_install_rollback_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let bin_path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ai-hook"));
+    let exe_name = if cfg!(windows) {
+        "ai-hook.exe"
+    } else {
+        "ai-hook"
+    };
+    let target_file = tmp.join(exe_name);
+
+    // 1. Initial successful install
+    let res1 = install_binary_file(&bin_path, &tmp, false);
+    assert_eq!(res1, Ok(InstallOutcome::Installed(target_file.clone())));
+    assert!(target_file.exists());
+
+    // Record original valid binary size
+    let orig_len = std::fs::metadata(&target_file).unwrap().len();
+
+    // 2. Prepare a corrupted non-executable dummy file
+    let broken_src = tmp.join("corrupted_payload.bin");
+    std::fs::write(&broken_src, b"THIS_IS_NOT_A_VALID_AI_HOOK_BINARY").unwrap();
+
+    // 3. Attempt force install with the broken source file
+    let res_broken = install_binary_file(&broken_src, &tmp, true);
+    assert!(res_broken.is_err(), "Install of corrupted binary must fail");
+    let err = res_broken.unwrap_err();
+    assert!(
+        err.contains("回滚") || err.contains("mismatch") || err.contains("大小不一致"),
+        "Failure must trigger safety rollback: {err}"
+    );
+
+    // 4. Verify that target file was restored and still functions!
+    assert!(target_file.exists(), "Target file must be restored");
+    let restored_len = std::fs::metadata(&target_file).unwrap().len();
+    assert_eq!(
+        orig_len, restored_len,
+        "File size must match original before failed install"
+    );
+
+    let test_run = Command::new(&target_file)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(
+        test_run.status.success(),
+        "Restored binary must still be executable"
+    );
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        stdout.contains("ai-hook"),
+        "Restored binary must pass self-check: {stdout}"
+    );
+
+    // 5. Verify temporary backups are cleaned up
+    let old_backups: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".old."))
+        .collect();
+    assert!(
+        old_backups.is_empty(),
+        "Temporary backup files should be cleaned up on rollback"
+    );
+
+    // Clean up
+    let _ = std::fs::remove_dir_all(&tmp);
+}

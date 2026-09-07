@@ -2,6 +2,7 @@ pub mod cli;
 pub mod engine;
 pub mod fast_path;
 pub mod i18n;
+pub mod install;
 pub mod paths;
 pub mod protocol;
 pub mod tutorial;
@@ -51,6 +52,13 @@ macro_rules! errln {
         let mut o = ::std::io::stderr().lock();
         let _ = writeln!(o, $($arg)*);
     }};
+}
+
+#[macro_export]
+macro_rules! eprint_ts {
+    ($($arg:tt)*) => {
+        $crate::errln!("[{}] {}", $crate::engine::local_now_str(), format_args!($($arg)*))
+    };
 }
 
 pub use cli::{Cli, Commands};
