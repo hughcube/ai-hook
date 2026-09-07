@@ -1274,28 +1274,54 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
 
     let existing_paths = path_entries_from_env();
 
-    // PATH entries keep their declared order; on Windows the %PATH% entries
-    // live in the registry and split_paths reproduces that order.
-    let is_windows_apps = |p: &std::path::Path| -> bool {
-        let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
-        s.contains("microsoft") && s.contains("windowsapps")
+    let norm_cmp = |p1: &std::path::Path, p2: &std::path::Path| -> bool {
+        let s1 = p1
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        let s2 = p2
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        s1 == s2
     };
 
-    // 1. Unix: standard system-wide /usr/local/bin first when writable
+    // 1. Unix: standard system-wide /usr/local/bin first when writable and in PATH
     #[cfg(not(windows))]
     {
         let usr_local_bin = PathBuf::from("/usr/local/bin");
-        if existing_paths.contains(&usr_local_bin) && is_dir_writable(&usr_local_bin) {
+        if existing_paths.iter().any(|p| norm_cmp(p, &usr_local_bin))
+            && is_dir_writable(&usr_local_bin)
+        {
             return usr_local_bin;
         }
     }
 
-    // 2. Walk PATH left-to-right and take the first writable directory (ignoring WindowsApps)
-    for path in &existing_paths {
-        if path.as_os_str().is_empty() {
-            continue;
+    // 2. Preferred standard user bin directories in PATH: ~/.local/bin, ~/.cargo/bin
+    if let Some(home) = ai_hook::paths::home_dir() {
+        let local_bin = home.join(".local").join("bin");
+        if existing_paths.iter().any(|p| norm_cmp(p, &local_bin)) && is_dir_writable(&local_bin) {
+            return local_bin;
         }
-        if cfg!(windows) && is_windows_apps(path) {
+        let cargo_bin = home.join(".cargo").join("bin");
+        if existing_paths.iter().any(|p| norm_cmp(p, &cargo_bin)) && is_dir_writable(&cargo_bin) {
+            return cargo_bin;
+        }
+    }
+
+    // 3. Walk PATH left-to-right, skipping special/temporary paths
+    let is_ignored_path = |p: &std::path::Path| -> bool {
+        let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
+        (cfg!(windows) && s.contains("microsoft") && s.contains("windowsapps"))
+            || s.contains("/target/")
+            || s.contains("/node_modules/")
+            || s.contains("/build/")
+    };
+
+    for path in &existing_paths {
+        if path.as_os_str().is_empty() || is_ignored_path(path) {
             continue;
         }
         if path.exists() && is_dir_writable(path) {
@@ -1303,7 +1329,7 @@ fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
         }
     }
 
-    // 3. Fallback default: ~/.local/bin (Standard cross-platform convention)
+    // 4. Fallback default: ~/.local/bin (Standard cross-platform convention)
     if let Some(home) = ai_hook::paths::home_dir() {
         home.join(".local").join("bin")
     } else {
@@ -1363,6 +1389,11 @@ fn handle_install(target_dir: Option<PathBuf>) {
             );
             let _ = std::fs::remove_file(&dest_file);
             return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o755));
         }
         outln!("{}:", t(Msg::M097));
         outln!("   {}", dest_file.display());

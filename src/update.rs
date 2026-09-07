@@ -29,6 +29,23 @@ const DEFAULT_REPO: &str = "hughcube/ai-hook";
 /// paranoia against a hostile or hijacked release response).
 const MAX_CHECKSUM_FILE_BYTES: u64 = 1024 * 1024;
 
+fn build_agent(timeout: Duration) -> ureq::Agent {
+    let mut builder = ureq::builder().timeout(timeout);
+    let proxy_url = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .or_else(|_| std::env::var("http_proxy"))
+        .or_else(|_| std::env::var("ALL_PROXY"))
+        .or_else(|_| std::env::var("all_proxy"));
+    if let Ok(p) = proxy_url
+        && !p.trim().is_empty()
+        && let Ok(proxy) = ureq::Proxy::new(p.trim())
+    {
+        builder = builder.proxy(proxy);
+    }
+    builder.build()
+}
+
 /// Opens `path` exclusively (fails if it exists). Any stale leftover from a
 /// previous run is removed first. `remove_file` never follows symlinks, so a
 /// pre-placed link cannot redirect the write to an arbitrary target.
@@ -217,35 +234,54 @@ fn fetch_expected_checksum(
         .and_then(|u| u.as_str())
         .ok_or_else(|| tf(Msg::M142, &[&"no SHA256SUMS.txt asset in the release"]))?;
 
-    let mut req = ureq::get(url).timeout(API_TIMEOUT).set(
-        "User-Agent",
-        &format!("ai-hook-updater/{}", current_version),
-    );
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", trimmed));
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        let agent = build_agent(API_TIMEOUT);
+        let mut req = agent
+            .get(url)
+            .set(
+                "User-Agent",
+                &format!("ai-hook-updater/{}", current_version),
+            )
+            .set("Cache-Control", "no-cache, no-store")
+            .set("Pragma", "no-cache");
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {}", trimmed));
+            }
+        }
+
+        match req.call() {
+            Ok(resp) => {
+                let mut text = String::new();
+                if resp
+                    .into_reader()
+                    .take(MAX_CHECKSUM_FILE_BYTES)
+                    .read_to_string(&mut text)
+                    .is_ok()
+                {
+                    // sha256sum writes "<hash>  <name>"; a leading '*' marks binary mode.
+                    for line in text.lines() {
+                        let mut parts = line.split_whitespace();
+                        let hash = parts.next().unwrap_or("");
+                        let name = parts.next().unwrap_or("").trim_start_matches('*');
+                        if name == asset_name && hash.len() == 64 {
+                            return Ok(hash.to_ascii_lowercase());
+                        }
+                    }
+                    return Err(tf(Msg::M141, &[&asset_name]));
+                }
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(500 * attempt as u64));
+                }
+            }
         }
     }
-
-    let mut text = String::new();
-    req.call()
-        .map_err(|e| tf(Msg::M142, &[&e]))?
-        .into_reader()
-        .take(MAX_CHECKSUM_FILE_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|e| tf(Msg::M142, &[&e]))?;
-
-    // sha256sum writes "<hash>  <name>"; a leading '*' marks binary mode.
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let hash = parts.next().unwrap_or("");
-        let name = parts.next().unwrap_or("").trim_start_matches('*');
-        if name == asset_name && hash.len() == 64 {
-            return Ok(hash.to_ascii_lowercase());
-        }
-    }
-    Err(tf(Msg::M141, &[&asset_name]))
+    Err(tf(Msg::M142, &[&last_err]))
 }
 
 /// Simple Semantic Versioning parser (e.g. "0.1.4" -> (0, 1, 4))
@@ -273,13 +309,16 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     outln!("{} https://github.com/{} ...", t(Msg::M015), repo);
 
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-    let mut req = ureq::get(&api_url)
-        .timeout(API_TIMEOUT)
+    let agent = build_agent(API_TIMEOUT);
+    let mut req = agent
+        .get(&api_url)
         .set(
             "User-Agent",
             &format!("ai-hook-updater/{}", current_version),
         )
-        .set("Accept", "application/vnd.github.v3+json");
+        .set("Accept", "application/vnd.github.v3+json")
+        .set("Cache-Control", "no-cache, no-store")
+        .set("Pragma", "no-cache");
 
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         let trimmed = token.trim();
@@ -312,7 +351,19 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     };
 
     if !force && !is_newer {
-        outln!("✓ {} (v{}).", t(Msg::M023), current_version);
+        if crate::i18n::lang().is_zh() {
+            outln!(
+                "✓ {} (v{})。如需强制重新安装，请执行 `ai-hook update --force`",
+                t(Msg::M023),
+                current_version
+            );
+        } else {
+            outln!(
+                "✓ {} (v{}). Run with `--force` to reinstall.",
+                t(Msg::M023),
+                current_version
+            );
+        }
         return Ok(());
     }
 
@@ -352,46 +403,110 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
         .and_then(|u| u.as_str())
         .ok_or_else(|| t(Msg::M026).to_string())?;
 
+    let expected_checksum = if env_flag_true("AI_HOOK_SKIP_CHECKSUM") {
+        errln!("[ai-hook] {}", t(Msg::M147));
+        None
+    } else {
+        Some(fetch_expected_checksum(
+            &release_val,
+            asset_name,
+            current_version,
+        )?)
+    };
+
     outln!("{}", tf(Msg::M027, &[&download_url]));
 
-    let mut download_req = ureq::get(download_url)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .set(
-            "User-Agent",
-            &format!("ai-hook-updater/{}", current_version),
-        )
-        .set("Accept", "application/octet-stream");
+    let mut binary_bytes = Vec::new();
+    let mut download_err = String::new();
+    for attempt in 1..=3 {
+        binary_bytes.clear();
+        let download_agent = build_agent(DOWNLOAD_TIMEOUT);
+        let mut download_req = download_agent
+            .get(download_url)
+            .set(
+                "User-Agent",
+                &format!("ai-hook-updater/{}", current_version),
+            )
+            .set("Accept", "application/octet-stream");
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            download_req = download_req.set("Authorization", &format!("Bearer {}", trimmed));
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                download_req = download_req.set("Authorization", &format!("Bearer {}", trimmed));
+            }
+        }
+
+        match download_req.call() {
+            Ok(download_resp) => {
+                let content_len = download_resp
+                    .header("Content-Length")
+                    .and_then(|s| s.parse::<u64>().ok());
+
+                let mut reader = download_resp.into_reader();
+                let mut buffer = [0u8; 64 * 1024];
+                let mut last_reported = std::time::Instant::now();
+                let mut read_failed = false;
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            binary_bytes.extend_from_slice(&buffer[..n]);
+                            if binary_bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+                                return Err(tf(
+                                    Msg::M030,
+                                    &[&(MAX_DOWNLOAD_BYTES / (1024 * 1024))],
+                                ));
+                            }
+                            if last_reported.elapsed() >= Duration::from_millis(300) {
+                                let downloaded_mb = binary_bytes.len() as f64 / (1024.0 * 1024.0);
+                                if let Some(total) = content_len {
+                                    let total_mb = total as f64 / (1024.0 * 1024.0);
+                                    let pct =
+                                        (binary_bytes.len() as f64 / total as f64 * 100.0) as u32;
+                                    eprint!(
+                                        "\r   ⬇ {:.2} MB / {:.2} MB ({}%)...",
+                                        downloaded_mb, total_mb, pct
+                                    );
+                                } else {
+                                    eprint!("\r   ⬇ {:.2} MB...", downloaded_mb);
+                                }
+                                let _ = std::io::stderr().flush();
+                                last_reported = std::time::Instant::now();
+                            }
+                        }
+                        Err(e) => {
+                            download_err = e.to_string();
+                            read_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if content_len.is_some() {
+                    eprintln!();
+                }
+                if !read_failed && !binary_bytes.is_empty() {
+                    download_err.clear();
+                    break;
+                }
+            }
+            Err(e) => {
+                download_err = e.to_string();
+            }
+        }
+        if attempt < 3 {
+            eprintln!("   [重试 {}/3] 下载连接中断，正在重试...", attempt);
+            std::thread::sleep(Duration::from_millis(1000));
         }
     }
 
-    let download_resp = download_req.call().map_err(|e| tf(Msg::M028, &[&e]))?;
-
-    let mut binary_bytes = Vec::new();
-    download_resp
-        .into_reader()
-        .take(MAX_DOWNLOAD_BYTES + 1)
-        .read_to_end(&mut binary_bytes)
-        .map_err(|e| tf(Msg::M029, &[&e]))?;
-    if binary_bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(tf(Msg::M030, &[&(MAX_DOWNLOAD_BYTES / (1024 * 1024))]));
+    if !download_err.is_empty() || binary_bytes.is_empty() {
+        return Err(tf(Msg::M028, &[&download_err]));
     }
 
-    // Verify the payload against the checksum published with the release,
-    // before any archive entry is written or the binary is executed. The
-    // `--version` probe below cannot serve this purpose: it asks the
-    // downloaded file to identify itself, which any payload can fake.
-    if env_flag_true("AI_HOOK_SKIP_CHECKSUM") {
-        errln!("[ai-hook] {}", t(Msg::M147));
-    } else {
-        let expected = fetch_expected_checksum(&release_val, asset_name, current_version)?;
+    if let Some(ref expected) = expected_checksum {
         let actual = sha256_hex(&binary_bytes);
-        if actual != expected {
-            return Err(tf(Msg::M140, &[&expected, &actual]));
+        if &actual != expected {
+            return Err(tf(Msg::M140, &[expected, &actual]));
         }
         outln!("{}", t(Msg::M143));
     }
