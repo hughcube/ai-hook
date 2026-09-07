@@ -545,11 +545,27 @@ mod tests {
             &ctx,
         );
 
-        assert!(prompt.contains("【ai-hook 安全确认】SQL 破坏性操作确认"));
-        assert!(prompt.contains("原因: SQL 破坏性操作可能批量删除/修改数据，请确认是否允许执行？"));
-        assert!(prompt.contains("操作: 执行命令 (Bash)"));
-        assert!(prompt.contains("目标: DELETE FROM users WHERE 1=1"));
-        assert!(prompt.contains("目录: /var/www/project"));
+        let l = crate::i18n::lang();
+        let expected_prefix = l.pick("【ai-hook 安全确认】", "[ai-hook Security Confirmation] ");
+        assert!(prompt.contains(expected_prefix));
+        assert!(prompt.contains("SQL 破坏性操作确认"));
+        assert!(prompt.contains(&format!(
+            "{}: SQL 破坏性操作可能批量删除/修改数据，请确认是否允许执行？",
+            l.pick("原因", "Reason")
+        )));
+        assert!(prompt.contains(&format!(
+            "{}: {} (Bash)",
+            l.pick("操作", "Operation"),
+            l.pick("执行命令", "Execute Command")
+        )));
+        assert!(prompt.contains(&format!(
+            "{}: DELETE FROM users WHERE 1=1",
+            l.pick("目标", "Target")
+        )));
+        assert!(prompt.contains(&format!(
+            "{}: /var/www/project",
+            l.pick("目录", "Directory")
+        )));
     }
 
     #[test]
@@ -571,10 +587,20 @@ mod tests {
 
         let prompt = format_ask_prompt(Some("核心配置修改"), "禁止擅自覆写核心业务配置", &ctx);
 
-        assert!(prompt.contains("【ai-hook 安全确认】核心配置修改"));
-        assert!(prompt.contains("原因: 禁止擅自覆写核心业务配置"));
-        assert!(prompt.contains("操作: 修改文件 (replace_file_content)"));
-        assert!(prompt.contains("目标: C:/app/config.php"));
-        assert!(prompt.contains("目录: C:/app"));
+        let l = crate::i18n::lang();
+        let expected_prefix = l.pick("【ai-hook 安全确认】", "[ai-hook Security Confirmation] ");
+        assert!(prompt.contains(expected_prefix));
+        assert!(prompt.contains("核心配置修改"));
+        assert!(prompt.contains(&format!(
+            "{}: 禁止擅自覆写核心业务配置",
+            l.pick("原因", "Reason")
+        )));
+        assert!(prompt.contains(&format!(
+            "{}: {} (replace_file_content)",
+            l.pick("操作", "Operation"),
+            l.pick("修改文件", "Edit File")
+        )));
+        assert!(prompt.contains(&format!("{}: C:/app/config.php", l.pick("目标", "Target"))));
+        assert!(prompt.contains(&format!("{}: C:/app", l.pick("目录", "Directory"))));
     }
 }
