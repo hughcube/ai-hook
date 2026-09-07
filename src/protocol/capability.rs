@@ -92,15 +92,22 @@ pub fn capabilities(platform: Platform, event: HookEvent) -> Capabilities {
         (P::CodeBuddy | P::WorkBuddy, E::PreToolUse) => {
             Capabilities::new(true, true, true, true, false, false)
         }
-        // Antigravity PreToolUse: official schema explicitly documents `overwrite`
-        // (object, optional) which is shallow-merged into tool arguments before execution
-        // (verified against official agy-customizations/docs/hooks.md).
-        // Mutate input is fully supported via `overwrite`.
-        (P::Antigravity, E::PreToolUse) => Capabilities::new(true, true, false, true, false, false),
+        // Antigravity PreToolUse: 官方输出字段表(antigravity.google/docs/hooks/ 与
+        // /docs/ide/hooks.md)只有 `decision` / `reason` / `permissionOverrides`
+        // 三项 —— 没有改写参数的通道。任何改写形态(如 `overwrite`)都未被官方
+        // 文档记载,发出去只会让宿主按 `decision:"allow"` 放行**原始**参数,
+        // 规则却以为改写成功了 —— 比"丢弃并告警"危险得多。故 mutate_input=false。
+        (P::Antigravity, E::PreToolUse) => {
+            Capabilities::new(true, true, false, false, false, false)
+        }
         // Gemini BeforeTool: official reference documents
         // `hookSpecificOutput.tool_input` as an object that "merges with and
         // overrides the model's arguments before execution".
-        (P::Gemini, E::BeforeTool) => Capabilities::new(true, false, true, true, false, false),
+        // 该事件的 Output Fields 只列了 `decision` / `reason` / `tool_input` /
+        // `continue`:没有 `additionalContext`,所以 inject 无通道(官方
+        // `systemMessage` 的定义是 "Displayed immediately to the user in the
+        // terminal",是给用户的,不是模型上下文,不能拿它顶替 inject)。
+        (P::Gemini, E::BeforeTool) => Capabilities::new(true, false, false, true, false, false),
         (P::Generic, E::PreToolUse) => Capabilities::new(true, false, true, true, false, false),
 
         // ------------------------------------------------------------------
@@ -125,10 +132,12 @@ pub fn capabilities(platform: Platform, event: HookEvent) -> Capabilities {
         // top-level `decision` group, so `decision:"block"` carries the
         // feedback. `additionalContext` is the documented injection channel.
         // ------------------------------------------------------------------
-        (
-            P::ClaudeCode | P::CodeBuddy | P::WorkBuddy | P::OpenCode | P::Generic,
-            E::PostToolUseFailure,
-        ) => Capabilities::new(true, false, true, false, false, false),
+        // CodeBuddy / WorkBuddy 官方事件表(@tencent-ai/codebuddy-code 随包
+        // hooks.md)不含 PostToolUseFailure,宿主不会触发该事件;不要为它
+        // 声明能力,否则矩阵会暗示一个并不存在的门禁点。
+        (P::ClaudeCode | P::Codex | P::OpenCode | P::Generic, E::PostToolUseFailure) => {
+            Capabilities::new(true, false, true, false, false, false)
+        }
 
         // ------------------------------------------------------------------
         // Prompt gate. The prompt-submit protocol has NO ask channel: its
@@ -154,10 +163,20 @@ pub fn capabilities(platform: Platform, event: HookEvent) -> Capabilities {
         // Gemini has no Stop event; AfterAgent's `decision:"deny"` rejects the
         // response and forces a retry, which is the same "keep going" intent.
         // ------------------------------------------------------------------
-        (
-            P::ClaudeCode | P::Codex | P::CodeBuddy | P::WorkBuddy | P::OpenCode | P::Generic,
-            E::Stop | E::SubagentStop,
-        ) => Capabilities::new(false, false, false, false, false, true),
+        // Claude Code 官方决策控制表原文:Stop / SubagentStop 走顶层
+        // `decision:"block"`,且 "**also accept** hookSpecificOutput.additionalContext
+        // for non-error feedback that continues the conversation" —— 所以这两个
+        // 事件是有 inject 通道的(与 `decision:"block"` 的区别只是会不会被标成
+        // hook error)。OpenCode 桥转发 CC 形态,同此。
+        (P::ClaudeCode | P::OpenCode, E::Stop | E::SubagentStop) => {
+            Capabilities::new(false, false, true, false, false, true)
+        }
+        // Codex 官方 Stop 只记载 `decision:"block"` + `reason`;CodeBuddy 官方
+        // Stop/SubagentStop 只记载 `continue:false` + `reason`。两者都没有
+        // additionalContext 通道。
+        (P::Codex | P::CodeBuddy | P::WorkBuddy | P::Generic, E::Stop | E::SubagentStop) => {
+            Capabilities::new(false, false, false, false, false, true)
+        }
         (P::Antigravity, E::Stop | E::SubagentStop) => {
             Capabilities::new(false, false, false, false, false, true)
         }
@@ -179,13 +198,19 @@ pub fn capabilities(platform: Platform, event: HookEvent) -> Capabilities {
         // SessionEnd has "no decision control" on the Claude family; Gemini
         // still accepts a `systemMessage` shown during shutdown.
         (P::Gemini, E::SessionEnd) => Capabilities::new(false, false, true, false, false, false),
-        // Subagent / compaction-post events: context injection only (official
-        // event lists of Claude Code, Codex and CodeBuddy all include
-        // SubagentStart / PostCompact).
+        // SubagentStart: context injection only (official event lists of Claude
+        // Code, Codex and CodeBuddy all include it, and all three document
+        // `hookSpecificOutput.additionalContext` for it).
         (
             P::ClaudeCode | P::Codex | P::CodeBuddy | P::WorkBuddy | P::OpenCode | P::Generic,
-            E::SubagentStart | E::PostCompact,
+            E::SubagentStart,
         ) => Capabilities::new(false, false, true, false, false, false),
+        // PostCompact 刻意**不给** inject:
+        // - Claude Code 官方决策控制表把它和 Setup / Notification / SessionEnd
+        //   并列为 "None. No decision control."
+        // - Codex 官方只记载 `continue: false`(Common output fields)
+        // - CodeBuddy / WorkBuddy 官方没有 PostCompact 的决策控制节
+        // 三处都没有 additionalContext 通道,声明它只会让规则以为注入成功了。
         // Setup has NO capability row on any host. Claude Code's official
         // Setup decision control is explicit: "On every exit code, Claude
         // Code discards a Setup hook's JSON output fields, such as
@@ -219,14 +244,19 @@ pub fn capabilities(platform: Platform, event: HookEvent) -> Capabilities {
         // ------------------------------------------------------------------
         // Permission request: allow / deny the pending approval prompt.
         // ------------------------------------------------------------------
-        (
-            P::ClaudeCode | P::Codex | P::CodeBuddy | P::WorkBuddy | P::OpenCode,
-            E::PermissionRequest,
-        ) => Capabilities::new(true, false, true, false, false, false),
+        // CodeBuddy / WorkBuddy 官方事件表不含 PermissionRequest(见
+        // PostToolUseFailure 处的说明),不为其声明能力。
+        (P::ClaudeCode | P::Codex | P::OpenCode, E::PermissionRequest) => {
+            Capabilities::new(true, false, true, false, false, false)
+        }
 
         // ------------------------------------------------------------------
         // Compaction gate
         // ------------------------------------------------------------------
+        // gate 为 true,但**各宿主的阻断形态不同**,由 output.rs 分别渲染:
+        // - Claude Code:官方决策控制表把 PreCompact 列入顶层 `decision:"block"` 组
+        // - Codex:官方原文只给出 `continue: false`("Codex stops before compacting")
+        // - CodeBuddy / WorkBuddy:官方只记载退出码 2 阻止压缩
         (P::ClaudeCode | P::CodeBuddy | P::WorkBuddy | P::Codex, E::PreCompact) => {
             Capabilities::new(true, false, false, false, false, false)
         }
@@ -256,9 +286,8 @@ mod tests {
         // Claude Code / CodeBuddy / WorkBuddy do honor ask, even in bypass
         // mode: official PreToolUse decision control says `"ask" prompts the
         // user to confirm`, and that "A hook's `"ask"` also forces a permission
-        // prompt in auto mode" (both sentences are on the current page —
-        // re-verified 2026-09-07 by fetching the full document, see
-        // docs/REVIEW_CROSSCHECK_2026-09-06.md §1.9.2).
+        // prompt in auto mode" (both sentences verified present on
+        // https://code.claude.com/docs/en/hooks as of 2026-09-07).
         assert!(capabilities(Platform::ClaudeCode, HookEvent::PreToolUse).ask);
         assert!(capabilities(Platform::CodeBuddy, HookEvent::PreToolUse).ask);
         assert!(capabilities(Platform::WorkBuddy, HookEvent::PreToolUse).ask);

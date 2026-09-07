@@ -332,6 +332,9 @@ pub enum Msg {
     M166,
     /// Subcommand help description.
     M167,
+    /// Hint appended to a SyntaxError when the rule uses an unsupported
+    /// `export …` form.
+    M168,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -1146,6 +1149,14 @@ impl Msg {
             Msg::M167 => match l {
                 Lang::Zh => "打印帮助信息或指定子命令的帮助信息",
                 Lang::En => "Print this message or the help of the given subcommand(s)",
+            },
+            Msg::M168 => match l {
+                Lang::Zh => {
+                    "规则文件只支持这三种导出:`export default function(ctx, sys) {…}`、`export function PreToolUse(ctx, sys) {…}`、`export async function Stop(ctx, sys) {…}`;其它形式(如 `export const …`)在 QuickJS 中不是合法语法"
+                }
+                Lang::En => {
+                    "a rule file may only export these three forms: `export default function(ctx, sys) {…}`, `export function PreToolUse(ctx, sys) {…}`, `export async function Stop(ctx, sys) {…}`; anything else (e.g. `export const …`) is not valid syntax in QuickJS"
+                }
             },
             Msg::AllowWord => match l {
                 Lang::Zh => "允许",

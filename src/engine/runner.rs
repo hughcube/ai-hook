@@ -692,8 +692,8 @@ impl RuleRunner {
                 // Back to front so earlier offsets stay valid while splicing.
                 for hit in hits.into_iter().rev() {
                     match hit {
-                        ExportHit::Default { offset } => {
-                            s.replace_range(offset..offset + 14, "var __ai_default__ = ");
+                        ExportHit::Default { offset, end } => {
+                            s.replace_range(offset..end, "var __ai_default__ = ");
                             has_default = true;
                         }
                         ExportHit::Handler { offset, name } => {
@@ -939,7 +939,8 @@ impl RuleRunner {
         if let Err(e) = res
             && error.is_none()
         {
-            error = Some(normalize_rule_error(&e.to_string()));
+            let msg = normalize_rule_error(&e.to_string());
+            error = Some(explain_export_syntax_error(&rule.code, msg));
         }
 
         // The watchdog interrupt fires once the deadline passes, whether it
@@ -1011,6 +1012,17 @@ fn normalize_rule_error(err: &str) -> String {
     err.trim().to_string()
 }
 
+/// `export` is not legal inside `new Function`, so any export form the loader
+/// does not rewrite surfaces as a bare `SyntaxError`. The rule is failed closed
+/// either way, but a bare "expecting ';'" gives the author nothing to act on —
+/// name the supported forms when the source actually contains an `export`.
+fn explain_export_syntax_error(code: &str, msg: String) -> String {
+    if !msg.contains("SyntaxError") || !code.contains("export") {
+        return msg;
+    }
+    format!("{}\n({})", msg, t(Msg::M168))
+}
+
 /// True when a rule explicitly declined to state an opinion (`return null`),
 /// the documented way to hand control to the next rule. `undefined` counts as
 /// "no opinion" too: with per-event named exports a handler whose
@@ -1023,8 +1035,14 @@ fn is_no_opinion(val: &Value) -> bool {
 
 /// A top-level `export ...` occurrence found by [`find_exports`].
 enum ExportHit {
-    /// `export default <expr>`
-    Default { offset: usize },
+    /// `export default <expr>`.
+    ///
+    /// `end` is stored alongside `offset` because the two are not a fixed
+    /// distance apart: `export  default` (any run of whitespace after
+    /// `export`) is still a valid default export, and replacing a hard-coded
+    /// 14-byte window would cut into the expression and turn the rule into a
+    /// syntax error.
+    Default { offset: usize, end: usize },
     /// `export [async] function NAME(...)`
     Handler { offset: usize, name: String },
 }
@@ -1108,7 +1126,10 @@ fn find_exports(code: &str) -> Vec<ExportHit> {
                                     || bytes[d_end] == b'_'
                                     || bytes[d_end] == b'$');
                             if next_ok {
-                                hits.push(ExportHit::Default { offset: i });
+                                hits.push(ExportHit::Default {
+                                    offset: i,
+                                    end: d_end,
+                                });
                             }
                         } else if let Some(rest) = after_trim.strip_prefix("function ") {
                             let name = take_ident(rest);

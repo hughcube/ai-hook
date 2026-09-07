@@ -154,7 +154,12 @@ fn chinese_tutorial_body() -> String {
   return { mutateInput: {...} };             → 改写工具参数(PreToolUse)。
                                    仅 PreToolUse 类 gate 事件可用;宿主/事件无改写
                                    通道时(如在 PostToolUse 或不支持改参的事件上)由引擎
-                                   丢弃并输出 stderr 提示,绝不输出宿主不认识的键
+                                   丢弃并输出 stderr 提示,绝不输出宿主不认识的键。
+                                   ⚠️ Codex(官方:updatedInput 必须与
+                                   permissionDecision:"allow" 同发)与 CodeBuddy(实现
+                                   同样要求)上,引擎会一并输出该放行标记 —— 即改写参数
+                                   的同时也会跳过本次权限确认。Antigravity 官方输出字段
+                                   表没有改参通道,该项会被丢弃
   return { replaceOutput: "…" };             → 替换工具结果(PostToolUse)。
                                    值可以是字符串(文本块宿主会用文本包裹),
                                    也可以是对象/数组 —— Claude Code 内置工具的
@@ -216,7 +221,6 @@ fn chinese_tutorial_body() -> String {
   会丢 gate),post-tool 载荷显示为 PreToolUse,且该期规则决策会被宿主忽略
   (官方 PostToolUse 输出固定 {})。未建模的宿主事件(如 TaskCompleted /
   Notification / ConfigChange)以宿主原名透传 ctx.event,可观测但不可决策。
-  完整 43 事件能力矩阵见 docs/HOOK_EVENT_MATRIX.md。
   ── 原生 matcher 速查:拦截目标 × 各家工具注册名 ─────────────────
   执行命令:CC Bash|PowerShell、Codex Bash、CB Bash、AGY run_command、
   Gemini run_shell_command、OpenCode bash(小写);写文件:Write / Write(别名
@@ -456,7 +460,15 @@ IV. Decision protocol (rule return values)
                                    rewrite channel; when the host/event has
                                    none (e.g. on non-PreToolUse events), the engine drops it
                                    with a stderr notice and never emits a key
-                                   the host does not know
+                                   the host does not know.
+                                   ⚠️ On Codex (official: updatedInput must be
+                                   returned with permissionDecision:"allow") and
+                                   CodeBuddy (same requirement in its
+                                   implementation) the engine emits that allow
+                                   marker too — rewriting the arguments also
+                                   skips this call's permission prompt.
+                                   Antigravity has no rewrite channel in its
+                                   official output fields, so it is dropped there
   return { replaceOutput: "…" };             → replace the tool result (PostToolUse).
                                    The value may be a string (text-block hosts
                                    wrap it) or an object/array — Claude Code
@@ -535,7 +547,7 @@ V. Host decision matrix (can_ask × mode; output is mapped automatically)
   is ignored by the host (official PostToolUse output is `{}`). Host events
   ai-hook does not model (TaskCompleted / Notification / ConfigChange / …)
   surface with the host's own spelling in ctx.event — observable, not
-  decidable. Full 43-event capability matrix: docs/HOOK_EVENT_MATRIX.md.
+  decidable.
   ── Native matcher cheat sheet: intercept goal × host tool names ───
   Run a command: CC Bash|PowerShell, Codex Bash, CB Bash, AGY run_command,
   Gemini run_shell_command, OpenCode bash (lowercase); write a file: Write /

@@ -115,24 +115,39 @@ impl GuiDialog {
         true
     }
 
+    /// Upper bound for the countdown, in seconds.
+    ///
+    /// The value reaches PowerShell as `[int]$env:AI_HOOK_DLG_TIMEOUT`, and
+    /// `[int]` is Int32 — a rule-supplied `timeout` near `u32::MAX` fails that
+    /// conversion, the dialog script dies before it paints, and the confirm
+    /// degrades to `DialogResult::Error` (still a deny, but the operator never
+    /// sees the question). Clamping keeps the dialog reachable; an hour is far
+    /// beyond any useful confirmation window anyway.
+    pub const MAX_TIMEOUT: u32 = 3600;
+
+    /// Clamps a caller-supplied timeout into `[1, MAX_TIMEOUT]`.
+    pub fn clamp_timeout(secs: u32) -> u32 {
+        secs.clamp(1, Self::MAX_TIMEOUT)
+    }
+
     /// Resolves the GUI countdown timeout in seconds (default: 60).
     pub fn resolve_timeout(cli_timeout: Option<u32>) -> u32 {
         if let Some(to) = cli_timeout
             && to > 0
         {
-            return to;
+            return Self::clamp_timeout(to);
         }
         if let Ok(val) = std::env::var("AI_HOOK_GUI_TIMEOUT")
             && let Ok(parsed) = val.trim().parse::<u32>()
             && parsed > 0
         {
-            return parsed;
+            return Self::clamp_timeout(parsed);
         }
         if let Ok(val) = std::env::var("HOOK_GUI_TIMEOUT")
             && let Ok(parsed) = val.trim().parse::<u32>()
             && parsed > 0
         {
-            return parsed;
+            return Self::clamp_timeout(parsed);
         }
         60
     }

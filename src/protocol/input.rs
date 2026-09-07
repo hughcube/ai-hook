@@ -183,6 +183,15 @@ pub struct HookContext {
     pub permission_mode: Option<String>,
     /// True when the host will not ask for confirmation
     /// (permission_mode bypassPermissions/dontAsk, or AGY skip flag).
+    ///
+    /// Antigravity has no documented way to learn this: its official common
+    /// input fields (`conversationId` / `workspacePaths` / `transcriptPath` /
+    /// `artifactDirectoryPath` / `modelName`) carry no permission mode, and the
+    /// only official toggle is the CLI flag `--dangerously-skip-permissions`
+    /// (antigravity.google/docs/cli/using). The two AGY probes below are
+    /// best-effort and will normally read false, which makes `can_ask()` report
+    /// "can ask" — the fail-safe direction (a confirm becomes a prompt, never
+    /// a silent allow).
     pub is_yolo: bool,
     pub conversation: Option<ConversationInfo>,
     /// Working directory of the command / session.
@@ -326,8 +335,10 @@ const GEMINI_EVENTS: &[&str] = &[
 /// content (e.g. a Bash command containing the word "codebuddy") flip the
 /// detected platform, so it is not done.
 fn detect_cc_family(val: &serde_json::Value, _raw_json: &str) -> Platform {
-    // `turn_id` is a documented Codex-only extension.
-    if val.get("turn_id").is_some() {
+    // `turn_id` is a documented Codex-only extension. `turnId` is accepted too
+    // so the platform verdict and the `is_codex` yolo check in `parse` below
+    // can never disagree about the same payload.
+    if val.get("turn_id").is_some() || val.get("turnId").is_some() {
         return Platform::Codex;
     }
     if let Some(name) = val.get("hook_event_name").and_then(|v| v.as_str())
@@ -523,10 +534,15 @@ fn normalize_semantics(
     // "run_shell_command" is Gemini CLI's registered shell tool name
     // (official Tools reference, geminicli.com/docs/reference/tools); without
     // it every command rule and the fast path are dead on Gemini.
+    // "exec_command" is Codex's unified exec tool: the official Tool coverage
+    // table lists it as firing PreToolUse/PostToolUse ("Match as Bash"), so it
+    // must be recognized or `ctx.cmd` stays null and every command rule on that
+    // path silently degrades to "no opinion" (= allow).
     let command_tools = [
         "bash",
         "run_command",
         "run_shell_command",
+        "exec_command",
         "shell",
         "powershell",
         "command",
@@ -786,6 +802,10 @@ impl HookContext {
             return Self {
                 platform: Platform::Antigravity,
                 permission_mode: None,
+                // Best-effort only: neither probe is documented by Antigravity
+                // (see the `is_yolo` field doc). Keeping them costs nothing and
+                // lets an operator force yolo semantics through the environment
+                // if AGY ever gains a documented signal.
                 is_yolo: if let Some(flag) = val.get("is_yolo").and_then(|v| v.as_bool()) {
                     flag
                 } else {
@@ -1032,9 +1052,8 @@ impl HookContext {
     ///   confirm`;免确认(bypass)模式下 ask 仍弹出亦有官网原文支撑 ——
     ///   同段紧随其后:"A hook's `\"ask\"` also forces a permission prompt in
     ///   auto mode: the classifier can still deny the tool call, but it can't
-    ///   approve the call silently."(2026-09-07 第四轮 curl 全文复核确认该句
-    ///   仍在现行页;此前一度误记为其已消失,见
-    ///   docs/REVIEW_CROSSCHECK_2026-09-06.md §1.9.2)。
+    ///   approve the call silently."(2026-09-07 curl 全文复核确认两句均在
+    ///   现行页;此前一度误记为其已消失。)
     /// - Codex `https://learn.chatgpt.com/docs/hooks`
     ///   原文:"`permissionDecision: "ask"` … are parsed but not supported yet.
     ///   Codex marks the hook run as failed, reports the error, and continues

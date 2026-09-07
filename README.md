@@ -241,14 +241,14 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 
 #### 1.1 Host event names at a glance: canonical (`ctx.event`) ↔ every agent
 
-`ctx.event` is the **Claude Code spelling**, used identically on every host. The table maps each canonical name to the event each agent fires for the same lifecycle point (`—` = the host has no such event; the full 43-event matrix with per-event capabilities lives in [`docs/HOOK_EVENT_MATRIX.md`](docs/HOOK_EVENT_MATRIX.md)):
+`ctx.event` is the **Claude Code spelling**, used identically on every host. The table maps each canonical name to the event each agent fires for the same lifecycle point (`—` = the host has no such event):
 
 | `ctx.event` (canonical) | Claude Code | OpenAI Codex | CodeBuddy / WorkBuddy | Google Antigravity | Gemini CLI | OpenCode (bridge) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `PreToolUse` | PreToolUse | PreToolUse | PreToolUse | PreToolUse (shape-inferred) | `BeforeTool` | PreToolUse |
 | `PostToolUse` | PostToolUse | PostToolUse | PostToolUse | (official event; deliberately *not* distinguished — payloads land under `PreToolUse`, see note) | `AfterTool` | PostToolUse |
-| `PostToolUseFailure` | PostToolUseFailure | — | PostToolUseFailure | — | — | — |
-| `PermissionRequest` | PermissionRequest | PermissionRequest | PermissionRequest | — | — | — |
+| `PostToolUseFailure` | PostToolUseFailure | — | — | — | — | — |
+| `PermissionRequest` | PermissionRequest | PermissionRequest | — | — | — | — |
 | `UserPromptSubmit` | UserPromptSubmit | UserPromptSubmit | UserPromptSubmit | — | `BeforeAgent` | — |
 | `Stop` | Stop | Stop | Stop | Stop (shape-inferred) | `AfterAgent` | — |
 | `SubagentStart` | SubagentStart | SubagentStart | SubagentStart | — | — | — |
@@ -257,7 +257,7 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 | `PostCompact` | PostCompact | PostCompact | PostCompact | — | — | — |
 | `SessionStart` | SessionStart | SessionStart | SessionStart | — | SessionStart | — |
 | `SessionEnd` | SessionEnd | SessionEnd | SessionEnd | — | SessionEnd | — |
-| `Setup` | Setup (observe only\*) | — | Setup (observe only\*) | — | — | — |
+| `Setup` | Setup (observe only\*) | — | — | — | — | — |
 | `PreInvocation` | — | — | — | PreInvocation (shape-inferred) | — | — |
 
 Notes that keep the table honest:
@@ -265,7 +265,7 @@ Notes that keep the table honest:
 - **Gemini CLI** spells events in its own vocabulary (`BeforeTool`/`AfterTool`/`BeforeAgent`/`AfterAgent`/`PreCompress`). They fold into the canonical names above — that is the whole point of `ctx.event` — while the original spelling stays readable as `ctx.eventRaw` (e.g. `"AfterTool"`) and named exports can still be written per canonical name.
 - **Antigravity sends no event name on stdin at all** (its official input fields are `conversationId`/`workspacePaths`/`transcriptPath`/… plus `toolCall`); ai-hook infers the event from the envelope shape. `PreInvocation` and `PostInvocation` have byte-identical input shapes, so both are classified as `PreInvocation` (`ctx.eventRaw` stays `null` for AGY — it genuinely has no spelling to report). AGY's `PostToolUse` is deliberately **not** inferred from the `error` key either (its presence is undocumented for `PreToolUse`, and a misclassification would silently drop the gate), so a post-tool payload is reported as `PreToolUse` — rules on it can still read the tool/cwd, but any decision they emit is ignored by the host, whose `PostToolUse` output schema is the empty object `{}`.
 - **OpenCode** has no out-of-process hook protocol; through the `opencode-claude-hooks` bridge it forwards Claude-Code-shaped envelopes (`OPENCODE_COMPAT=1`), so the canonical column equals the Claude Code column.
-- **`Setup` (\*)** is observable but has no decision/inject channel: Claude Code's official Setup decision control discards a Setup hook's JSON output fields (including `hookSpecificOutput.additionalContext`), and CodeBuddy documents no Setup output channel either.
+- **`Setup` (\*)** is observable but has no decision/inject channel: Claude Code's official Setup decision control discards a Setup hook's JSON output fields (including `hookSpecificOutput.additionalContext`). Setup is absent from the CodeBuddy / WorkBuddy official event list and from Codex's, so only Claude Code ever fires it.
 - Events ai-hook does not model (e.g. Claude Code `TaskCompleted`, `Notification`, `ConfigChange`, `WorktreeCreate`… ) are never lost: they surface as `ctx.event` with the **host's own spelling** and can be observed (logged / branched on), they just cannot drive a decision.
 - **CodeBuddy and WorkBuddy share one engine**: WorkBuddy runs the CodeBuddy Code CLI with its own config directory, and its hooks documentation is the same CodeBuddy document.
 

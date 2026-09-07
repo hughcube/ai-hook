@@ -240,14 +240,14 @@ export default function(ctx, sys) {
 
 #### 1.1 宿主事件名速查:规范名(`ctx.event`)× 各家 Agent 事件对照
 
-`ctx.event` 一律采用 **Claude Code 拼写**,在所有宿主上含义一致。下表把每个规范名映射到各家 Agent 在同一生命周期节点实际触发的事件名(`—` = 该宿主无此事件;含每事件能力的完整 43 事件矩阵见 [`docs/HOOK_EVENT_MATRIX.md`](docs/HOOK_EVENT_MATRIX.md)):
+`ctx.event` 一律采用 **Claude Code 拼写**,在所有宿主上含义一致。下表把每个规范名映射到各家 Agent 在同一生命周期节点实际触发的事件名(`—` = 该宿主无此事件):
 
 | `ctx.event`(规范名) | Claude Code | OpenAI Codex | CodeBuddy / WorkBuddy | Google Antigravity | Gemini CLI | OpenCode(经桥) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `PreToolUse` | PreToolUse | PreToolUse | PreToolUse | PreToolUse(按载荷形状推断) | `BeforeTool` | PreToolUse |
 | `PostToolUse` | PostToolUse | PostToolUse | PostToolUse | (官方有该事件;引擎**刻意不区分**——载荷归入 `PreToolUse` 分支,见注) | `AfterTool` | PostToolUse |
-| `PostToolUseFailure` | PostToolUseFailure | — | PostToolUseFailure | — | — | — |
-| `PermissionRequest` | PermissionRequest | PermissionRequest | PermissionRequest | — | — | — |
+| `PostToolUseFailure` | PostToolUseFailure | — | — | — | — | — |
+| `PermissionRequest` | PermissionRequest | PermissionRequest | — | — | — | — |
 | `UserPromptSubmit` | UserPromptSubmit | UserPromptSubmit | UserPromptSubmit | — | `BeforeAgent` | — |
 | `Stop` | Stop | Stop | Stop | Stop(按载荷形状推断) | `AfterAgent` | — |
 | `SubagentStart` | SubagentStart | SubagentStart | SubagentStart | — | — | — |
@@ -256,7 +256,7 @@ export default function(ctx, sys) {
 | `PostCompact` | PostCompact | PostCompact | PostCompact | — | — | — |
 | `SessionStart` | SessionStart | SessionStart | SessionStart | — | SessionStart | — |
 | `SessionEnd` | SessionEnd | SessionEnd | SessionEnd | — | SessionEnd | — |
-| `Setup` | Setup(仅可观测\*) | — | Setup(仅可观测\*) | — | — | — |
+| `Setup` | Setup(仅可观测\*) | — | — | — | — | — |
 | `PreInvocation` | — | — | — | PreInvocation(按载荷形状推断) | — | — |
 
 让表格保持诚实的注记:
@@ -264,7 +264,7 @@ export default function(ctx, sys) {
 - **Gemini CLI** 使用自己的事件词汇(`BeforeTool`/`AfterTool`/`BeforeAgent`/`AfterAgent`/`PreCompress`),它们折叠进上表规范名——这正是 `ctx.event` 的意义;原始拼写仍可经 `ctx.eventRaw`(如 `"AfterTool"`)读取,具名导出也按规范名书写即可命中。
 - **Antigravity 的 stdin 根本不携带事件名**(官方输入字段只有 `conversationId`/`workspacePaths`/`transcriptPath`…加 `toolCall`),ai-hook 按载荷形状推断事件;`PreInvocation` 与 `PostInvocation` 输入形状逐字节相同,故统一归类为 `PreInvocation`(AGY 的 `ctx.eventRaw` 保持 `null`——它确实没有宿主拼写可报告)。AGY 的 `PostToolUse` 也被**刻意不**用 `error` 键推断(`error` 在 PreToolUse 上是否出现无官方记载,误判会静默丢失 gate 能力),因此 post-tool 载荷会显示为 `PreToolUse`——规则仍可读取 tool/cwd,但其输出的任何决策都会被宿主忽略(AGY 的 PostToolUse 输出 schema 就是空对象 `{}`)。
 - **OpenCode** 没有进程外 hook 协议;经 `opencode-claude-hooks` 桥转发 Claude Code 形态信封(`OPENCODE_COMPAT=1`),规范名列与 Claude Code 列一致。
-- **`Setup`(\*)** 可观测但无决策/注入通道:Claude Code 官方 Setup decision control 丢弃 Setup hook 的全部 JSON 输出(含 `hookSpecificOutput.additionalContext`),CodeBuddy 亦未记载 Setup 输出通道。
+- **`Setup`(\*)** 可观测但无决策/注入通道:Claude Code 官方 Setup decision control 丢弃 Setup hook 的全部 JSON 输出(含 `hookSpecificOutput.additionalContext`)。CodeBuddy / WorkBuddy 的官方事件表里根本没有 Setup,Codex 也没有,所以只有 Claude Code 会触发它。
 - ai-hook 未建模的事件(如 Claude Code 的 `TaskCompleted`/`Notification`/`ConfigChange`/`WorktreeCreate`…)不会丢失:它们以**宿主原名**出现在 `ctx.event` 中可观测(记日志/分支判断),只是不能驱动决策。
 - **CodeBuddy 与 WorkBuddy 共用同一内核**:WorkBuddy 以 CodeBuddy Code CLI 内核 + 独立配置目录运行,其 hooks 文档即 CodeBuddy 同一份文档。
 

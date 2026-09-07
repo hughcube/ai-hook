@@ -336,6 +336,12 @@ fn render_cc_family(platform: Platform, event: HookEvent, op: Op, event_name: &s
                 })
                 .to_string()
             } else if matches!(event, HookEvent::PreToolUse | HookEvent::Other) {
+                // `Other` = 宿主事件名 ai-hook 未建模(如 Claude Code 的
+                // TaskCompleted / ConfigChange)。它们的官方决策形态各不相同
+                // (TaskCompleted 用 `continue:false` 或退出码 2),没有通用解;
+                // 这里沿用 `permissionDecision` 形态属于**尽力而为**:能力矩阵
+                // 已把它们标成 NONE(调用方会打 stderr 告警),而 Deny 从不降级,
+                // 最坏结果是宿主忽略这条输出 —— 不会变成相反的语义。
                 json!({
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
@@ -344,9 +350,28 @@ fn render_cc_family(platform: Platform, event: HookEvent, op: Op, event_name: &s
                     }
                 })
                 .to_string()
-            } else if matches!(event, HookEvent::UserPromptSubmit)
-                && matches!(platform, Platform::CodeBuddy | Platform::WorkBuddy)
+            } else if matches!(platform, Platform::CodeBuddy | Platform::WorkBuddy)
+                && matches!(
+                    event,
+                    HookEvent::UserPromptSubmit
+                        | HookEvent::Stop
+                        | HookEvent::SubagentStop
+                        | HookEvent::PreCompact
+                )
             {
+                // CodeBuddy / WorkBuddy 官方(`@tencent-ai/codebuddy-code` 随包
+                // hooks.md)在三处明确标注:
+                //   "**注意**：`decision: "block"` 字段已废弃,请使用 `continue: false`。"
+                // (PostToolUse / UserPromptSubmit / Stop·SubagentStop)
+                // PreCompact 官方只记载「退出码 2 阻止压缩」,JSON 决策控制节缺失,
+                // 而 `continue: false` 是这两个宿主通用的阻断形态,故一并使用。
+                json!({ "continue": false, "reason": reason }).to_string()
+            } else if platform == Platform::Codex && event == HookEvent::PreCompact {
+                // Codex 官方 PreCompact 节原文:"If a matching PreCompact hook
+                // returns `continue: false`, Codex stops before compacting."
+                // 官方没有给该事件 `decision: "block"` 形态(那是 PreToolUse 的
+                // legacy 形状 + UserPromptSubmit / Stop / SubagentStop 三处),
+                // 输出它可能被忽略 → 压缩照常进行(即门禁失效)。
                 json!({ "continue": false, "reason": reason }).to_string()
             } else {
                 json!({ "decision": "block", "reason": reason }).to_string()
@@ -428,14 +453,18 @@ fn render_antigravity(event: HookEvent, op: Op) -> String {
             json!({ "decision": "continue", "reason": reason }).to_string()
         }
         Op::Modify(m) => {
-            // Antigravity PreToolUse: official schema explicitly supports `overwrite`
-            // (key-value pairs shallow-merged into the tool call's arguments).
-            if let Some(args) = m.mutate_input {
-                let mut map = serde_json::Map::new();
-                map.insert("decision".into(), json!("allow"));
-                map.insert("overwrite".into(), args);
-                return serde_json::Value::Object(map).to_string();
-            }
+            // No `mutate_input` branch on purpose: Antigravity's official
+            // PreToolUse output fields are `decision` / `reason` /
+            // `permissionOverrides` only, so the capability matrix keeps
+            // mutate_input closed and `to_op` drops the modifier before it
+            // ever reaches here. Emitting an undocumented key (e.g.
+            // `overwrite`) would make AGY honour the `decision:"allow"` and run
+            // the **original** arguments while the rule believes it rewrote
+            // them — strictly worse than dropping it.
+            debug_assert!(
+                m.mutate_input.is_none(),
+                "AGY has no input-rewrite channel; the modifier must be dropped upstream"
+            );
             let injectable = matches!(event, HookEvent::PreInvocation | HookEvent::PostInvocation);
             if let Some(text) = m.inject
                 && injectable

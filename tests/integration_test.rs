@@ -1832,8 +1832,16 @@ fn gemini_after_tool_inject_targets_the_model() {
     );
 }
 
+/// Gemini 官方 BeforeTool 的 Output Fields 只列了 `decision` / `reason` /
+/// `hookSpecificOutput.tool_input` / `continue`,**没有 additionalContext**。
+/// 官方 `systemMessage` 的定义是 "Displayed immediately to the user in the
+/// terminal" —— 是给用户的,不是模型上下文,不能拿它顶替 inject,否则规则
+/// 作者会以为"注入给模型"生效了而实际模型什么都没收到。
+/// 所以该事件没有 inject 通道,Modify 应降级为空输出(= allow)。
+/// (SessionEnd / PreCompress 走 systemMessage 是另一回事:那两个事件的官方
+///  Output Fields 本来就写的是 systemMessage。)
 #[test]
-fn gemini_before_tool_inject_falls_back_to_system_message() {
+fn gemini_before_tool_has_no_inject_channel() {
     let ctx = ctx_with_event(
         "BeforeTool",
         serde_json::json!({"tool_name":"run_shell_command","tool_input":{"command":"ls"}}),
@@ -1843,10 +1851,10 @@ fn gemini_before_tool_inject_falls_back_to_system_message() {
         ..Mutation::default()
     })
     .to_json_output(&ctx, None);
-    assert!(
-        out.contains("\"systemMessage\""),
-        "BeforeTool 未文档化 additionalContext，退化为 systemMessage: {out}"
-    );
+    // Gemini 工具事件上降级后是显式 allow(不是空串);关键是既不能塞
+    // additionalContext(该事件未文档化),也不能拿 systemMessage 顶替
+    // (它是给用户看的终端消息,规则作者会误以为模型收到了)。
+    assert_eq!(out, r#"{"decision":"allow"}"#, "got: {out}");
 }
 
 #[test]
@@ -2612,36 +2620,223 @@ fn codebuddy_stop_and_prompt_block_use_continue_false() {
         out.contains(r#""decision":"block""#),
         "CC UPS 阻断仍是顶层 decision:block: {out}"
     );
+
+    // 此前漏测的一条:CB/WB 的 **Stop + Deny** 也曾落到通用分支输出
+    // `decision:"block"`,而该字段在 CodeBuddy 官方已标注废弃
+    // ("请使用 `continue: false`")。补上断言防止回归。
+    unsafe {
+        std::env::set_var("CODEBUDDY_HOST", "cli");
+    }
+    let cb_stop_deny = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name":"Stop",
+            "session_id":"s1",
+            "transcript_path":"/home/u/.codebuddy/projects/t/abc.jsonl",
+            "cwd":"/tmp"
+        })
+        .to_string(),
+    );
+    let out = HookDecision::Deny {
+        reason: "do not stop yet".into(),
+    }
+    .to_json_output(&cb_stop_deny, None);
+    assert!(
+        out.contains(r#""continue":false"#),
+        "CB/WB Stop 上的阻断必须是 continue:false(decision:block 已废弃): {out}"
+    );
+
+    // PreCompact 同理:官方只记载退出码 2 阻止压缩,JSON 侧用通用的
+    // `continue: false`,而不是废弃的 decision:block。
+    let cb_precompact = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name":"PreCompact",
+            "trigger":"manual",
+            "session_id":"s1",
+            "transcript_path":"/home/u/.codebuddy/projects/t/abc.jsonl",
+            "cwd":"/tmp"
+        })
+        .to_string(),
+    );
+    let out = HookDecision::Deny {
+        reason: "keep the context".into(),
+    }
+    .to_json_output(&cb_precompact, None);
+    assert!(
+        out.contains(r#""continue":false"#),
+        "CB/WB PreCompact 阻断必须是 continue:false: {out}"
+    );
+    unsafe {
+        std::env::remove_var("CODEBUDDY_HOST");
+    }
 }
 
-/// 事件矩阵标注为 D(inject) 的 SubagentStart / PostCompact 必须真的可注入
-/// (此前枚举缺失,永远落 Other → 能力静默归零)。
+/// Codex 官方 PreCompact 节原文:
+/// "If a matching PreCompact hook returns `continue: false`, Codex stops before
+/// compacting."
+/// 官方没有给该事件 `decision: "block"` 形态(那是 PreToolUse 的 legacy 形状
+/// 加 UserPromptSubmit / Stop / SubagentStop 三处),输出它可能被忽略 → 压缩
+/// 照常进行(门禁失效)。
 #[test]
-fn subagent_start_postcompact_inject_context() {
-    for event in ["SubagentStart", "PostCompact"] {
+fn codex_precompact_deny_uses_continue_false() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "turn_id":"t1",
+            "hook_event_name":"PreCompact",
+            "trigger":"auto",
+            "session_id":"s1",
+            "transcript_path":"/home/u/.codex/sessions/t/abc.jsonl",
+            "cwd":"/tmp"
+        })
+        .to_string(),
+    );
+    assert_eq!(ctx.platform, Platform::Codex);
+    let out = HookDecision::Deny {
+        reason: "do not compact".into(),
+    }
+    .to_json_output(&ctx, None);
+    assert!(
+        out.contains(r#""continue":false"#),
+        "Codex PreCompact 阻断必须是 continue:false: {out}"
+    );
+    assert!(
+        !out.contains(r#""decision":"block""#),
+        "Codex PreCompact 未记载 decision:block,不该输出它: {out}"
+    );
+}
+
+/// Claude Code 官方决策控制表原文:Stop / SubagentStop 走顶层
+/// `decision:"block"`,且 "**also accept** hookSpecificOutput.additionalContext
+/// for non-error feedback that continues the conversation"。
+/// 也就是说这两个事件是有 inject 通道的 —— 不能把 inject 一律关掉。
+#[test]
+fn claude_code_stop_accepts_additional_context() {
+    clear_codebuddy_env();
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name":"Stop",
+            "session_id":"s1",
+            "transcript_path":"/home/u/.claude/projects/t/abc.jsonl",
+            "cwd":"/tmp"
+        })
+        .to_string(),
+    );
+    assert_eq!(ctx.platform, Platform::ClaudeCode);
+    let out = HookDecision::Modify(Mutation {
+        inject: Some("run the test suite before finishing".into()),
+        ..Mutation::default()
+    })
+    .to_json_output(&ctx, None);
+    assert!(
+        out.contains("additionalContext"),
+        "CC Stop 支持 additionalContext 非错误反馈: {out}"
+    );
+    assert!(
+        out.contains(r#""hookEventName":"Stop""#),
+        "渲染必须回填真实事件名: {out}"
+    );
+}
+
+/// `export  default`(export 与 default 之间多于一个空格)仍是合法的默认导出。
+/// 早前实现按固定 14 字节窗口替换,多出的空白会把窗口错切进表达式,
+/// 规则直接变成 SyntaxError。
+#[test]
+fn export_default_tolerates_extra_whitespace() {
+    let runner = RuleRunner::new().expect("engine");
+    let rule = rule(
+        "ws",
+        "export  default function(ctx) { return { deny: 'WS_OK ' + ctx.cmd }; }",
+    );
+    let ctx = ctx_for("echo hi");
+    let (decision, results) = runner.evaluate_all(&[rule], &ctx, ErrorPolicy::FailClosed);
+    assert!(results[0].error.is_none(), "err: {:?}", results[0].error);
+    match decision {
+        HookDecision::Deny { reason } => assert!(
+            reason.contains("WS_OK echo hi"),
+            "多空格 export default 应正常执行: {reason}"
+        ),
+        other => panic!("expected deny, got {other:?}"),
+    }
+}
+
+/// Codex 的 unified exec 工具。官方 Tool coverage 表:
+/// "Unified exec (`exec_command`) Yes Yes Match as Bash."
+/// 不识别它的话 `ctx.cmd` 恒为 null,所有命令规则静默跳过 = 放行。
+#[test]
+fn codex_exec_command_is_a_command_tool() {
+    for tool in ["exec_command", "Bash", "bash"] {
         let ctx = HookContext::parse(
             &serde_json::json!({
-                "hook_event_name": event,
-                "session_id":"s1",
-                "transcript_path":"/home/u/.claude/projects/t/abc.jsonl",
+                "turn_id":"t1",
+                "hook_event_name":"PreToolUse",
+                "tool_name": tool,
+                "tool_input":{"command":"rm -rf /tmp/x"},
                 "cwd":"/tmp"
             })
             .to_string(),
         );
-        let out = HookDecision::Modify(Mutation {
-            inject: Some("ctx-note".into()),
-            ..Mutation::default()
-        })
-        .to_json_output(&ctx, None);
-        assert!(
-            out.contains("additionalContext"),
-            "{event} 必须支持 additionalContext 注入, got: {out}"
-        );
-        assert!(
-            out.contains(&format!(r#""hookEventName":"{event}""#)),
-            "{event} 渲染必须回填真实事件名: {out}"
+        assert_eq!(
+            ctx.cmd.as_deref(),
+            Some("rm -rf /tmp/x"),
+            "{tool} 必须被识别为命令工具,否则命令规则全部失效: {:?}",
+            ctx.cmd
         );
     }
+}
+
+/// SubagentStart 标注为 inject,必须真的可注入(此前枚举缺失,永远落 Other →
+/// 能力静默归零)。
+#[test]
+fn subagent_start_inject_context() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "session_id":"s1",
+            "transcript_path":"/home/u/.claude/projects/t/abc.jsonl",
+            "cwd":"/tmp"
+        })
+        .to_string(),
+    );
+    let out = HookDecision::Modify(Mutation {
+        inject: Some("ctx-note".into()),
+        ..Mutation::default()
+    })
+    .to_json_output(&ctx, None);
+    assert!(
+        out.contains("additionalContext"),
+        "SubagentStart 必须支持 additionalContext 注入, got: {out}"
+    );
+    assert!(
+        out.contains(r#""hookEventName":"SubagentStart""#),
+        "渲染必须回填真实事件名: {out}"
+    );
+}
+
+/// PostCompact **没有** inject 通道,三个宿主都不给:Claude Code 官方决策控制表把
+/// PostCompact 与 Setup / Notification / SessionEnd 并列为
+/// "None. No decision control.";Codex 官方只记载 `continue: false`;
+/// CodeBuddy / WorkBuddy 官方没有 PostCompact 的决策控制节。
+/// 因此它必须和"被过滤光的 Modify"一样降级为 Allow(空输出),
+/// 而不是输出一个宿主会丢弃的空壳 JSON。
+#[test]
+fn postcompact_has_no_inject_channel_and_degrades_to_allow() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "PostCompact",
+            "session_id":"s1",
+            "transcript_path":"/home/u/.claude/projects/t/abc.jsonl",
+            "cwd":"/tmp"
+        })
+        .to_string(),
+    );
+    let out = HookDecision::Modify(Mutation {
+        inject: Some("ctx-note".into()),
+        ..Mutation::default()
+    })
+    .to_json_output(&ctx, None);
+    assert!(
+        out.is_empty(),
+        "PostCompact 没有 inject 通道,必须降级为空输出(空 = allow), got: {out}"
+    );
 }
 
 /// Setup 在能力矩阵中必须无任何通道:Claude Code 官方 Setup decision control
@@ -2911,15 +3106,22 @@ fn stop_keepgoing_never_emits_continue_false_for_claude_code() {
     }
 }
 
-/// Antigravity 官方 PreToolUse 输出 schema 明确支持 `overwrite` 字段用于改写工具入参
-/// (查阅官方 agy-customizations/docs/hooks.md 证实: PreToolUse output schema 明确定义
-/// `overwrite` 字典, 用于在执行前浅合并覆盖 toolCall.args)。
+/// Antigravity 的 PreToolUse **没有**改参通道。
+///
+/// 官方三处来源(https://antigravity.google/docs/hooks/、
+/// https://antigravity.google/docs/ide/hooks.md,SDK 版是 Python 装饰器与
+/// JSON hook 协议无关)的 PreToolUse Output Fields 表都只有
+/// `decision` / `reason` / `permissionOverrides` 三项。
+/// 早前这里断言的 `overwrite` 字段无从证实。发出
+/// `{"decision":"allow","overwrite":{…}}` 的后果是宿主按 allow 放行**原始**
+/// 参数,规则却以为改写成功了 —— 比丢弃并告警危险得多,因此能力矩阵关闭
+/// mutate_input,Modify 整体降级为 Allow(空输出)。
 #[test]
-fn antigravity_mutate_input_emits_overwrite_object() {
+fn antigravity_mutate_input_is_dropped() {
     let caps = ai_hook::protocol::capabilities(Platform::Antigravity, HookEvent::PreToolUse);
     assert!(
-        caps.mutate_input,
-        "AGY PreToolUse 原生支持 overwrite 改参，能力矩阵必须开放 mutate_input"
+        !caps.mutate_input,
+        "AGY 官方输出字段表没有改参通道,能力矩阵不得开放 mutate_input"
     );
 
     let ctx = HookContext::parse(
@@ -2941,12 +3143,11 @@ fn antigravity_mutate_input_emits_overwrite_object() {
         replace_output: None,
     });
     let out = decision.to_json_output(&ctx, None);
-    let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json output");
-    assert_eq!(parsed["decision"], "allow");
-    assert_eq!(
-        parsed["overwrite"]["CommandLine"], "echo safe",
-        "AGY 必须输出官方支持的 overwrite 字段: {out}"
-    );
+    // AGY 在 gating 事件上要求输出 `decision`,所以降级后是显式的 allow
+    // (不是空串) —— 关键是绝不能带 `overwrite`:那会让宿主按 allow 放行
+    // **原始**命令,而规则以为自己改写成功了。
+    assert_eq!(out, r#"{"decision":"allow"}"#, "got: {out}");
+    assert!(!out.contains("overwrite"), "got: {out}");
 }
 
 /// Claude Code 原生 View 工具名正确归一为 FileAction::Read

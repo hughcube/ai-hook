@@ -217,6 +217,15 @@ fn extraction_error(e: std::io::Error) -> String {
 /// self-check proves nothing (any payload can print "ai-hook"), so the
 /// published checksum is the only thing standing between a hijacked release and
 /// arbitrary code execution on the user's machine.
+///
+/// Scope of that guarantee, stated plainly: the digest comes from
+/// `SHA256SUMS.txt` published **in the same release as the binary**, over HTTPS.
+/// It therefore proves the download was not corrupted or tampered with in
+/// transit — it does not prove the release itself is authentic. Anyone able to
+/// replace the release assets could replace the checksum file too. Closing that
+/// gap needs a signature (e.g. GitHub artifact attestation / cosign), which is
+/// out of scope here; the check is a transport-integrity control, not a
+/// supply-chain authenticity control.
 fn fetch_expected_checksum(
     release: &serde_json::Value,
     asset_name: &str,

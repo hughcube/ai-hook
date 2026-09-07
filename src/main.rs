@@ -1227,6 +1227,7 @@ fn handle_dispatch(args: &Cli) {
             // Rule-provided timeout of 0 is treated as "use the default".
             let timeout = rule_timeout
                 .filter(|t| *t > 0)
+                .map(GuiDialog::clamp_timeout)
                 .unwrap_or_else(|| GuiDialog::resolve_timeout(args.timeout));
             let forced = args.force_gui
                 || env_flag_true("AI_HOOK_FORCE_GUI")
