@@ -1,3 +1,3 @@
 pub mod dialog;
 
-pub use dialog::GuiDialog;
+pub use dialog::{DialogResult, GuiDialog};

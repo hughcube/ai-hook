@@ -190,6 +190,14 @@ pub fn check_fast_path(ctx: &HookContext) -> Option<HookDecision> {
         "_key",
         ".kdbx",
         "hosts.yml",
+        ".npmrc",
+        ".dockercfg",
+        ".docker",
+        "auth_token",
+        "bearer",
+        "private_key",
+        "secret_key",
+        "access_token",
     ];
 
     // Zero-allocation case-insensitive ASCII substring search

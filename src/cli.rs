@@ -84,8 +84,18 @@ pub enum Commands {
         #[arg(short, long, default_value = "claude_code")]
         platform: String,
 
+        /// Simulated lifecycle event (default: PreToolUse)
+        #[arg(short = 'e', long, default_value = "PreToolUse")]
+        event: String,
+
+        /// User prompt text — only honored when event is UserPromptSubmit
+        /// (rules keyed on ctx.prompt need it; the command argument is
+        /// ignored for that event)
+        #[arg(long, default_value = "")]
+        prompt: String,
+
         /// Explicit rule scripts to test against
-        #[arg(trailing_var_arg = true)]
+        #[arg()]
         scripts: Vec<PathBuf>,
     },
 

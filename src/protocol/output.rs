@@ -4,6 +4,125 @@ use crate::errln;
 use crate::i18n::{Msg, t, tf};
 use serde_json::json;
 
+/// Derives a human-friendly action description from context.
+pub fn resolve_action_description(ctx: &HookContext) -> &'static str {
+    let l = crate::i18n::lang();
+    if ctx.cmd.is_some() {
+        return l.pick("执行命令", "Execute Command");
+    }
+    if let Some(ref f) = ctx.file {
+        return match f.action {
+            crate::protocol::input::FileAction::Read => l.pick("读取文件", "Read File"),
+            crate::protocol::input::FileAction::Write => l.pick("写入文件", "Write File"),
+            crate::protocol::input::FileAction::Edit => l.pick("修改文件", "Edit File"),
+            crate::protocol::input::FileAction::Delete => l.pick("删除文件", "Delete File"),
+            crate::protocol::input::FileAction::List => l.pick("查看目录", "List Directory"),
+            crate::protocol::input::FileAction::Other => l.pick("文件操作", "File Operation"),
+        };
+    }
+    if ctx.mcp.is_some() {
+        return l.pick("MCP工具调用", "MCP Tool Call");
+    }
+    if ctx.web.is_some() {
+        return l.pick("网络请求", "Web Request");
+    }
+    if ctx.search.is_some() {
+        return l.pick("代码搜索", "Code Search");
+    }
+    if ctx.agent.is_some() {
+        return l.pick("子Agent派发", "Subagent Delegation");
+    }
+    l.pick("工具调用", "Tool Invocation")
+}
+
+/// Resolves the primary target resource (command, file, URL, MCP) from context.
+pub fn resolve_context_target(ctx: &HookContext) -> String {
+    if let Some(cmd) = ctx.cmd.as_deref()
+        && !cmd.is_empty()
+    {
+        return cmd.to_string();
+    }
+    if let Some(path) = ctx.file.as_ref().and_then(|f| f.path.as_deref())
+        && !path.is_empty()
+    {
+        return path.to_string();
+    }
+    if let Some(mcp) = ctx.mcp.as_ref() {
+        let s = mcp.server.as_deref().unwrap_or("");
+        let t = mcp.tool.as_deref().unwrap_or("");
+        if !s.is_empty() && !t.is_empty() {
+            return format!("{}/{}", s, t);
+        } else if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Some(web) = ctx.web.as_ref() {
+        if let Some(url) = &web.url {
+            return url.clone();
+        }
+        if let Some(q) = &web.query {
+            return q.clone();
+        }
+    }
+    if let Some(search) = ctx.search.as_ref() {
+        if let Some(p) = &search.pattern {
+            return p.clone();
+        }
+        if let Some(p) = &search.path {
+            return p.clone();
+        }
+    }
+    String::new()
+}
+
+/// Formats a complete, structured prompt for interactive confirmation (terminal ask / host inline prompt).
+/// Aligns with the information displayed in the GUI security confirmation dialog.
+pub fn format_ask_prompt(title: Option<&str>, reason: &str, ctx: &HookContext) -> String {
+    let l = crate::i18n::lang();
+    let default_title = l.pick("操作安全授权确认", "Security Authorization Required");
+    let effective_title = title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(default_title);
+
+    let prefix = l.pick("【ai-hook 安全确认】", "[ai-hook Security Confirmation] ");
+    let mut lines = Vec::new();
+    lines.push(format!("{}{}", prefix, effective_title));
+
+    let trimmed_reason = reason.trim();
+    if !trimmed_reason.is_empty() {
+        lines.push(format!("{}: {}", l.pick("原因", "Reason"), trimmed_reason));
+    }
+
+    let action_desc = resolve_action_description(ctx);
+    if !ctx.tool_name.is_empty() {
+        lines.push(format!(
+            "{}: {} ({})",
+            l.pick("操作", "Operation"),
+            action_desc,
+            ctx.tool_name
+        ));
+    } else {
+        lines.push(format!("{}: {}", l.pick("操作", "Operation"), action_desc));
+    }
+
+    let target = resolve_context_target(ctx);
+    let target_display = if target.is_empty() {
+        ctx_target(ctx)
+    } else {
+        &target
+    };
+    if !target_display.is_empty() {
+        lines.push(format!("{}: {}", l.pick("目标", "Target"), target_display));
+    }
+
+    let cwd = ctx.cwd.trim();
+    if !cwd.is_empty() {
+        lines.push(format!("{}: {}", l.pick("目录", "Directory"), cwd));
+    }
+
+    lines.join("\n")
+}
+
 /// The offending command (or file when no command) of the current context.
 fn ctx_target(ctx: &HookContext) -> &str {
     if let Some(cmd) = ctx.cmd.as_deref()
@@ -58,10 +177,14 @@ fn non_empty_reason(msg: String) -> String {
 impl HookDecision {
     /// Downgrades the rule's intent against what the host can express.
     fn to_op(&self, ctx: &HookContext, caps: &Capabilities, gui_approved: Option<bool>) -> Op {
-        let target = ctx_target(ctx);
+        let target_str = resolve_context_target(ctx);
+        let target = if target_str.is_empty() {
+            ctx_target(ctx)
+        } else {
+            &target_str
+        };
         let denied_label = t(Msg::M005);
         let command_label = t(Msg::M006);
-        let about_to_run = t(Msg::M007);
 
         match self {
             Self::Allow => Op::Allow,
@@ -86,7 +209,7 @@ impl HookDecision {
                 Op::Deny { reason: msg }
             }
 
-            Self::Confirm { reason, .. } => match gui_approved {
+            Self::Confirm { reason, title, .. } => match gui_approved {
                 Some(true) => Op::Allow,
                 Some(false) => Op::Deny {
                     reason: non_empty_reason(format!(
@@ -100,7 +223,7 @@ impl HookDecision {
                     // and the host still prompts in this mode (can_ask).
                     if caps.ask && ctx.can_ask() {
                         Op::Ask {
-                            reason: format!("{}\n{}:\n{}", reason, about_to_run, target),
+                            reason: format_ask_prompt(title.as_deref(), reason, ctx),
                         }
                     } else {
                         // The host cannot ask and no dialog was shown: an
@@ -394,5 +517,64 @@ fn render_gemini(event: HookEvent, op: Op, event_name: &str) -> String {
                 out.to_string()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::input::FileAction;
+
+    #[test]
+    fn test_format_ask_prompt_command_tool() {
+        let mut ctx = HookContext::parse(
+            &serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": { "command": "DELETE FROM users WHERE 1=1" },
+                "cwd": "/var/www/project"
+            })
+            .to_string(),
+        );
+        ctx.cmd = Some("DELETE FROM users WHERE 1=1".to_string());
+        ctx.cwd = "/var/www/project".to_string();
+
+        let prompt = format_ask_prompt(
+            Some("SQL 破坏性操作确认"),
+            "SQL 破坏性操作可能批量删除/修改数据，请确认是否允许执行？",
+            &ctx,
+        );
+
+        assert!(prompt.contains("【ai-hook 安全确认】SQL 破坏性操作确认"));
+        assert!(prompt.contains("原因: SQL 破坏性操作可能批量删除/修改数据，请确认是否允许执行？"));
+        assert!(prompt.contains("操作: 执行命令 (Bash)"));
+        assert!(prompt.contains("目标: DELETE FROM users WHERE 1=1"));
+        assert!(prompt.contains("目录: /var/www/project"));
+    }
+
+    #[test]
+    fn test_format_ask_prompt_file_tool() {
+        let mut ctx = HookContext::parse(
+            &serde_json::json!({
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": { "TargetFile": "C:/app/config.php" }
+                }
+            })
+            .to_string(),
+        );
+        ctx.cwd = "C:/app".to_string();
+        if let Some(ref mut f) = ctx.file {
+            f.action = FileAction::Edit;
+            f.path = Some("C:/app/config.php".to_string());
+        }
+
+        let prompt = format_ask_prompt(Some("核心配置修改"), "禁止擅自覆写核心业务配置", &ctx);
+
+        assert!(prompt.contains("【ai-hook 安全确认】核心配置修改"));
+        assert!(prompt.contains("原因: 禁止擅自覆写核心业务配置"));
+        assert!(prompt.contains("操作: 修改文件 (replace_file_content)"));
+        assert!(prompt.contains("目标: C:/app/config.php"));
+        assert!(prompt.contains("目录: C:/app"));
     }
 }

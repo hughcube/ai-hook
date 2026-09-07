@@ -4,7 +4,7 @@ use crate::errln;
 use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision, Mutation};
 use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp, RegExpCompiler};
-use rquickjs::{Coerced, Context, Function, Object, Runtime, Value};
+use rquickjs::{Array, Coerced, Context, Function, Object, Runtime, Value};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -391,6 +391,11 @@ impl RuleRunner {
                 } else {
                     file_obj.set("path", Value::new_null(js_ctx.clone()))?;
                 }
+                let paths_arr = Array::new(js_ctx.clone())?;
+                for (i, p) in f.paths.iter().enumerate() {
+                    paths_arr.set(i, p.as_str())?;
+                }
+                file_obj.set("paths", paths_arr)?;
                 file_obj.set("action", f.action.as_str())?;
                 ctx_obj.set("file", file_obj)?;
             } else {
@@ -470,9 +475,96 @@ impl RuleRunner {
                 ctx_obj.set("agent", Value::new_null(js_ctx.clone()))?;
             }
             let args_val: Value = if !ctx.args.is_null() {
-                js_ctx
+                let parsed = js_ctx
                     .json_parse(ctx.args.to_string().as_bytes())
-                    .unwrap_or_else(|_| Value::new_null(js_ctx.clone()))
+                    .unwrap_or_else(|_| Value::new_null(js_ctx.clone()));
+                if let Some(obj) = parsed.as_object() {
+                    // Enrich with cross-platform canonical aliases without overriding explicit fields.
+                    // 1. command aliases: command <-> CommandLine <-> cmd
+                    let mut cmd_val: Option<Value> = None;
+                    for k in &["command", "CommandLine", "cmd"] {
+                        if let Ok(v) = obj.get::<_, Value>(*k)
+                            && !v.is_undefined()
+                            && !v.is_null()
+                        {
+                            cmd_val = Some(v);
+                            break;
+                        }
+                    }
+                    if let Some(cv) = cmd_val {
+                        if obj
+                            .get::<_, Value>("command")
+                            .map(|v| v.is_undefined() || v.is_null())
+                            .unwrap_or(true)
+                        {
+                            let _ = obj.set("command", cv.clone());
+                        }
+                        if obj
+                            .get::<_, Value>("CommandLine")
+                            .map(|v| v.is_undefined() || v.is_null())
+                            .unwrap_or(true)
+                        {
+                            let _ = obj.set("CommandLine", cv.clone());
+                        }
+                    }
+
+                    // 2. path aliases: file_path <-> TargetFile <-> AbsolutePath <-> path
+                    let mut path_val: Option<Value> = None;
+                    for k in &["file_path", "TargetFile", "AbsolutePath", "path"] {
+                        if let Ok(v) = obj.get::<_, Value>(*k)
+                            && !v.is_undefined()
+                            && !v.is_null()
+                        {
+                            path_val = Some(v);
+                            break;
+                        }
+                    }
+                    if let Some(pv) = path_val {
+                        if obj
+                            .get::<_, Value>("file_path")
+                            .map(|v| v.is_undefined() || v.is_null())
+                            .unwrap_or(true)
+                        {
+                            let _ = obj.set("file_path", pv.clone());
+                        }
+                        if obj
+                            .get::<_, Value>("TargetFile")
+                            .map(|v| v.is_undefined() || v.is_null())
+                            .unwrap_or(true)
+                        {
+                            let _ = obj.set("TargetFile", pv.clone());
+                        }
+                    }
+
+                    // 3. content aliases: content <-> CodeContent
+                    let mut content_val: Option<Value> = None;
+                    for k in &["content", "CodeContent"] {
+                        if let Ok(v) = obj.get::<_, Value>(*k)
+                            && !v.is_undefined()
+                            && !v.is_null()
+                        {
+                            content_val = Some(v);
+                            break;
+                        }
+                    }
+                    if let Some(cnt) = content_val {
+                        if obj
+                            .get::<_, Value>("content")
+                            .map(|v| v.is_undefined() || v.is_null())
+                            .unwrap_or(true)
+                        {
+                            let _ = obj.set("content", cnt.clone());
+                        }
+                        if obj
+                            .get::<_, Value>("CodeContent")
+                            .map(|v| v.is_undefined() || v.is_null())
+                            .unwrap_or(true)
+                        {
+                            let _ = obj.set("CodeContent", cnt.clone());
+                        }
+                    }
+                }
+                parsed
             } else {
                 Value::new_null(js_ctx.clone())
             };
@@ -731,7 +823,10 @@ impl RuleRunner {
                 // Modifiers (combinable): inject / mutateInput / replaceOutput.
                 // Stop events: keepGoing.
                 let deny = obj.get::<_, String>("deny").ok();
-                let ask = obj.get::<_, String>("ask").ok();
+                let ask = obj
+                    .get::<_, String>("ask")
+                    .ok()
+                    .or_else(|| obj.get::<_, String>("confirm").ok());
                 let allow = obj.get::<_, bool>("allow").ok();
                 let keep_going = obj.get::<_, String>("keepGoing").ok();
 

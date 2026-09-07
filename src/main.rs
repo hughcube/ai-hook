@@ -8,14 +8,18 @@
 
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::debug::{
-    DebugCollector, InteractionTrace, RuleTrace, decision_to_value, is_debug_enabled,
+    AskTrace, DebugCollector, DispositionTrace, InteractionTrace, RuleTrace, UserActionTrace,
+    decision_to_value, is_debug_enabled,
 };
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
-use ai_hook::i18n::{Msg, t};
+use ai_hook::i18n::{Msg, lang, t};
 use ai_hook::protocol::input::env_flag_true;
-use ai_hook::protocol::{ConfirmPath, HookContext, HookDecision, confirm_path};
-use ai_hook::ui::GuiDialog;
+use ai_hook::protocol::{
+    ConfirmPath, HookContext, HookDecision, confirm_path, format_ask_prompt,
+    resolve_action_description,
+};
+use ai_hook::ui::{DialogResult, GuiDialog};
 use ai_hook::{eprint_ts, errln, outln};
 use clap::FromArgMatches;
 use serde_json::json;
@@ -332,6 +336,7 @@ fn is_known_flag(flag_name: &str, subcmd: Option<&str>) -> (bool, bool) {
             },
             "test" => match flag_name {
                 "t" | "tool" | "f" | "file" | "p" | "platform" => return (true, true),
+                "e" | "event" | "prompt" => return (true, true),
                 _ => {}
             },
             "bench" => match flag_name {
@@ -606,8 +611,10 @@ fn main() {
             ref tool,
             ref file,
             ref platform,
+            ref event,
+            ref prompt,
             ref scripts,
-        }) => handle_test(&args, command, tool, file, platform, scripts),
+        }) => handle_test(&args, command, tool, file, platform, event, prompt, scripts),
         Some(Commands::Bench {
             iterations,
             ref command,
@@ -737,10 +744,36 @@ fn handle_dispatch(args: &Cli) {
         eprint_ts!("[ai-hook] {}: {}", t(Msg::M055), e);
         let ctx = HookContext::parse("");
         let reason = t(Msg::M135).to_string();
-        let dec = HookDecision::Deny { reason };
+        let dec = HookDecision::Deny {
+            reason: reason.clone(),
+        };
         let out = dec.to_json_output(&ctx, None);
         if let Some(mut col) = debug_collector {
+            let l = lang();
             col.parse_failed = true;
+            col.disposition = Some(DispositionTrace {
+                engine_action: "Deny".to_string(),
+                final_effect: "Blocked".to_string(),
+                ask: None,
+                user: UserActionTrace {
+                    action: "NotApplicable".to_string(),
+                    duration_ms: None,
+                    description: l
+                        .pick(
+                            "stdin 流读取失败，无需用户交互",
+                            "Failed to read stdin stream, no user interaction required",
+                        )
+                        .to_string(),
+                },
+                summary: if l.is_zh() {
+                    format!("stdin 流读取失败或编码异常: {}，已执行安全阻断", e)
+                } else {
+                    format!(
+                        "Failed to read stdin stream or encoding error: {}, safety blocked",
+                        e
+                    )
+                },
+            });
             col.record("generic", Some(&ctx), &dec, &out, 0);
         }
         print_output(&out);
@@ -765,9 +798,33 @@ fn handle_dispatch(args: &Cli) {
         // Same reasoning: an empty hook payload is not a verified allow.
         let ctx = HookContext::parse("");
         let reason = t(Msg::M136).to_string();
-        let dec = HookDecision::Deny { reason };
+        let dec = HookDecision::Deny {
+            reason: reason.clone(),
+        };
         let out = dec.to_json_output(&ctx, None);
-        if let Some(col) = debug_collector {
+        if let Some(mut col) = debug_collector {
+            let l = lang();
+            col.disposition = Some(DispositionTrace {
+                engine_action: "Deny".to_string(),
+                final_effect: "Blocked".to_string(),
+                ask: None,
+                user: UserActionTrace {
+                    action: "NotApplicable".to_string(),
+                    duration_ms: None,
+                    description: l
+                        .pick(
+                            "stdin 为空，无需用户交互",
+                            "Empty stdin payload, no user interaction required",
+                        )
+                        .to_string(),
+                },
+                summary: l
+                    .pick(
+                        "接收到空 payload，未通过安全校验，已执行安全阻断",
+                        "Received empty payload, security check failed, safety blocked",
+                    )
+                    .to_string(),
+            });
             col.record("generic", Some(&ctx), &dec, &out, 0);
         }
         print_output(&out);
@@ -798,21 +855,21 @@ fn handle_dispatch(args: &Cli) {
         let gui_enabled = GuiDialog::is_enabled(args.no_gui) && !args.dry_run;
         if gui_enabled {
             let prompt_agent = ctx.platform.to_string();
+            let prompt_title = t(Msg::M058);
+            let timeout = GuiDialog::resolve_timeout(args.timeout);
             let t_dlg = Instant::now();
-            let approved = GuiDialog::confirm(
-                t(Msg::M058),
-                &reason,
-                "",
-                &prompt_agent,
-                GuiDialog::resolve_timeout(args.timeout),
-            );
+            let dlg_res =
+                GuiDialog::confirm_detailed(prompt_title, &reason, "", &prompt_agent, timeout);
+            let approved = dlg_res.is_approved();
             let dlg_dur = t_dlg.elapsed().as_secs_f64() * 1000.0;
             let (dec, out) = if approved {
                 let d = HookDecision::Allow;
                 let o = d.to_json_output(&ctx, None);
                 (d, o)
             } else {
-                let d = HookDecision::Deny { reason };
+                let d = HookDecision::Deny {
+                    reason: reason.clone(),
+                };
                 let o = d.to_json_output(&ctx, None);
                 (d, o)
             };
@@ -821,6 +878,68 @@ fn handle_dispatch(args: &Cli) {
                     confirm_path: "Popup".to_string(),
                     gui_approved: Some(approved),
                     dialog_duration_ms: Some(dlg_dur),
+                    user_action: Some(dlg_res.as_str().to_string()),
+                });
+                col.disposition = Some(DispositionTrace {
+                    engine_action: if approved {
+                        "Allow".to_string()
+                    } else {
+                        "Deny".to_string()
+                    },
+                    final_effect: if approved {
+                        "Allowed".to_string()
+                    } else {
+                        "Blocked".to_string()
+                    },
+                    ask: Some(AskTrace {
+                        channel: "DesktopPopup".to_string(),
+                        trigger_reason: "UnparseablePayload".to_string(),
+                        protocol_op: Some(if approved {
+                            "allow".to_string()
+                        } else {
+                            "deny".to_string()
+                        }),
+                        title: Some(prompt_title.to_string()),
+                        reason: Some(reason.clone()),
+                        target: None,
+                        action: Some(lang().pick("未知载荷", "Unknown Payload").to_string()),
+                        tool: None,
+                        prompt: Some(reason.clone()),
+                        timeout_sec: Some(timeout),
+                    }),
+                    user: UserActionTrace {
+                        action: dlg_res.as_str().to_string(),
+                        duration_ms: Some(dlg_dur),
+                        description: dlg_res.description().to_string(),
+                    },
+                    summary: {
+                        let l = lang();
+                        if approved {
+                            if l.is_zh() {
+                                format!(
+                                    "非 JSON payload 触发桌面弹窗门禁: 用户在 {:.0}ms 内确认允许，已放行",
+                                    dlg_dur
+                                )
+                            } else {
+                                format!(
+                                    "Unparseable payload popup: user approved in {:.0}ms, allowed",
+                                    dlg_dur
+                                )
+                            }
+                        } else {
+                            if l.is_zh() {
+                                format!(
+                                    "非 JSON payload 触发桌面弹窗门禁: {}，已阻断",
+                                    dlg_res.description()
+                                )
+                            } else {
+                                format!(
+                                    "Unparseable payload popup: {}, blocked",
+                                    dlg_res.description()
+                                )
+                            }
+                        }
+                    },
                 });
                 col.record(&prompt_agent, Some(&ctx), &dec, &out, 0);
             }
@@ -835,7 +954,7 @@ fn handle_dispatch(args: &Cli) {
             // would only see an `ask` here if the payload named a platform the
             // matrix actually grants `ask` to — it cannot, by construction.
             let dec = HookDecision::Confirm {
-                reason,
+                reason: reason.clone(),
                 title: None,
                 gui: None,
                 timeout: None,
@@ -843,10 +962,44 @@ fn handle_dispatch(args: &Cli) {
             };
             let out = dec.to_json_output(&ctx, None);
             if let Some(mut col) = debug_collector {
+                let l = lang();
                 col.interaction = Some(InteractionTrace {
                     confirm_path: "Ask".to_string(),
                     gui_approved: None,
                     dialog_duration_ms: None,
+                    user_action: Some("NotApplicable".to_string()),
+                });
+                col.disposition = Some(DispositionTrace {
+                    engine_action: "Confirm".to_string(),
+                    final_effect: "Blocked".to_string(),
+                    ask: Some(AskTrace {
+                        channel: "HostTerminalInline".to_string(),
+                        trigger_reason: "UnparseablePayload".to_string(),
+                        protocol_op: Some("deny".to_string()),
+                        title: None,
+                        reason: Some(reason.clone()),
+                        target: None,
+                        action: Some(l.pick("未知载荷", "Unknown Payload").to_string()),
+                        tool: None,
+                        prompt: Some(reason.clone()),
+                        timeout_sec: None,
+                    }),
+                    user: UserActionTrace {
+                        action: "NotApplicable".to_string(),
+                        duration_ms: None,
+                        description: l
+                            .pick(
+                                "非 JSON payload 且无可用 GUI 弹窗，能力矩阵自动降级阻断",
+                                "Unparseable payload and no GUI dialog available, auto-denied",
+                            )
+                            .to_string(),
+                    },
+                    summary: l
+                        .pick(
+                            "非 JSON payload 且无可用 GUI 弹窗，系统自动降级阻断",
+                            "Unparseable payload without available GUI dialog, auto-denied",
+                        )
+                        .to_string(),
                 });
                 col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
             }
@@ -871,10 +1024,36 @@ fn handle_dispatch(args: &Cli) {
         let out = decision.to_json_output(&ctx, None);
         if let Some(mut col) = debug_collector {
             col.fast_path_hit = true;
-            col.fast_path_prefix = ctx
+            let matched = ctx
                 .cmd
                 .as_deref()
                 .and_then(|c| c.split_whitespace().next().map(str::to_string));
+            col.fast_path_prefix = matched.clone();
+            let prefix_desc = matched.unwrap_or_else(|| "whitelist".to_string());
+            let l = lang();
+            col.disposition = Some(DispositionTrace {
+                engine_action: "FastPath".to_string(),
+                final_effect: "Allowed".to_string(),
+                ask: None,
+                user: UserActionTrace {
+                    action: "NotApplicable".to_string(),
+                    duration_ms: None,
+                    description: l
+                        .pick(
+                            "命中白名单安全命令，跳过规则引擎与用户交互",
+                            "Hit safe command whitelist, skipped rule engine and user interaction",
+                        )
+                        .to_string(),
+                },
+                summary: if l.is_zh() {
+                    format!("命中白名单快速路径 [{}]，无耗时直接放行", prefix_desc)
+                } else {
+                    format!(
+                        "Fast-path hit [{}], zero latency allowed directly",
+                        prefix_desc
+                    )
+                },
+            });
             col.record(&ctx.platform.to_string(), Some(&ctx), &decision, &out, 0);
         }
         print_output(&out);
@@ -896,7 +1075,29 @@ fn handle_dispatch(args: &Cli) {
         }
         let dec = HookDecision::Allow;
         let out = dec.to_json_output(&ctx, None);
-        if let Some(col) = debug_collector {
+        if let Some(mut col) = debug_collector {
+            let l = lang();
+            col.disposition = Some(DispositionTrace {
+                engine_action: "Bypass".to_string(),
+                final_effect: "Allowed".to_string(),
+                ask: None,
+                user: UserActionTrace {
+                    action: "NotApplicable".to_string(),
+                    duration_ms: None,
+                    description: l
+                        .pick(
+                            "未加载到任何规则文件，无需用户交互",
+                            "No rules loaded, no user interaction required",
+                        )
+                        .to_string(),
+                },
+                summary: l
+                    .pick(
+                        "未配置或未加载到任何规则文件，默认放行",
+                        "No rules configured or loaded, default allowed",
+                    )
+                    .to_string(),
+            });
             col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
         }
         print_output(&out);
@@ -919,9 +1120,32 @@ fn handle_dispatch(args: &Cli) {
                 // Gate is broken: rules cannot run, so do NOT silently allow.
                 eprint_ts!("[ai-hook] {}: {}", t(Msg::M056), e);
                 let reason = t(Msg::M057).to_string();
-                let dec = HookDecision::Deny { reason };
+                let dec = HookDecision::Deny {
+                    reason: reason.clone(),
+                };
                 let out = dec.to_json_output(&ctx, None);
-                if let Some(col) = debug_col_cell.borrow_mut().take() {
+                if let Some(mut col) = debug_col_cell.borrow_mut().take() {
+                    let l = lang();
+                    col.disposition = Some(DispositionTrace {
+                        engine_action: "Deny".to_string(),
+                        final_effect: "Blocked".to_string(),
+                        ask: None,
+                        user: UserActionTrace {
+                            action: "NotApplicable".to_string(),
+                            duration_ms: None,
+                            description: l
+                                .pick(
+                                    "规则运行环境损坏，Fail-closed 拒绝",
+                                    "Rule runtime broken, fail-closed deny",
+                                )
+                                .to_string(),
+                        },
+                        summary: if l.is_zh() {
+                            format!("规则引擎初始化失败: {}，Fail-closed 强制阻断", e)
+                        } else {
+                            format!("Rule engine init failed: {}, fail-closed forced block", e)
+                        },
+                    });
                     col.record(&agent_str, Some(&ctx), &dec, &out, 0);
                 }
                 print_output(&out);
@@ -935,9 +1159,15 @@ fn handle_dispatch(args: &Cli) {
         if let Some(ref mut col) = *debug_col_cell.borrow_mut() {
             col.t_rules_done = Some(Instant::now());
             for r in &results {
+                let p_str = r.rule_path.to_string_lossy().replace('\\', "/");
+                let compact_path = if let Some(pos) = p_str.find("/.agents/") {
+                    format!("~{}", &p_str[pos..])
+                } else {
+                    p_str
+                };
                 col.rules_evaluated.push(RuleTrace {
                     id: r.rule_id.clone(),
-                    path: r.rule_path.to_string_lossy().to_string(),
+                    path: compact_path,
                     duration_ms: r.duration.as_secs_f64() * 1000.0,
                     decision: r.decision.as_ref().map(decision_to_value),
                     error: r.error.clone(),
@@ -955,6 +1185,14 @@ fn handle_dispatch(args: &Cli) {
         //    gui:false → 能 ask 走 ask;不能 ask 自动拒绝(规则禁弹窗 → fail-closed)。
         let mut gui_approved = None;
         let mut auto_deny = false;
+        let mut user_action_trace = UserActionTrace {
+            action: "NotApplicable".to_string(),
+            duration_ms: None,
+            description: "无需用户物理交互".to_string(),
+        };
+        let mut ask_trace: Option<AskTrace> = None;
+        let mut disposition_summary = String::new();
+
         if let HookDecision::Confirm {
             reason,
             title,
@@ -983,33 +1221,181 @@ fn handle_dispatch(args: &Cli) {
             let ask_ok = ctx.can_ask() && ctx.capabilities().ask;
             let c_path = confirm_path(*gui, forced, ask_ok, gui_enabled, args.dry_run);
 
+            let prompt_target = ctx
+                .cmd
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .or_else(|| ctx.file.as_ref().and_then(|f| f.path.as_deref()))
+                .unwrap_or("");
+            let prompt_title = title.as_deref().unwrap_or_else(|| t(Msg::M058));
+
+            let trigger_reason = if args.force_gui || env_flag_true("AI_HOOK_FORCE_GUI") {
+                "GuiForcedByCli"
+            } else if rule_force_gui.unwrap_or(false) || *gui == Some(true) {
+                "GuiForcedByRule"
+            } else if ctx.is_yolo {
+                "GuiFallbackYolo"
+            } else if !ask_ok {
+                "GuiFallbackNoHostAsk"
+            } else if c_path == ConfirmPath::Ask {
+                "HostNativeProtocol"
+            } else {
+                "AutoDenyNoGuiAvailable"
+            };
+
             let mut dialog_dur = None;
+            let mut dlg_res: Option<DialogResult> = None;
+            let prompt_action = resolve_action_description(&ctx).to_string();
+            let prompt_tool = if ctx.tool_name.is_empty() {
+                None
+            } else {
+                Some(ctx.tool_name.clone())
+            };
+            let prompt_formatted = format_ask_prompt(Some(prompt_title), reason, &ctx);
+
             match c_path {
                 ConfirmPath::Popup => {
-                    let prompt_target = ctx
-                        .cmd
-                        .as_deref()
-                        .filter(|c| !c.is_empty())
-                        .or_else(|| ctx.file.as_ref().and_then(|f| f.path.as_deref()))
-                        .unwrap_or("");
-                    let prompt_title = title.as_deref().unwrap_or_else(|| t(Msg::M058));
                     let prompt_agent = ctx.platform.to_string();
                     let t_gui = Instant::now();
-                    let approved = GuiDialog::confirm(
+                    let res = GuiDialog::confirm_detailed(
                         prompt_title,
                         reason,
                         prompt_target,
                         &prompt_agent,
                         timeout,
                     );
-                    dialog_dur = Some(t_gui.elapsed().as_secs_f64() * 1000.0);
-                    gui_approved = Some(approved);
+                    let dur = t_gui.elapsed().as_secs_f64() * 1000.0;
+                    dialog_dur = Some(dur);
+                    gui_approved = Some(res.is_approved());
+                    dlg_res = Some(res);
+
+                    user_action_trace = UserActionTrace {
+                        action: res.as_str().to_string(),
+                        duration_ms: Some(dur),
+                        description: res.description().to_string(),
+                    };
+
+                    ask_trace = Some(AskTrace {
+                        channel: "DesktopPopup".to_string(),
+                        trigger_reason: trigger_reason.to_string(),
+                        protocol_op: Some(if res.is_approved() {
+                            "allow".to_string()
+                        } else {
+                            "deny".to_string()
+                        }),
+                        title: Some(prompt_title.to_string()),
+                        reason: Some(reason.clone()),
+                        target: if prompt_target.is_empty() {
+                            None
+                        } else {
+                            Some(prompt_target.to_string())
+                        },
+                        action: Some(prompt_action.clone()),
+                        tool: prompt_tool.clone(),
+                        prompt: Some(prompt_formatted.clone()),
+                        timeout_sec: Some(timeout),
+                    });
+
+                    let l = lang();
+                    disposition_summary = if res.is_approved() {
+                        if l.is_zh() {
+                            format!(
+                                "桌面置顶弹窗确认: 用户在 {:.0}ms 内确认允许执行，操作已放行",
+                                dur
+                            )
+                        } else {
+                            format!(
+                                "Desktop popup confirmation: user approved in {:.0}ms, allowed",
+                                dur
+                            )
+                        }
+                    } else {
+                        if l.is_zh() {
+                            format!("桌面置顶弹窗确认: {}，操作已阻断", res.description())
+                        } else {
+                            format!("Desktop popup confirmation: {}, blocked", res.description())
+                        }
+                    };
                 }
                 ConfirmPath::Ask => {
-                    // 不弹窗:gui_approved 保持 None → 输出层按宿主协议输出
-                    // ask(CC/CB)、force_ask(AGY 交互)。Codex 不支持 ask（由能力矩阵和 auto_deny 兜底）
+                    let l = lang();
+                    user_action_trace = UserActionTrace {
+                        action: "PendingHostPrompt".to_string(),
+                        duration_ms: None,
+                        description: if l.is_zh() {
+                            format!(
+                                "已下发原生 ask 交互指令至 {} 控制台，等待终端用户确认",
+                                ctx.platform
+                            )
+                        } else {
+                            format!(
+                                "Dispatched native ask prompt to {} console, pending user confirmation",
+                                ctx.platform
+                            )
+                        },
+                    };
+
+                    ask_trace = Some(AskTrace {
+                        channel: "HostTerminalInline".to_string(),
+                        trigger_reason: trigger_reason.to_string(),
+                        protocol_op: Some("ask".to_string()),
+                        title: Some(prompt_title.to_string()),
+                        reason: Some(reason.clone()),
+                        target: if prompt_target.is_empty() {
+                            None
+                        } else {
+                            Some(prompt_target.to_string())
+                        },
+                        action: Some(prompt_action.clone()),
+                        tool: prompt_tool.clone(),
+                        prompt: Some(prompt_formatted.clone()),
+                        timeout_sec: Some(timeout),
+                    });
+
+                    disposition_summary = if l.is_zh() {
+                        format!(
+                            "宿主终端交互确认: 已向 {} 下发原生交互询问指令，挂起等待用户决定",
+                            ctx.platform
+                        )
+                    } else {
+                        format!(
+                            "Host terminal confirmation: dispatched native ask prompt to {}, pending user decision",
+                            ctx.platform
+                        )
+                    };
                 }
-                ConfirmPath::AutoDeny => auto_deny = true,
+                ConfirmPath::AutoDeny => {
+                    auto_deny = true;
+                    let l = lang();
+
+                    user_action_trace = UserActionTrace {
+                        action: "NotApplicable".to_string(),
+                        duration_ms: None,
+                        description: l.pick("当前环境无可用 GUI 弹窗且宿主不支持 ask，系统自动安全拒绝", "No GUI dialog available and host does not support ask, auto-denied").to_string(),
+                    };
+
+                    ask_trace = Some(AskTrace {
+                        channel: "NoneAutoDeny".to_string(),
+                        trigger_reason: trigger_reason.to_string(),
+                        protocol_op: Some("deny".to_string()),
+                        title: Some(prompt_title.to_string()),
+                        reason: Some(reason.clone()),
+                        target: if prompt_target.is_empty() {
+                            None
+                        } else {
+                            Some(prompt_target.to_string())
+                        },
+                        action: Some(prompt_action.clone()),
+                        tool: prompt_tool.clone(),
+                        prompt: Some(prompt_formatted.clone()),
+                        timeout_sec: None,
+                    });
+
+                    disposition_summary = l.pick(
+                        "安全降级阻断: 规则要求人工确认，但当前环境无 GUI 弹窗且宿主不支持 ask，已自动安全阻断",
+                        "Security fallback block: confirmation required but no dialog or host ask available, auto-denied",
+                    ).to_string();
+                }
             }
 
             if let Some(ref mut col) = *debug_col_cell.borrow_mut() {
@@ -1021,7 +1407,106 @@ fn handle_dispatch(args: &Cli) {
                     },
                     gui_approved,
                     dialog_duration_ms: dialog_dur,
+                    user_action: dlg_res.map(|r| r.as_str().to_string()).or_else(|| {
+                        if c_path == ConfirmPath::Ask {
+                            Some("PendingHostPrompt".to_string())
+                        } else {
+                            None
+                        }
+                    }),
                 });
+            }
+        } else {
+            // Non-Confirm branch: Allow, Deny, Modify, KeepGoing
+            let hit_rule = debug_col_cell
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.hit_rule.clone())
+                .unwrap_or_else(|| "rule".to_string());
+            let l = lang();
+
+            match &decision {
+                HookDecision::Deny { reason } => {
+                    disposition_summary = if l.is_zh() {
+                        format!("触发规则拦截 [{}]: {}，已直接阻断", hit_rule, reason)
+                    } else {
+                        format!(
+                            "Triggered rule block [{}]: {}, blocked directly",
+                            hit_rule, reason
+                        )
+                    };
+                    user_action_trace = UserActionTrace {
+                        action: "NotApplicable".to_string(),
+                        duration_ms: None,
+                        description: l
+                            .pick(
+                                "触发规则硬拦截，无需用户交互",
+                                "Triggered hard rule block, no user interaction required",
+                            )
+                            .to_string(),
+                    };
+                    ask_trace = Some(AskTrace {
+                        channel: "NoneHardDeny".to_string(),
+                        trigger_reason: "RuleDecision".to_string(),
+                        protocol_op: Some("deny".to_string()),
+                        title: None,
+                        reason: Some(reason.clone()),
+                        target: ctx
+                            .cmd
+                            .clone()
+                            .or_else(|| ctx.file.as_ref().and_then(|f| f.path.clone())),
+                        action: Some(resolve_action_description(&ctx).to_string()),
+                        tool: if ctx.tool_name.is_empty() {
+                            None
+                        } else {
+                            Some(ctx.tool_name.clone())
+                        },
+                        prompt: None,
+                        timeout_sec: None,
+                    });
+                }
+                HookDecision::Allow => {
+                    disposition_summary = l
+                        .pick(
+                            "所有规则评估通过，已静默允许执行",
+                            "All rules passed, silently allowed",
+                        )
+                        .to_string();
+                    user_action_trace = UserActionTrace {
+                        action: "NotApplicable".to_string(),
+                        duration_ms: None,
+                        description: l
+                            .pick(
+                                "规则安全检查通过，直接放行",
+                                "Rule safety check passed, allowed directly",
+                            )
+                            .to_string(),
+                    };
+                }
+                HookDecision::Modify(_) => {
+                    disposition_summary = l
+                        .pick(
+                            "规则修改了输入参数或注入提示词",
+                            "Rule modified input arguments or injected prompt",
+                        )
+                        .to_string();
+                    user_action_trace = UserActionTrace {
+                        action: "NotApplicable".to_string(),
+                        duration_ms: None,
+                        description: l
+                            .pick(
+                                "规则改写参数，无需用户交互",
+                                "Rule rewritten arguments, no user interaction required",
+                            )
+                            .to_string(),
+                    };
+                }
+                HookDecision::KeepGoing { .. } => {
+                    disposition_summary = l
+                        .pick("规则评估忽略继续", "Rule evaluation ignored, keep going")
+                        .to_string();
+                }
+                _ => {}
             }
         }
 
@@ -1042,7 +1527,39 @@ fn handle_dispatch(args: &Cli) {
         };
 
         let out = decision.to_json_output(&ctx, gui_approved);
-        if let Some(col) = debug_col_cell.borrow_mut().take() {
+
+        let final_effect = match &decision {
+            HookDecision::Allow => "Allowed",
+            HookDecision::Deny { .. } => "Blocked",
+            HookDecision::Confirm { .. } => {
+                if gui_approved == Some(true) {
+                    "Allowed"
+                } else if gui_approved == Some(false) || auto_deny {
+                    "Blocked"
+                } else {
+                    "Asked"
+                }
+            }
+            HookDecision::Modify(_) => "Mutated",
+            HookDecision::KeepGoing { .. } => "Allowed",
+        };
+
+        let engine_action = match &decision {
+            HookDecision::Allow => "Allow",
+            HookDecision::Deny { .. } => "Deny",
+            HookDecision::Confirm { .. } => "Confirm",
+            HookDecision::Modify(_) => "Modify",
+            HookDecision::KeepGoing { .. } => "KeepGoing",
+        };
+
+        if let Some(mut col) = debug_col_cell.borrow_mut().take() {
+            col.disposition = Some(DispositionTrace {
+                engine_action: engine_action.to_string(),
+                final_effect: final_effect.to_string(),
+                ask: ask_trace,
+                user: user_action_trace,
+                summary: disposition_summary,
+            });
             col.record(&agent_str, Some(&ctx), &decision, &out, 0);
         }
         print_output(&out);
@@ -1051,9 +1568,34 @@ fn handle_dispatch(args: &Cli) {
     if outcome.is_err() {
         eprint_ts!("[ai-hook] {}", t(Msg::M059));
         let reason = t(Msg::M060).to_string();
-        let dec = HookDecision::Deny { reason };
+        let dec = HookDecision::Deny {
+            reason: reason.clone(),
+        };
         let out = dec.to_json_output(&ctx_panic, None);
-        if let Some(col) = debug_col_panic.borrow_mut().take() {
+        if let Some(mut col) = debug_col_panic.borrow_mut().take() {
+            col.disposition = Some(DispositionTrace {
+                engine_action: "Deny".to_string(),
+                final_effect: "Blocked".to_string(),
+                ask: None,
+                user: UserActionTrace {
+                    action: "NotApplicable".to_string(),
+                    duration_ms: None,
+                    description: lang()
+                        .pick(
+                            "规则执行触发 panic 异常，无需用户交互",
+                            "Rule execution panic exception, no user interaction required",
+                        )
+                        .to_string(),
+                },
+                summary: {
+                    let l = lang();
+                    if l.is_zh() {
+                        format!("规则执行内部发生 Panic 异常: {}，已执行安全阻断", reason)
+                    } else {
+                        format!("Rule execution internal panic: {}, safety blocked", reason)
+                    }
+                },
+            });
             col.record(&agent_str, Some(&ctx_panic), &dec, &out, 0);
         }
         print_output(&out);
@@ -1105,14 +1647,111 @@ const TEST_PLATFORMS: &[&str] = &[
 /// production. The shape is host-specific in ways that matter: only
 /// Antigravity nests the tool under `toolCall`, only Gemini spells the event
 /// `BeforeTool`, and `transcript_path` is what carries the product name.
-fn synthetic_payload(platform: &str, command: &str, tool: &str, file: &str, cwd: &str) -> String {
+/// Tool-name → synthesized tool_input shape for `ai-hook test`.
+/// Kept in sync with `normalize_semantics` in protocol/input.rs: command
+/// tools carry a command string, file tools carry a target path
+/// (apply_patch carries the target inside its patch text), anything else
+/// falls back to the command key so the legacy shape keeps working.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimToolKind {
+    Command,
+    File,
+    ApplyPatch,
+    Other,
+}
+
+fn classify_sim_tool(tool: &str) -> SimToolKind {
+    let lower = tool.to_ascii_lowercase();
+    // Command tools (normalize_semantics §1).
+    if matches!(
+        lower.as_str(),
+        "bash"
+            | "run_command"
+            | "run_shell_command"
+            | "shell"
+            | "powershell"
+            | "command"
+            | "terminal"
+    ) {
+        return SimToolKind::Command;
+    }
+    if lower == "apply_patch" {
+        return SimToolKind::ApplyPatch;
+    }
+    // File tools (normalize_semantics §6: read/write/edit/delete/list).
+    if matches!(
+        lower.as_str(),
+        // Read.
+        "read" | "view" | "view_file" | "read_file" | "read_many_files"
+            // Write.
+            | "write" | "write_file" | "write_to_file" | "create_file" | "overwrite_file"
+            // Edit.
+            | "edit" | "multi_edit" | "notebookedit" | "replace"
+            | "replace_file_content" | "multi_replace_file_content" | "edit_file" | "modify_file"
+            // Delete.
+            | "delete" | "delete_file" | "remove_file" | "rm" | "remove" | "unlink" | "unlink_file"
+            // List.
+            | "list_dir" | "list_directory" | "list" | "read_dir"
+    ) {
+        return SimToolKind::File;
+    }
+    SimToolKind::Other
+}
+
+fn synthetic_payload(
+    platform: &str,
+    command: &str,
+    tool: &str,
+    file: &str,
+    event: &str,
+    prompt: &str,
+    cwd: &str,
+) -> String {
+    let kind = classify_sim_tool(tool);
+    // File tools need a concrete target; without one the synthesized payload
+    // leaves `ctx.file` null and every file rule silently passes. Fall back
+    // to the command key only for non-file kinds.
+    let needs_file = matches!(kind, SimToolKind::File | SimToolKind::ApplyPatch);
+    if needs_file && file.is_empty() {
+        eprintln!(
+            "⚠️  工具 {tool} 是文件类工具:未提供 -f <path>,合成的 payload 将无 ctx.file(文件规则会全部放行)。请用 -f 指定目标文件路径。"
+        );
+    }
+    // Prompt-gate events (UserPromptSubmit & friends) carry `prompt` instead
+    // of a tool envelope. The positional command doubles as the prompt text
+    // unless --prompt is given explicitly — `ai-hook test "/ai:balance" r.js
+    // --event UserPromptSubmit` just works.
+    let ev_lower = event.to_ascii_lowercase();
+    let is_prompt_event = matches!(
+        ev_lower.as_str(),
+        "userpromptsubmit" | "user_prompt_submit" | "beforeagent"
+    );
+    let effective_prompt = if prompt.is_empty() { command } else { prompt };
     match platform {
         "antigravity" => {
+            if is_prompt_event {
+                eprintln!(
+                    "⚠️  Antigravity 没有 prompt 类事件(UserPromptSubmit/BeforeAgent),--event {event} 无法模拟,仍按工具信封构造。"
+                );
+            }
             let mut args = serde_json::Map::new();
-            args.insert("CommandLine".into(), json!(command));
-            args.insert("Cwd".into(), json!(cwd));
-            if !file.is_empty() {
-                args.insert("TargetFile".into(), json!(file));
+            match kind {
+                SimToolKind::Command => {
+                    args.insert("CommandLine".into(), json!(command));
+                    args.insert("Cwd".into(), json!(cwd));
+                }
+                SimToolKind::ApplyPatch => {
+                    // Antigravity has no apply_patch; treat it as a plain
+                    // write so the file branch stays testable.
+                    args.insert("TargetFile".into(), json!(file));
+                }
+                SimToolKind::File => {
+                    args.insert("TargetFile".into(), json!(file));
+                }
+                SimToolKind::Other => {
+                    args.insert("CommandLine".into(), json!(command));
+                    args.insert("Cwd".into(), json!(cwd));
+                }
             }
             // `name` lives inside toolCall for the Antigravity envelope;
             // omitting it made `ctx.cmd` always null and silently disabled
@@ -1121,13 +1760,30 @@ fn synthetic_payload(platform: &str, command: &str, tool: &str, file: &str, cwd:
                 .to_string()
         }
         "gemini" => {
+            if is_prompt_event {
+                return json!({
+                    "hook_event_name": event,
+                    "prompt": effective_prompt,
+                    "session_id": "test-session",
+                    "transcript_path": format!("{cwd}/.gemini/tmp/test-session.json"),
+                    "cwd": cwd,
+                })
+                .to_string();
+            }
             let mut input = serde_json::Map::new();
-            input.insert("command".into(), json!(command));
-            if !file.is_empty() {
-                input.insert("file_path".into(), json!(file));
+            match kind {
+                SimToolKind::Command => {
+                    input.insert("command".into(), json!(command));
+                }
+                SimToolKind::ApplyPatch | SimToolKind::File => {
+                    input.insert("file_path".into(), json!(file));
+                }
+                SimToolKind::Other => {
+                    input.insert("command".into(), json!(command));
+                }
             }
             json!({
-                "hook_event_name": "BeforeTool",
+                "hook_event_name": event,
                 "tool_name": tool,
                 "tool_input": input,
                 "session_id": "test-session",
@@ -1146,13 +1802,40 @@ fn synthetic_payload(platform: &str, command: &str, tool: &str, file: &str, cwd:
                 "workbuddy" => ".workbuddy",
                 _ => ".claude",
             };
+            if is_prompt_event {
+                let mut obj = json!({
+                    "hook_event_name": event,
+                    "prompt": effective_prompt,
+                    "session_id": "test-session",
+                    "transcript_path": format!("{cwd}/{dir}/projects/test-session.jsonl"),
+                    "cwd": cwd,
+                });
+                if platform == "codex" {
+                    obj["turn_id"] = json!("test-turn");
+                }
+                return obj.to_string();
+            }
             let mut input = serde_json::Map::new();
-            input.insert("command".into(), json!(command));
-            if !file.is_empty() {
-                input.insert("file_path".into(), json!(file));
+            match kind {
+                SimToolKind::Command => {
+                    input.insert("command".into(), json!(command));
+                }
+                SimToolKind::ApplyPatch => {
+                    // Codex carries apply_patch targets inside the patch
+                    // text; a minimal "*** Update File" header is enough for
+                    // `extract_patch_target` to yield {path, edit}.
+                    let patch = format!("*** Update File: {file}\n@@ -0,0 +1 @@\n+probe\n");
+                    input.insert("patchText".into(), json!(patch));
+                }
+                SimToolKind::File => {
+                    input.insert("file_path".into(), json!(file));
+                }
+                SimToolKind::Other => {
+                    input.insert("command".into(), json!(command));
+                }
             }
             let mut obj = json!({
-                "hook_event_name": "PreToolUse",
+                "hook_event_name": event,
                 "tool_name": tool,
                 "tool_input": input,
                 "session_id": "test-session",
@@ -1178,12 +1861,15 @@ fn print_rendered(decision: &HookDecision, ctx: &HookContext) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_test(
     args: &Cli,
     command: &str,
     tool: &str,
     file: &str,
     platform: &str,
+    event: &str,
+    prompt: &str,
     scripts: &[PathBuf],
 ) {
     outln!("{}...", t(Msg::M066));
@@ -1210,7 +1896,7 @@ fn handle_test(
         unsafe { std::env::set_var("OPENCODE_COMPAT", "1") };
     }
 
-    let raw_payload = synthetic_payload(platform, command, tool, file, &cwd);
+    let raw_payload = synthetic_payload(platform, command, tool, file, event, prompt, &cwd);
     let ctx = HookContext::parse(&raw_payload);
     outln!("{}: {}", t(Msg::M157), ctx.platform);
     outln!("------------------------------------------------------------");
@@ -1333,7 +2019,7 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, platform: &str, sc
         unsafe { std::env::set_var("OPENCODE_COMPAT", "1") };
     }
 
-    let raw_payload = synthetic_payload(platform, command, "Bash", "", &cwd);
+    let raw_payload = synthetic_payload(platform, command, "Bash", "", "PreToolUse", "", &cwd);
     let ctx = HookContext::parse(&raw_payload);
     outln!("{}: {}", t(Msg::M157), ctx.platform);
     let explicit_paths = collect_target_rules(args, Some(scripts));

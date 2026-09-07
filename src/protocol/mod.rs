@@ -11,6 +11,7 @@ pub use input::{
     AgentContext, AgentKind, ConversationInfo, FileAction, FileContext, HookContext, McpContext,
     Platform, SearchContext, SearchKind, WebAction, WebContext, env_flag_true,
 };
+pub use output::{format_ask_prompt, resolve_action_description, resolve_context_target};
 
 /// 规则 confirm 决策在「宿主协议 ask」与「GUI 弹窗」之间的通道选择结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

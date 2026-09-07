@@ -9,6 +9,62 @@ use crate::NoConsoleSpawn;
 #[cfg(not(windows))]
 use crate::i18n::{Msg, t, tf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DialogResult {
+    /// User clicked Allow button or pressed Enter
+    Approved,
+    /// User clicked Deny button
+    Denied,
+    /// User pressed Escape key or closed window
+    EscCancelled,
+    /// Countdown timer expired without user response
+    TimedOut,
+    /// Failed to spawn dialog process or unexpected exit code
+    Error,
+}
+
+impl DialogResult {
+    pub fn is_approved(&self) -> bool {
+        matches!(self, Self::Approved)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approved => "Approved",
+            Self::Denied => "Denied",
+            Self::EscCancelled => "EscCancelled",
+            Self::TimedOut => "TimedOut",
+            Self::Error => "Error",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        let l = crate::i18n::lang();
+        match self {
+            Self::Approved => l.pick(
+                "用户在弹窗中确认允许执行",
+                "User approved via confirmation dialog",
+            ),
+            Self::Denied => l.pick(
+                "用户在弹窗中点击拒绝",
+                "User denied via confirmation dialog",
+            ),
+            Self::EscCancelled => l.pick(
+                "用户按下 Esc 键取消或关闭了弹窗",
+                "User cancelled dialog with Esc or closed window",
+            ),
+            Self::TimedOut => l.pick(
+                "弹窗倒计时超时自动拒绝",
+                "Confirmation dialog timed out, auto-denied",
+            ),
+            Self::Error => l.pick(
+                "弹窗进程异常或退出码错误",
+                "Dialog process failed or returned error exit code",
+            ),
+        }
+    }
+}
+
 pub struct GuiDialog;
 
 impl GuiDialog {
@@ -87,9 +143,21 @@ impl GuiDialog {
         title: &str,
         reason: &str,
         command: &str,
-        _agent: &str,
+        agent: &str,
         timeout_sec: u32,
     ) -> bool {
+        Self::confirm_detailed(title, reason, command, agent, timeout_sec).is_approved()
+    }
+
+    /// Prompts the user with a modern, high-aesthetic system-level GUI dialog.
+    /// Returns a detailed DialogResult distinguishing Approved, Denied, EscCancelled, and TimedOut.
+    pub fn confirm_detailed(
+        title: &str,
+        reason: &str,
+        command: &str,
+        _agent: &str,
+        timeout_sec: u32,
+    ) -> DialogResult {
         #[cfg(target_os = "windows")]
         {
             return Self::prompt_windows_wpf(title, reason, command, _agent, timeout_sec);
@@ -108,7 +176,7 @@ impl GuiDialog {
         }
 
         #[allow(unreachable_code)]
-        false
+        DialogResult::Error
     }
 
     #[cfg(target_os = "windows")]
@@ -118,7 +186,7 @@ impl GuiDialog {
         command: &str,
         agent: &str,
         timeout_sec: u32,
-    ) -> bool {
+    ) -> DialogResult {
         // The dialog content travels through the child's environment block,
         // which Windows caps at ~32,767 characters for ALL variables combined.
         // A rule reason can reach the 10k-char hook limit on its own, so
@@ -142,6 +210,10 @@ impl GuiDialog {
         let command = truncate(command, MAX_TEXT_CHARS);
         let ps_script = r###"
             param()
+            # 0. Fast-bail in non-interactive environment (Session 0 or headless service)
+            if (-not [Environment]::UserInteractive) {
+                exit 1
+            }
             Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
             # 1. System Theme Adaptive Detection (Windows Dark/Light mode)
@@ -403,7 +475,8 @@ impl GuiDialog {
                 }
             }
 
-            $result = 1
+            # Exit codes: 0 = Approved, 1 = Denied, 2 = Esc/Closed, 3 = TimedOut
+            $result = 2
 
             $btnAllow.Add_Click({
                 $script:result = 0
@@ -418,7 +491,7 @@ impl GuiDialog {
             $win.Add_PreviewKeyDown({
                 param($s, $e)
                 if ($e.Key -eq [System.Windows.Input.Key]::Escape) {
-                    $script:result = 1
+                    $script:result = 2
                     $win.Close()
                 } elseif ($e.Key -eq [System.Windows.Input.Key]::Enter) {
                     $script:result = 0
@@ -461,7 +534,7 @@ impl GuiDialog {
                 $txtCountdown.Text = $CountdownFmt -f $script:remaining
                 if ($script:remaining -le 0) {
                     $timer.Stop()
-                    $script:result = 1
+                    $script:result = 3
                     $win.Close()
                 }
             })
@@ -498,13 +571,19 @@ impl GuiDialog {
             .status();
 
         match status {
-            Ok(s) => s.success(),
-            Err(_) => false,
+            Ok(s) => match s.code() {
+                Some(0) => DialogResult::Approved,
+                Some(1) => DialogResult::Denied,
+                Some(2) => DialogResult::EscCancelled,
+                Some(3) => DialogResult::TimedOut,
+                _ => DialogResult::Error,
+            },
+            Err(_) => DialogResult::Error,
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn prompt_macos_native(title: &str, body: &str, timeout_sec: u32) -> bool {
+    fn prompt_macos_native(title: &str, body: &str, timeout_sec: u32) -> DialogResult {
         // Escape the text for embedding inside an AppleScript string literal.
         // Backslash MUST be escaped before quotes: a raw '\' followed by '"'
         // would otherwise close the string early and inject AppleScript code
@@ -546,15 +625,26 @@ impl GuiDialog {
 
         match output {
             Ok(out) => {
-                let res = String::from_utf8_lossy(&out.stdout);
-                res.contains(expected.as_str())
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stdout.contains("gave up:true") {
+                    DialogResult::TimedOut
+                } else if stdout.contains(expected.as_str()) {
+                    DialogResult::Approved
+                } else if stdout.contains(&format!("button returned:{}", deny_label)) {
+                    DialogResult::Denied
+                } else if stderr.contains("User canceled") || out.status.code() == Some(1) {
+                    DialogResult::EscCancelled
+                } else {
+                    DialogResult::Denied
+                }
             }
-            Err(_) => false,
+            Err(_) => DialogResult::Error,
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn prompt_linux_native(title: &str, body: &str, timeout_sec: u32) -> bool {
+    fn prompt_linux_native(title: &str, body: &str, timeout_sec: u32) -> DialogResult {
         let gate_title = t(Msg::M011);
         let question = format!("{}\n\n{}", body, t(Msg::M012));
         let timeout_note = tf(Msg::M013, &[&timeout_sec.to_string()]);
@@ -569,7 +659,12 @@ impl GuiDialog {
             .status();
 
         if let Ok(s) = status {
-            return s.success();
+            return match s.code() {
+                Some(0) => DialogResult::Approved,
+                Some(5) => DialogResult::TimedOut,
+                Some(1) => DialogResult::Denied,
+                _ => DialogResult::Denied,
+            };
         }
 
         // kdialog has no CLI timeout; wrap it with coreutils `timeout` so the
@@ -586,8 +681,12 @@ impl GuiDialog {
             .status();
 
         match kdialog_status {
-            Ok(s) => s.success(),
-            Err(_) => false,
+            Ok(s) => match s.code() {
+                Some(0) => DialogResult::Approved,
+                Some(124) => DialogResult::TimedOut,
+                _ => DialogResult::Denied,
+            },
+            Err(_) => DialogResult::Error,
         }
     }
 }

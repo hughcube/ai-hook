@@ -168,6 +168,8 @@ pub struct ConversationInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileContext {
     pub path: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
     pub action: FileAction,
 }
 
@@ -425,7 +427,7 @@ fn has_claude_envelope(val: &serde_json::Value) -> bool {
         || val.get("toolName").is_some()
 }
 
-/// Extracts the first target path (and its action) from a Codex
+/// Extracts all target paths (and their actions) from a Codex
 /// `apply_patch` patch body. Only the header lines are inspected:
 ///
 /// ```text
@@ -434,29 +436,26 @@ fn has_claude_envelope(val: &serde_json::Value) -> bool {
 /// ```
 ///
 /// `Update` maps to [`FileAction::Edit`], `Add` to Write and `Delete` to
-/// Delete. A patch touching several files still reports the first one —
-/// rules that need the full set can read `ctx.args.patchText`.
-fn extract_patch_target(patch: &str) -> Option<(String, FileAction)> {
+/// Delete. Returns all targets found, preserving order without duplicates.
+fn extract_patch_targets(patch: &str) -> Vec<(String, FileAction)> {
+    let mut targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in patch.lines() {
         let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix("*** Update File:") {
-            let target = rest.trim();
-            if !target.is_empty() {
-                return Some((target.to_string(), FileAction::Edit));
-            }
+        let (raw_target, action) = if let Some(rest) = t.strip_prefix("*** Update File:") {
+            (rest.trim(), FileAction::Edit)
         } else if let Some(rest) = t.strip_prefix("*** Add File:") {
-            let target = rest.trim();
-            if !target.is_empty() {
-                return Some((target.to_string(), FileAction::Write));
-            }
+            (rest.trim(), FileAction::Write)
         } else if let Some(rest) = t.strip_prefix("*** Delete File:") {
-            let target = rest.trim();
-            if !target.is_empty() {
-                return Some((target.to_string(), FileAction::Delete));
-            }
+            (rest.trim(), FileAction::Delete)
+        } else {
+            continue;
+        };
+        if !raw_target.is_empty() && seen.insert(raw_target.to_string()) {
+            targets.push((raw_target.to_string(), action));
         }
     }
-    None
+    targets
 }
 
 /// Classifies command/file tools and extracts the normalized payload for the
@@ -661,16 +660,21 @@ fn normalize_semantics(
     // otherwise every rule that guards file writes has to regex the raw
     // payload itself.
     if lower == "apply_patch"
-        && let Some(patch) = get_str(args, &["patchText", "patch_text", "patch"])
-        && let Some((path, action)) = extract_patch_target(patch)
+        && let Some(patch) = get_str(args, &["patchText", "patch_text", "patch", "command"])
     {
-        return Normalized {
-            file: Some(FileContext {
-                path: Some(path),
-                action,
-            }),
-            ..Normalized::default()
-        };
+        let targets = extract_patch_targets(patch);
+        if !targets.is_empty() {
+            let (first_path, first_action) = targets[0].clone();
+            let all_paths: Vec<String> = targets.into_iter().map(|(p, _)| p).collect();
+            return Normalized {
+                file: Some(FileContext {
+                    path: Some(first_path),
+                    paths: all_paths,
+                    action: first_action,
+                }),
+                ..Normalized::default()
+            };
+        }
     }
 
     let action = match lower.as_str() {
@@ -705,8 +709,13 @@ fn normalize_semantics(
         _ => return Normalized::default(), // not a tool we model
     };
     let path = get_str(args, path_keys).map(str::to_string);
+    let paths = path.as_ref().map(|p| vec![p.clone()]).unwrap_or_default();
     Normalized {
-        file: Some(FileContext { path, action }),
+        file: Some(FileContext {
+            path,
+            paths,
+            action,
+        }),
         ..Normalized::default()
     }
 }

@@ -257,6 +257,7 @@ fn test_file_action_normalization_across_hosts() {
         w.file,
         Some(FileContext {
             path: Some("/tmp/a.txt".into()),
+            paths: vec!["/tmp/a.txt".into()],
             action: FileAction::Write
         })
     );
@@ -304,6 +305,7 @@ fn test_file_action_normalization_across_hosts() {
         vf_abs.file,
         Some(FileContext {
             path: Some("/p/secret.txt".into()),
+            paths: vec!["/p/secret.txt".into()],
             action: FileAction::Read
         })
     );
@@ -313,6 +315,7 @@ fn test_file_action_normalization_across_hosts() {
         ld_dir.file,
         Some(FileContext {
             path: Some("/p/dir".into()),
+            paths: vec!["/p/dir".into()],
             action: FileAction::List
         })
     );
@@ -2183,8 +2186,34 @@ fn apply_patch_target_is_extracted_from_patch_text() {
         file.path.as_deref().unwrap().ends_with("x.js"),
         "path 应来自 *** Update File: 行: {file:?}"
     );
+    assert_eq!(file.paths.len(), 1);
 
-    // Add File -> write,Delete File -> delete
+    // Multi-file patch: extracts all target paths
+    let multi = HookContext::parse(
+        &serde_json::json!({
+            "turn_id": "t1",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "patchText": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n*** Add File: config/.env\n+SECRET=1\n*** Delete File: old.tmp\n*** End Patch"
+            }
+        })
+        .to_string(),
+    );
+    let multi_file = multi
+        .file
+        .expect("multi apply_patch should yield a file context");
+    assert_eq!(multi_file.path.as_deref(), Some("src/main.rs"));
+    assert_eq!(multi_file.action, FileAction::Edit);
+    assert_eq!(
+        multi_file.paths,
+        vec![
+            "src/main.rs".to_string(),
+            "config/.env".to_string(),
+            "old.tmp".to_string()
+        ]
+    );
+
+    // Add File -> write, Delete File -> delete
     let add = HookContext::parse(
         &serde_json::json!({
             "tool_name": "apply_patch",
@@ -2941,6 +2970,7 @@ fn claude_code_view_tool_is_recognized_as_read() {
         ctx.file,
         Some(FileContext {
             path: Some("/work/src/secret.key".into()),
+            paths: vec!["/work/src/secret.key".into()],
             action: FileAction::Read
         })
     );
@@ -3853,4 +3883,570 @@ fn test_cli_unknown_arguments_are_safely_ignored() {
         .output()
         .expect("Failed to run help subcommand");
     assert!(out_help.status.success(), "'ai-hook help' should succeed");
+}
+
+#[test]
+fn test_cross_platform_args_alias_enrichment() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+
+    // Test Antigravity payload (has CommandLine, TargetFile, CodeContent)
+    let agy_ctx = HookContext::parse(
+        &serde_json::json!({
+            "conversationId": "c1",
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo 123",
+                    "TargetFile": "/app/test.php",
+                    "CodeContent": "<?php echo 1;"
+                }
+            }
+        })
+        .to_string(),
+    );
+
+    let script = rule(
+        "test-alias",
+        r#"export default function(ctx) {
+            // Check cross-platform aliases
+            if (ctx.args.command === "echo 123" &&
+                ctx.args.file_path === "/app/test.php" &&
+                ctx.args.content === "<?php echo 1;") {
+                return { deny: "alias_ok" };
+            }
+            return null;
+        }"#,
+    );
+
+    let res = runner.execute_rule(&script, &agy_ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "alias_ok".to_string()
+        })
+    );
+}
+
+#[test]
+fn test_fast_path_sensitive_tokens_extension() {
+    use ai_hook::fast_path::check_fast_path;
+
+    // Commands targeting newly protected sensitive tokens must NOT hit fast path
+    let tests = [
+        "cat ~/.npmrc",
+        "head -n 10 ~/.dockercfg",
+        "cat .docker/config.json",
+        "cat /etc/ssl/private_key.pem",
+        "cat app_secret_key.txt",
+    ];
+
+    for cmd in tests {
+        let ctx = HookContext::parse(
+            &serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": { "command": cmd }
+            })
+            .to_string(),
+        );
+        assert!(
+            check_fast_path(&ctx).is_none(),
+            "Command '{cmd}' must be rejected by fast path due to sensitive tokens"
+        );
+    }
+}
+
+// =========================================================================
+// Sanitized Authentic Payload Fixtures Captured from Real Agent Debug Logs
+// =========================================================================
+
+#[test]
+fn test_real_fixture_antigravity_run_command() {
+    clear_codebuddy_env();
+    // Sanitized authentic payload from ai-hook-debug-antigravity-20260907.log
+    let raw = r#"{
+        "artifactDirectoryPath": "C:/Users/test_developer/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555",
+        "conversationId": "11111111-2222-3333-4444-555555555555",
+        "modelName": "gemini-3.8-flash-high",
+        "stepIdx": 2,
+        "toolCall": {
+            "args": {
+                "CommandLine": "git status",
+                "Cwd": "C:\\Users\\test_developer\\workspace",
+                "WaitMsBeforeAsync": 5000,
+                "toolAction": "Check git repository status",
+                "toolSummary": "Run git status"
+            },
+            "name": "run_command"
+        },
+        "transcriptPath": "C:/Users/test_developer/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["C:/Users/test_developer/workspace"]
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    assert_eq!(ctx.event_enum, HookEvent::PreToolUse);
+    assert_eq!(ctx.tool_name, "run_command");
+    assert_eq!(ctx.cmd.as_deref(), Some("git status"));
+    assert_eq!(ctx.model.as_deref(), Some("gemini-3.8-flash-high"));
+    assert_eq!(ctx.cwd, "C:\\Users\\test_developer\\workspace");
+    assert_eq!(
+        ctx.conversation.as_ref().and_then(|c| c.id.as_deref()),
+        Some("11111111-2222-3333-4444-555555555555")
+    );
+
+    // Rule execution asserting cross-platform alias and properties
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "agy-cmd-test",
+        r#"export default function(ctx) {
+            if (ctx.cmd === "git status" && ctx.args.command === "git status") {
+                return { allow: true };
+            }
+            return { deny: "mismatch" };
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+}
+
+#[test]
+fn test_real_fixture_antigravity_write_to_file() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "artifactDirectoryPath": "C:/Users/test_developer/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555",
+        "conversationId": "11111111-2222-3333-4444-555555555555",
+        "modelName": "gemini-3.8-flash-high",
+        "stepIdx": 174,
+        "toolCall": {
+            "args": {
+                "CodeContent": "package main\n\nfunc main() {}\n",
+                "Description": "Creating entrypoint file",
+                "Overwrite": true,
+                "TargetFile": "C:\\Users\\test_developer\\workspace\\main.go",
+                "toolAction": "Writing entrypoint file",
+                "toolSummary": "Create main.go"
+            },
+            "name": "write_to_file"
+        },
+        "transcriptPath": "C:/Users/test_developer/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript_full.jsonl",
+        "workspacePaths": ["C:/Users/test_developer/workspace"]
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    assert_eq!(ctx.tool_name, "write_to_file");
+    let f = ctx.file.as_ref().expect("file context expected");
+    assert_eq!(f.action, FileAction::Write);
+    assert_eq!(
+        f.path.as_deref(),
+        Some("C:\\Users\\test_developer\\workspace\\main.go")
+    );
+    assert_eq!(
+        f.paths,
+        vec!["C:\\Users\\test_developer\\workspace\\main.go".to_string()]
+    );
+
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "agy-write-test",
+        r#"export default function(ctx) {
+            if (ctx.file.action === "write" && ctx.args.file_path === "C:\\Users\\test_developer\\workspace\\main.go") {
+                return { allow: true };
+            }
+            return { deny: "mismatch" };
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+}
+
+#[test]
+fn test_real_fixture_antigravity_replace_file_content() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "artifactDirectoryPath": "C:/Users/test_developer/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555",
+        "conversationId": "11111111-2222-3333-4444-555555555555",
+        "modelName": "gemini-3.8-flash-high",
+        "stepIdx": 272,
+        "toolCall": {
+            "args": {
+                "AllowMultiple": false,
+                "Description": "Updating configuration comment",
+                "EndLine": 5,
+                "Instruction": "Update comment line",
+                "ReplacementContent": "// configuration updated",
+                "StartLine": 5,
+                "TargetContent": "// configuration default",
+                "TargetFile": "C:\\Users\\test_developer\\workspace\\config.go",
+                "toolAction": "Editing configuration",
+                "toolSummary": "Edit config.go"
+            },
+            "name": "replace_file_content"
+        }
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    assert_eq!(ctx.tool_name, "replace_file_content");
+    let f = ctx.file.expect("file context expected");
+    assert_eq!(f.action, FileAction::Edit);
+    assert_eq!(
+        f.path.as_deref(),
+        Some("C:\\Users\\test_developer\\workspace\\config.go")
+    );
+}
+
+#[test]
+fn test_real_fixture_antigravity_view_file_sensitive_path() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "conversationId": "conv-test",
+        "toolCall": {
+            "name": "view_file",
+            "args": {
+                "AbsolutePath": "C:/Users/test_user/.ssh/id_rsa"
+            }
+        }
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    assert_eq!(ctx.tool_name, "view_file");
+    let f = ctx.file.expect("file context expected");
+    assert_eq!(f.action, FileAction::Read);
+    assert_eq!(f.path.as_deref(), Some("C:/Users/test_user/.ssh/id_rsa"));
+}
+
+#[test]
+fn test_real_fixture_claude_code_user_prompt_submit() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "session_id": "22222222-3333-4444-5555-666666666666",
+        "transcript_path": "C:\\Users\\test_developer\\.claude\\projects\\test-proj\\22222222-3333-4444-5555-666666666666.jsonl",
+        "cwd": "C:\\Users\\test_developer\\workspace",
+        "prompt_id": "33333333-4444-5555-6666-777777777777",
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "/ai:balance",
+        "effort": "low"
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::ClaudeCode);
+    assert_eq!(ctx.event_enum, HookEvent::UserPromptSubmit);
+    assert_eq!(ctx.prompt.as_deref(), Some("/ai:balance"));
+    assert_eq!(ctx.permission_mode.as_deref(), Some("default"));
+    assert_eq!(
+        ctx.conversation.as_ref().and_then(|c| c.id.as_deref()),
+        Some("22222222-3333-4444-5555-666666666666")
+    );
+
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "intercept-prompt",
+        r#"export default function(ctx) {
+            if (ctx.event === "UserPromptSubmit" && ctx.prompt === "/ai:balance") {
+                return { deny: "Balance quota: $100.00" };
+            }
+            return null;
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "Balance quota: $100.00".to_string()
+        })
+    );
+}
+
+#[test]
+fn test_real_fixture_claude_code_pre_tool_use_bash_yolo() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "session_id": "22222222-3333-4444-5555-666666666666",
+        "transcript_path": "C:\\Users\\test_developer\\.claude\\projects\\test-proj\\22222222-3333-4444-5555-666666666666.jsonl",
+        "cwd": "C:\\Users\\test_developer\\workspace",
+        "prompt_id": "33333333-4444-5555-6666-777777777777",
+        "permission_mode": "bypassPermissions",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "rm -rf /",
+            "description": "Clean root files"
+        }
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::ClaudeCode);
+    assert_eq!(ctx.event_enum, HookEvent::PreToolUse);
+    assert_eq!(ctx.tool_name, "Bash");
+    assert_eq!(ctx.cmd.as_deref(), Some("rm -rf /"));
+    assert!(ctx.is_yolo);
+
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "rm-root-guard",
+        r#"export default function(ctx) {
+            if (ctx.cmd && ctx.cmd.startsWith("rm -rf /")) {
+                return { deny: "Forbidden deletion of root" };
+            }
+            return null;
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "Forbidden deletion of root".to_string()
+        })
+    );
+}
+
+#[test]
+fn test_real_fixture_claude_code_file_tools_suite() {
+    clear_codebuddy_env();
+    // 1. Write
+    let raw_write = r#"{
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": { "file_path": "/app/src/index.ts", "content": "console.log('hi');" }
+    }"#;
+    let ctx_w = HookContext::parse(raw_write);
+    assert_eq!(ctx_w.tool_name, "Write");
+    let fw = ctx_w.file.unwrap();
+    assert_eq!(fw.action, FileAction::Write);
+    assert_eq!(fw.path.as_deref(), Some("/app/src/index.ts"));
+
+    // 2. Edit
+    let raw_edit = r#"{
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "/app/src/index.ts", "old_string": "hi", "new_string": "hello" }
+    }"#;
+    let ctx_e = HookContext::parse(raw_edit);
+    assert_eq!(ctx_e.file.unwrap().action, FileAction::Edit);
+
+    // 3. Delete
+    let raw_del = r#"{
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Delete",
+        "tool_input": { "file_path": "/app/tmp/cache.lock" }
+    }"#;
+    let ctx_d = HookContext::parse(raw_del);
+    assert_eq!(ctx_d.file.unwrap().action, FileAction::Delete);
+}
+
+#[test]
+fn test_real_fixture_claude_code_post_tool_use_context_injection() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "hook_event_name": "PostToolUse",
+        "session_id": "22222222-3333-4444-5555-666666666666",
+        "transcript_path": "C:\\Users\\test_developer\\.claude\\projects\\test-proj\\22222222-3333-4444-5555-666666666666.jsonl",
+        "cwd": "C:\\Users\\test_developer\\workspace",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git worktree add -b feature-test ../wt-test" },
+        "tool_response": "Preparing worktree (checking out 'feature-test')",
+        "duration_ms": 120
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.event_enum, HookEvent::PostToolUse);
+    assert_eq!(ctx.tool_name, "Bash");
+
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "worktree-reminder",
+        r#"export default function(ctx) {
+            if (ctx.event === "PostToolUse" && ctx.cmd && ctx.cmd.includes("worktree add")) {
+                return { inject: "Remember to register worktree in bay" };
+            }
+            return null;
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Modify(ai_hook::protocol::Mutation {
+            inject: Some("Remember to register worktree in bay".to_string()),
+            ..Default::default()
+        }))
+    );
+}
+
+#[test]
+fn test_real_fixture_codebuddy_superset_fields() {
+    clear_codebuddy_env();
+    // Authentic structure from ai-hook-debug-codebuddy-20260907.log
+    let raw = r#"{
+        "session_id": "44444444-5555-6666-7777-888888888888",
+        "transcript_path": "C:\\Users\\test_developer\\.codebuddy\\projects\\test-proj\\44444444-5555-6666-7777-888888888888.jsonl",
+        "cwd": "C:\\Users\\test_developer\\workspace",
+        "hook_event_name": "PreToolUse",
+        "prompt": "Optimize database queries",
+        "permission_mode": "bypassPermissions",
+        "client": "codebuddy",
+        "version": "1.8.0",
+        "generation_id": "gen-82910381",
+        "model": "glm-5.3-flash",
+        "agent_type": "developer",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "php artisan db:wipe",
+            "description": "Reset test database"
+        },
+        "call_id": "call-12345",
+        "tool_use_id": "tool-call-999"
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::CodeBuddy);
+    assert_eq!(ctx.event_enum, HookEvent::PreToolUse);
+    assert_eq!(ctx.model.as_deref(), Some("glm-5.3-flash"));
+    assert_eq!(ctx.tool_name, "Bash");
+    assert_eq!(ctx.cmd.as_deref(), Some("php artisan db:wipe"));
+    assert!(ctx.is_yolo);
+
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "db-wipe-confirm",
+        r#"export default function(ctx) {
+            if (ctx.cmd && ctx.cmd.includes("db:wipe")) {
+                return { confirm: "Wiping database requires explicit confirmation" };
+            }
+            return null;
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert!(matches!(
+        res.decision,
+        Some(HookDecision::Confirm { ref reason, .. })
+            if reason.contains("Wiping database requires explicit confirmation")
+    ));
+}
+
+#[test]
+fn test_real_fixture_codex_bash_and_can_ask_boundary() {
+    clear_codebuddy_env();
+    // Authentic structure from ai-hook-debug-codex-20260907.log
+    let raw = r#"{
+        "hook_event_name": "PreToolUse",
+        "permission_mode": "bypassPermissions",
+        "turn_id": "turn-codex-test-001",
+        "model": "gpt-5.6-sol",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "php artisan db:wipe --force"
+        }
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Codex);
+    assert_eq!(ctx.event_enum, HookEvent::PreToolUse);
+    assert_eq!(ctx.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(ctx.cmd.as_deref(), Some("php artisan db:wipe --force"));
+    // Codex protocol has no native ask: can_ask must be false to avoid Fail-open
+    assert!(!ctx.can_ask());
+}
+
+#[test]
+fn test_real_fixture_codex_apply_patch_multi_target() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "hook_event_name": "PreToolUse",
+        "permission_mode": "bypassPermissions",
+        "turn_id": "turn-codex-test-002",
+        "model": "gpt-5.6-sol",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": "*** Begin Patch\n*** Update File: C:/Users/test_user/project/src/main.rs\n@@\n-old\n+new\n*** Add File: C:/Users/test_user/project/config/.env\n+SECRET_KEY=123\n*** End Patch"
+        }
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Codex);
+    assert_eq!(ctx.tool_name, "apply_patch");
+    let f = ctx
+        .file
+        .as_ref()
+        .expect("file context expected for apply_patch");
+    assert_eq!(f.action, FileAction::Edit);
+    assert_eq!(
+        f.path.as_deref(),
+        Some("C:/Users/test_user/project/src/main.rs")
+    );
+    // Verified: all targets extracted into paths
+    assert_eq!(f.paths.len(), 2);
+    assert_eq!(f.paths[0], "C:/Users/test_user/project/src/main.rs");
+    assert_eq!(f.paths[1], "C:/Users/test_user/project/config/.env");
+
+    let runner = RuleRunner::new().expect("runner init");
+    let script = rule(
+        "protect-env-in-patch",
+        r#"export default function(ctx) {
+            // Can inspect all target paths from apply_patch
+            if (ctx.file.paths && ctx.file.paths.some(p => p.includes(".env"))) {
+                return { deny: "Forbidden modification of .env via patch" };
+            }
+            return null;
+        }"#,
+    );
+    let res = runner.execute_rule(&script, &ctx);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "Forbidden modification of .env via patch".to_string()
+        })
+    );
+}
+
+#[test]
+fn test_real_fixture_codex_read_file() {
+    clear_codebuddy_env();
+    let raw = r#"{
+        "hook_event_name": "PreToolUse",
+        "permission_mode": "bypassPermissions",
+        "turn_id": "turn-codex-test-003",
+        "tool_name": "read_file",
+        "tool_input": {
+            "path": "~/.aws/credentials"
+        }
+    }"#;
+
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Codex);
+    assert_eq!(ctx.tool_name, "read_file");
+    let f = ctx.file.expect("file context expected");
+    assert_eq!(f.action, FileAction::Read);
+    assert_eq!(f.path.as_deref(), Some("~/.aws/credentials"));
+}
+
+#[test]
+fn test_real_fixture_generic_unparseable_code_payload() {
+    clear_codebuddy_env();
+    // From ai-hook-debug-generic-20260907.log line 1: non-JSON raw JS text passed to stdin
+    let raw = "export default function(ctx, sys) { const r = sys.exec(\"bash\", [\"-c\", \"echo hello\"]); return { deny: JSON.stringify(r) }; }\r\n";
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Generic);
+    assert!(ctx.parse_failed);
+}
+
+#[test]
+fn test_real_fixture_generic_truncated_json_payload() {
+    clear_codebuddy_env();
+    // From ai-hook-debug-generic-20260907.log line 2: truncated JSON
+    let raw = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}},"#;
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Generic);
+    assert!(ctx.parse_failed);
+}
+
+#[test]
+fn test_real_fixture_generic_empty_payload() {
+    clear_codebuddy_env();
+    // From ai-hook-debug-generic-20260907.log line 11: completely empty stdin
+    let raw = "";
+    let ctx = HookContext::parse(raw);
+    assert_eq!(ctx.platform, Platform::Generic);
 }

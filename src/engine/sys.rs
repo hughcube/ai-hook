@@ -232,6 +232,25 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             cmd_obj.current_dir(&target_cwd);
             cmd_obj.no_console_window();
 
+            #[cfg(windows)]
+            {
+                // Ensure essential Windows environment variables are preserved for subprocess DLL initialization.
+                // When invoked from GUI processes (Electron, Antigravity, etc.), MSYS2 / POSIX tools (bash, zsh)
+                // or conhost require SystemRoot, ComSpec, and Windows directory variables to avoid 0xC0000142.
+                if std::env::var_os("SystemRoot").is_none()
+                    && std::env::var_os("SYSTEMROOT").is_none()
+                {
+                    let windir =
+                        std::env::var("windir").unwrap_or_else(|_| r"C:\Windows".to_string());
+                    cmd_obj.env("SystemRoot", &windir);
+                    cmd_obj.env("SYSTEMROOT", &windir);
+                }
+                if std::env::var_os("ComSpec").is_none() && std::env::var_os("COMSPEC").is_none() {
+                    cmd_obj.env("ComSpec", r"C:\Windows\System32\cmd.exe");
+                    cmd_obj.env("COMSPEC", r"C:\Windows\System32\cmd.exe");
+                }
+            }
+
             if let Some(ref opt) = options.0
                 && let Ok(env_obj) = opt.get::<_, Object<'js>>("env")
             {
@@ -792,6 +811,28 @@ fn resolve_command_name(cmd: &str, raw_args: Vec<String>, _cwd: &Path) -> Resolv
 }
 
 #[cfg(windows)]
+fn find_git_bash_candidate() -> Option<String> {
+    let candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ];
+    for c in candidates {
+        if Path::new(c).is_file() {
+            return Some(c.to_string());
+        }
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let user_git = PathBuf::from(local_app_data).join(r"Programs\Git\bin\bash.exe");
+        if user_git.is_file() {
+            return Some(user_git.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
 fn find_windows_posix_shell(preferred: &str, cwd: &Path) -> String {
     if let Ok(shell_env) = std::env::var("SHELL") {
         let shell_path = Path::new(&shell_env);
@@ -820,6 +861,10 @@ fn find_windows_posix_shell(preferred: &str, cwd: &Path) -> String {
         {
             return path;
         }
+    }
+
+    if let Some(git_bash) = find_git_bash_candidate() {
+        return git_bash;
     }
 
     preferred.to_string()

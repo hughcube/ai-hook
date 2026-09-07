@@ -38,6 +38,7 @@ pub struct RuleTrace {
     pub id: String,
     pub path: String,
     pub duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -51,6 +52,70 @@ pub struct InteractionTrace {
     pub gui_approved: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dialog_duration_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_action: Option<String>,
+}
+
+/// Detailed trace of how an ask/confirmation was routed and requested by ai-hook.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AskTrace {
+    /// Channel used: "DesktopPopup" | "HostTerminalInline" | "NoneAutoDeny" | "NoneHardDeny" | "NoneBypass"
+    pub channel: String,
+    /// Reason/origin triggering the ask:
+    /// "GuiFallbackYolo" | "HostNativeProtocol" | "GuiFallbackNoHostAsk" | "GuiForcedByRule" | "GuiForcedByCli" | "AutoDenyNoGuiAvailable" | "RuleDecision" | "FastPath" | "UnparseablePayload" | "None"
+    pub trigger_reason: String,
+    /// Native host protocol operator if applicable (e.g. "ask", "confirm", "permission_request")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_op: Option<String>,
+    /// Dialog/prompt title
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Prompt reason displayed to user
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Target command or resource prompted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Action description (e.g. "执行命令", "修改文件", "读取文件")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Tool name (e.g. "run_command", "replace_file_content")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Rendered prompt formatted for terminal/dialog
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Timeout in seconds configured for user prompt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_sec: Option<u32>,
+}
+
+/// Trace of how the user or host responded physically to the prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserActionTrace {
+    /// Action taken: "Approved" | "Denied" | "EscCancelled" | "TimedOut" | "PendingHostPrompt" | "NotApplicable" | "Error"
+    pub action: String,
+    /// Duration of interaction in milliseconds (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<f64>,
+    /// Human-friendly description of user's physical action
+    pub description: String,
+}
+
+/// Consolidated disposition summary in debug log.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DispositionTrace {
+    /// Action determined by engine: "Allow" | "Deny" | "Confirm" | "Modify" | "KeepGoing" | "FastPath" | "Bypass"
+    pub engine_action: String,
+    /// Final physical effect: "Allowed" | "Blocked" | "Asked" | "Mutated" | "Injected"
+    pub final_effect: String,
+    /// Detailed ask routing trace (if an ask was attempted or evaluated)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask: Option<AskTrace>,
+    /// Detailed user/host physical action trace
+    pub user: UserActionTrace,
+    /// One-line human-readable summary
+    pub summary: String,
 }
 
 /// Final decision and delivery result in debug log.
@@ -72,6 +137,37 @@ pub struct TimingTrace {
     pub total_process_ms: f64,
 }
 
+/// Truncates string fields in a JSON value if they exceed `max_chars`.
+pub fn sanitize_large_json_values(val: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s) => {
+            if s.chars().count() > max_chars {
+                let prefix: String = s.chars().take(max_chars).collect();
+                serde_json::Value::String(format!(
+                    "{} ...[truncated, total {} chars]",
+                    prefix,
+                    s.chars().count()
+                ))
+            } else {
+                serde_json::Value::String(s.clone())
+            }
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|item| sanitize_large_json_values(item, max_chars))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+            for (k, v) in map {
+                new_map.insert(k.clone(), sanitize_large_json_values(v, max_chars));
+            }
+            serde_json::Value::Object(new_map)
+        }
+        other => other.clone(),
+    }
+}
+
 /// Normalized view of the hook context exposed to rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextView {
@@ -79,29 +175,53 @@ pub struct ContextView {
     pub event: Option<String>,
     pub event_raw: Option<String>,
     pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub web: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<serde_json::Value>,
     pub args: serde_json::Value,
     pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<serde_json::Value>,
     pub is_yolo: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 }
 
 impl From<&HookContext> for ContextView {
     fn from(ctx: &HookContext) -> Self {
+        const MAX_ARG_CHARS: usize = 512;
+        let sanitized_args = sanitize_large_json_values(&ctx.args, MAX_ARG_CHARS);
+        let sanitized_cmd = ctx.cmd.as_ref().map(|c| {
+            if c.chars().count() > 1024 {
+                let prefix: String = c.chars().take(1024).collect();
+                format!(
+                    "{} ...[truncated, total {} chars]",
+                    prefix,
+                    c.chars().count()
+                )
+            } else {
+                c.clone()
+            }
+        });
         Self {
             platform: ctx.platform.to_string(),
             event: ctx.event.clone(),
             event_raw: ctx.event_raw.clone(),
             tool: ctx.tool_name.clone(),
-            cmd: ctx.cmd.clone(),
+            cmd: sanitized_cmd,
             file: ctx.file.as_ref().and_then(|f| serde_json::to_value(f).ok()),
             mcp: ctx.mcp.as_ref().and_then(|m| serde_json::to_value(m).ok()),
             web: ctx.web.as_ref().and_then(|w| serde_json::to_value(w).ok()),
@@ -113,7 +233,7 @@ impl From<&HookContext> for ContextView {
                 .agent
                 .as_ref()
                 .and_then(|a| serde_json::to_value(a).ok()),
-            args: ctx.args.clone(),
+            args: sanitized_args,
             cwd: ctx.cwd.clone(),
             model: ctx.model.clone(),
             session: ctx
@@ -122,7 +242,18 @@ impl From<&HookContext> for ContextView {
                 .and_then(|c| serde_json::to_value(c).ok()),
             is_yolo: ctx.is_yolo,
             mode: ctx.permission_mode.clone(),
-            prompt: ctx.prompt.clone(),
+            prompt: ctx.prompt.as_ref().map(|p| {
+                if p.chars().count() > 512 {
+                    let prefix: String = p.chars().take(512).collect();
+                    format!(
+                        "{} ...[truncated, total {} chars]",
+                        prefix,
+                        p.chars().count()
+                    )
+                } else {
+                    p.clone()
+                }
+            }),
         }
     }
 }
@@ -141,6 +272,7 @@ pub struct DebugLogEntry {
     pub cli_args: Vec<String>,
     pub raw_input: String,
     pub parse_failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextView>,
     pub fast_path: FastPathTrace,
     pub rules_evaluated: Vec<RuleTrace>,
@@ -148,6 +280,8 @@ pub struct DebugLogEntry {
     pub hit_rule: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction: Option<InteractionTrace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<DispositionTrace>,
     pub result: ResultTrace,
     pub timing_ms: TimingTrace,
 }
@@ -427,6 +561,7 @@ pub struct DebugCollector {
     pub rules_evaluated: Vec<RuleTrace>,
     pub hit_rule: Option<String>,
     pub interaction: Option<InteractionTrace>,
+    pub disposition: Option<DispositionTrace>,
 }
 
 impl Default for DebugCollector {
@@ -450,6 +585,7 @@ impl DebugCollector {
             rules_evaluated: Vec::new(),
             hit_rule: None,
             interaction: None,
+            disposition: None,
         }
     }
 
@@ -477,6 +613,40 @@ impl DebugCollector {
 
         let gui_ms = self.interaction.as_ref().and_then(|i| i.dialog_duration_ms);
 
+        let disposition = self.disposition.or_else(|| {
+            // Intelligent fallback disposition if not explicitly set
+            let (engine_action, final_effect, summary) = match decision {
+                HookDecision::Allow => (
+                    "Allow",
+                    "Allowed",
+                    "操作通过安全检查，已允许执行".to_string(),
+                ),
+                HookDecision::Deny { reason } => {
+                    ("Deny", "Blocked", format!("操作被规则阻断: {}", reason))
+                }
+                HookDecision::Confirm { reason, .. } => {
+                    ("Confirm", "Asked", format!("操作触发确认提示: {}", reason))
+                }
+                HookDecision::Modify(_) => {
+                    ("Modify", "Mutated", "操作参数已由规则改写".to_string())
+                }
+                HookDecision::KeepGoing { .. } => {
+                    ("KeepGoing", "Allowed", "规则评估后放行继续".to_string())
+                }
+            };
+            Some(DispositionTrace {
+                engine_action: engine_action.to_string(),
+                final_effect: final_effect.to_string(),
+                ask: None,
+                user: UserActionTrace {
+                    action: "NotApplicable".to_string(),
+                    duration_ms: None,
+                    description: "无需用户物理交互".to_string(),
+                },
+                summary,
+            })
+        });
+
         let entry = DebugLogEntry {
             time: local_now_str(),
             date: local_date_str(),
@@ -489,7 +659,16 @@ impl DebugCollector {
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             cli_args: self.cli_args,
-            raw_input: self.raw_input,
+            raw_input: if self.raw_input.chars().count() > 1024 {
+                let prefix: String = self.raw_input.chars().take(1024).collect();
+                format!(
+                    "{} ...[truncated, total {} chars]",
+                    prefix,
+                    self.raw_input.chars().count()
+                )
+            } else {
+                self.raw_input
+            },
             parse_failed: self.parse_failed,
             context: ctx.map(ContextView::from),
             fast_path: FastPathTrace {
@@ -499,6 +678,7 @@ impl DebugCollector {
             rules_evaluated: self.rules_evaluated,
             hit_rule: self.hit_rule,
             interaction: self.interaction,
+            disposition,
             result: ResultTrace {
                 rule_decision: decision_to_value(decision),
                 rendered_output: rendered_output.to_string(),
@@ -602,6 +782,103 @@ mod tests {
             default_path
                 .to_string_lossy()
                 .contains("ai-hook-debug-claude_code-")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_large_json_values_truncates_long_strings() {
+        let long_str = "A".repeat(1000);
+        let val = serde_json::json!({
+            "short": "hello",
+            "long": long_str,
+            "nested": {
+                "nested_long": "B".repeat(600)
+            }
+        });
+        let sanitized = sanitize_large_json_values(&val, 512);
+        assert_eq!(sanitized["short"], "hello");
+        assert!(
+            sanitized["long"]
+                .as_str()
+                .unwrap()
+                .contains("...[truncated, total 1000 chars]")
+        );
+        assert!(
+            sanitized["nested"]["nested_long"]
+                .as_str()
+                .unwrap()
+                .contains("...[truncated, total 600 chars]")
+        );
+    }
+
+    #[test]
+    fn test_disposition_trace_serialization_and_recording() {
+        let entry = DebugLogEntry {
+            time: "2026-09-07 18:00:00".to_string(),
+            date: "2026-09-07".to_string(),
+            timestamp: 1788770000000,
+            agent: "antigravity".to_string(),
+            r#type: "debug".to_string(),
+            pid: 12345,
+            version: "3.0.4".to_string(),
+            cli_args: vec!["ai-hook".to_string()],
+            raw_input: "test_input".to_string(),
+            parse_failed: false,
+            context: None,
+            fast_path: FastPathTrace::default(),
+            rules_evaluated: Vec::new(),
+            hit_rule: None,
+            interaction: None,
+            disposition: Some(DispositionTrace {
+                engine_action: "Confirm".to_string(),
+                final_effect: "Allowed".to_string(),
+                ask: Some(AskTrace {
+                    channel: "DesktopPopup".to_string(),
+                    trigger_reason: "GuiFallbackYolo".to_string(),
+                    protocol_op: Some("allow".to_string()),
+                    title: Some("安全授权".to_string()),
+                    reason: Some("测试敏感命令".to_string()),
+                    target: Some("rm -rf /".to_string()),
+                    action: Some("执行命令".to_string()),
+                    tool: Some("run_command".to_string()),
+                    prompt: Some("【ai-hook 安全确认】安全授权\n原因: 测试敏感命令\n操作: 执行命令 (run_command)\n目标: rm -rf /".to_string()),
+                    timeout_sec: Some(60),
+                }),
+                user: UserActionTrace {
+                    action: "Approved".to_string(),
+                    duration_ms: Some(1523.5),
+                    description: "用户在弹窗中确认允许执行".to_string(),
+                },
+                summary: "桌面置顶弹窗确认: 用户在 1524ms 内确认允许执行，操作已放行".to_string(),
+            }),
+            result: ResultTrace {
+                rule_decision: serde_json::json!({ "type": "Allow" }),
+                rendered_output: "{}".to_string(),
+                exit_code: 0,
+            },
+            timing_ms: TimingTrace::default(),
+        };
+
+        let json_str = serde_json::to_string(&entry).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["type"], "debug");
+        assert_eq!(parsed["disposition"]["engine_action"], "Confirm");
+        assert_eq!(parsed["disposition"]["final_effect"], "Allowed");
+        assert_eq!(parsed["disposition"]["ask"]["channel"], "DesktopPopup");
+        assert_eq!(
+            parsed["disposition"]["ask"]["trigger_reason"],
+            "GuiFallbackYolo"
+        );
+        assert_eq!(parsed["disposition"]["user"]["action"], "Approved");
+        assert_eq!(
+            parsed["disposition"]["user"]["description"],
+            "用户在弹窗中确认允许执行"
+        );
+        assert!(
+            parsed["disposition"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("操作已放行")
         );
     }
 }
