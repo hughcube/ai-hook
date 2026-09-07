@@ -3784,3 +3784,73 @@ fn test_install_binary_file_safety_rollback_on_broken_source() {
     // Clean up
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_cli_unrecognized_subcommand_error_reporting() {
+    let bin_path = env!("CARGO_BIN_EXE_ai-hook");
+    let out = Command::new(bin_path)
+        .arg("totally_nonexistent_command_xyz")
+        .output()
+        .expect("Failed to run ai-hook");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "Unrecognized command should exit with code 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("未识别的命令") || stderr.contains("unrecognized subcommand"),
+        "Stderr should clearly report unrecognized command: {stderr}"
+    );
+    assert!(
+        stderr.contains("totally_nonexistent_command_xyz"),
+        "Stderr should mention the exact unknown command name: {stderr}"
+    );
+    assert!(
+        stderr.contains("--help"),
+        "Stderr should advise user to run --help: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_unknown_arguments_are_safely_ignored() {
+    let bin_path = env!("CARGO_BIN_EXE_ai-hook");
+
+    // 1. Unknown options with -V/--version: unknown options are ignored and version succeeds
+    let out1 = Command::new(bin_path)
+        .args(["--some-unknown-flag", "--session-id=test1234", "-x", "-V"])
+        .output()
+        .expect("Failed to run with unknown arguments");
+    assert!(
+        out1.status.success(),
+        "Unknown flags should be safely ignored"
+    );
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    assert!(
+        stdout1.contains("ai-hook"),
+        "Version output expected: {stdout1}"
+    );
+
+    // 2. Unknown options inside a subcommand (e.g. version)
+    let out2 = Command::new(bin_path)
+        .args(["version", "--unknown-flag", "--foo=bar"])
+        .output()
+        .expect("Failed to run version with unknown arguments");
+    assert!(
+        out2.status.success(),
+        "Unknown flags in subcommand should be ignored"
+    );
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("ai-hook"),
+        "Version output expected: {stdout2}"
+    );
+
+    // 3. Subcommand aliases: help, version
+    let out_help = Command::new(bin_path)
+        .arg("help")
+        .output()
+        .expect("Failed to run help subcommand");
+    assert!(out_help.status.success(), "'ai-hook help' should succeed");
+}

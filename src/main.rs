@@ -270,27 +270,177 @@ fn get_binary_info_help() -> String {
 
 /// Subcommand names defined by the derive macro. When the first positional
 /// argument is one of these, argument handling belongs to clap.
-const SUBCOMMANDS: [&str; 9] = [
-    "list", "test", "bench", "install", "update", "tutorial", "guide", "clean", "prune",
+const SUBCOMMANDS: [&str; 13] = [
+    "list", "ls", "test", "bench", "install", "update", "upgrade", "tutorial", "guide", "clean",
+    "prune", "version", "help",
 ];
 
+/// Returns true if the token is a recognized subcommand name or alias.
+fn is_valid_subcommand(name: &str) -> bool {
+    SUBCOMMANDS.contains(&name)
+}
+
+/// Returns true if the token looks like a script file or filesystem path.
+fn is_likely_script_or_path(s: &str) -> bool {
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+    if std::path::Path::new(s).exists() {
+        return true;
+    }
+    let lower = s.to_lowercase();
+    lower.ends_with(".js")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".cjs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".json")
+}
+
+/// Checks whether a flag name (e.g. "no-gui" or "t") is a recognized option
+/// for the given subcommand context, and whether it expects a separate value argument.
+fn is_known_flag(flag_name: &str, subcmd: Option<&str>) -> (bool, bool) {
+    // 1. Global flags
+    match flag_name {
+        "h" | "help" | "V" | "version" => return (true, false),
+        "no-gui" | "force-gui" | "force-popup" | "dry-run" | "allow-on-error" | "no-fast-path"
+        | "debug" => return (true, false),
+        "r" | "rule" | "timeout" => return (true, true),
+        _ => {}
+    }
+
+    // 2. Subcommand-specific flags
+    if let Some(cmd) = subcmd {
+        match cmd {
+            "install" => match flag_name {
+                "f" | "force" => return (true, false),
+                "t" | "target-dir" => return (true, true),
+                _ => {}
+            },
+            "update" | "upgrade" => match flag_name {
+                "f" | "force" => return (true, false),
+                "repo" => return (true, true),
+                _ => {}
+            },
+            "clean" | "prune" => match flag_name {
+                "n" | "max-files" => return (true, true),
+                "dry-run" => return (true, false),
+                _ => {}
+            },
+            "tutorial" | "guide" => match flag_name {
+                "l" | "lang" => return (true, true),
+                _ => {}
+            },
+            "test" => match flag_name {
+                "t" | "tool" | "f" | "file" | "p" | "platform" => return (true, true),
+                _ => {}
+            },
+            "bench" => match flag_name {
+                "i" | "iterations" | "c" | "command" | "p" | "platform" => return (true, true),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    (false, false)
+}
+
+/// Pre-processes arguments:
+/// 1. Intercepts unrecognized subcommands (positionals that are not commands and not scripts/paths)
+/// 2. Safely ignores unrecognized flags/options so they don't break agent callers or humans
+fn process_and_filter_args(args: &[OsString]) -> Result<Vec<OsString>, String> {
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut filtered = Vec::new();
+    let mut i = 0usize;
+    let mut current_subcmd: Option<String> = None;
+    let mut found_positional = false;
+
+    while i < args.len() {
+        let os_str = &args[i];
+        let arg = match os_str.to_str() {
+            Some(s) => s,
+            None => {
+                filtered.push(os_str.clone());
+                i += 1;
+                continue;
+            }
+        };
+
+        // Explicit delimiter '--': everything following is verbatim
+        if arg == "--" {
+            filtered.push(os_str.clone());
+            filtered.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+
+        if arg.starts_with('-') {
+            let (flag_name, has_inline) = if let Some(long) = arg.strip_prefix("--") {
+                let name = long.split_once('=').map(|(n, _)| n).unwrap_or(long);
+                (name, long.contains('='))
+            } else if let Some(short) = arg.strip_prefix('-') {
+                let name = short.split_once('=').map(|(n, _)| n).unwrap_or(short);
+                (name, short.contains('='))
+            } else {
+                (arg, false)
+            };
+
+            let (known, takes_val) = is_known_flag(flag_name, current_subcmd.as_deref());
+
+            if known {
+                filtered.push(os_str.clone());
+                if takes_val && !has_inline && i + 1 < args.len() {
+                    let next = &args[i + 1];
+                    filtered.push(next.clone());
+                    i += 1;
+                }
+            } else {
+                // Unrecognized flag: ignore it!
+                // If it doesn't have an inline '=' and next token looks like an argument value, skip that too.
+                if !has_inline && i + 1 < args.len() {
+                    let next_str = args[i + 1].to_str().unwrap_or("");
+                    if !next_str.starts_with('-')
+                        && !is_valid_subcommand(next_str)
+                        && !is_likely_script_or_path(next_str)
+                    {
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Positional argument
+        if !found_positional {
+            found_positional = true;
+            if is_valid_subcommand(arg) {
+                current_subcmd = Some(arg.to_string());
+                filtered.push(os_str.clone());
+            } else if is_likely_script_or_path(arg) {
+                filtered.push(os_str.clone());
+            } else {
+                // Unrecognized command!
+                return Err(arg.to_string());
+            }
+        } else {
+            filtered.push(os_str.clone());
+        }
+
+        i += 1;
+    }
+
+    Ok(filtered)
+}
+
 /// Hand-rolled parse of the argument shapes a hook configuration produces.
-///
-/// Constructing clap's `Command` — every subcommand plus every localized help
-/// string — measures ~0.2 ms, i.e. as much as a whole rule evaluation. Hosts
-/// only ever pass global flags and rule paths, so those are parsed here in
-/// nanoseconds. Anything not recognized returns `None` and the caller falls
-/// back to clap, which keeps the derive definitions authoritative; there is
-/// no second, divergent grammar to keep in sync.
-///
-/// Mirrors clap's `trailing_var_arg` on `scripts`: the first positional and
-/// everything after it is a script path, even when it looks like a flag.
 fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
     let mut cli = Cli::default();
     let mut i = 0usize;
 
     while i < args.len() {
-        // Non-UTF-8 is legal on Unix; let clap report it properly.
         let arg = args[i].to_str()?;
 
         // 1. Explicit end of options: everything after is a script path.
@@ -305,8 +455,6 @@ fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
                 Some((n, v)) => (n, Some(v)),
                 None => (long, None),
             };
-            // Inline values on boolean flags are not valid clap syntax;
-            // letting them reach clap keeps the error message consistent.
             match name {
                 "no-gui" if inline.is_none() => cli.no_gui = true,
                 "force-gui" | "force-popup" if inline.is_none() => cli.force_gui = true,
@@ -340,8 +488,7 @@ fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
             continue;
         }
 
-        // 3. Short flag. Only `-r` takes a value and every other global flag
-        //    is long-only, so no clustering needs to be supported.
+        // 3. Short flag.
         if arg.len() > 1 && arg.starts_with('-') {
             let (name, inline) = match arg[1..].split_once('=') {
                 Some((n, v)) => (n, Some(v)),
@@ -359,8 +506,7 @@ fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
             continue;
         }
 
-        // 4. First positional. A subcommand belongs to clap; anything else is
-        //    a script path, and so is everything after it (trailing var-arg).
+        // 4. First positional. A subcommand belongs to clap; anything else is a script path.
         if SUBCOMMANDS.contains(&arg) {
             return None;
         }
@@ -374,56 +520,68 @@ fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
 fn parse_args() -> Cli {
     let mut raw_args = std::env::args_os();
     let bin = raw_args.next();
-    let first = raw_args.next();
+    let rest: Vec<OsString> = raw_args.collect();
 
-    match first {
-        None => {
-            // 没有任何参数 (最常见的 Agent Hook 调用场景)，零 Clap 构建，零帮助文本堆分配
-            Cli::default()
+    if rest.is_empty() {
+        return Cli::default();
+    }
+
+    // 1. Process and filter args: catch unrecognized subcommands & ignore unknown options
+    let filtered_args = match process_and_filter_args(&rest) {
+        Ok(args) => args,
+        Err(unrecognized) => {
+            if ai_hook::i18n::lang().is_zh() {
+                errln!(
+                    "[ai-hook] 错误: 未识别的命令 '{}'。请执行 'ai-hook --help' 查看可用命令。",
+                    unrecognized
+                );
+            } else {
+                errln!(
+                    "[ai-hook] error: unrecognized subcommand '{}'. Run 'ai-hook --help' for usage.",
+                    unrecognized
+                );
+            }
+            std::process::exit(2);
         }
-        Some(first_arg) => {
-            let mut rest: Vec<OsString> = vec![first_arg];
-            rest.extend(raw_args);
+    };
 
-            // 检查是否需要帮助或版本信息
-            let wants_help_or_version = rest.iter().any(|a| {
-                let s = a.to_string_lossy();
-                s == "-h" || s == "--help" || s == "-V" || s == "--version"
-            });
+    // 2. Check help / version
+    let wants_help_or_version = filtered_args.iter().any(|a| {
+        let s = a.to_string_lossy();
+        s == "-h" || s == "--help" || s == "-V" || s == "--version"
+    });
 
-            if wants_help_or_version {
-                let help_info = get_binary_info_help();
-                let cmd = localized_command()
-                    .after_help(help_info.clone())
-                    .after_long_help(help_info);
-                let all: Vec<OsString> = std::iter::once(bin.unwrap_or_default())
-                    .chain(rest.iter().cloned())
-                    .collect();
-                let matches = cmd.get_matches_from(&all);
-                return Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-            }
+    if wants_help_or_version {
+        let help_info = get_binary_info_help();
+        let cmd = localized_command()
+            .after_help(help_info.clone())
+            .after_long_help(help_info);
+        let all: Vec<OsString> = std::iter::once(bin.unwrap_or_default())
+            .chain(filtered_args.iter().cloned())
+            .collect();
+        let matches = cmd.get_matches_from(&all);
+        return Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    }
 
-            // 快速路径：宿主实际会产生的参数形态，不构造 clap
-            if let Some(cli) = parse_simple_args(&rest) {
-                return cli;
-            }
+    // 3. Fast path: simple hook flags and scripts
+    if let Some(cli) = parse_simple_args(&filtered_args) {
+        return cli;
+    }
 
-            // 回退 clap：子命令、未知 flag、解析错误
-            let all_args: Vec<OsString> = std::iter::once(bin.unwrap_or_default())
-                .chain(rest)
-                .collect();
-            use clap::Parser;
-            match Cli::try_parse_from(&all_args) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    let help_info = get_binary_info_help();
-                    let cmd = localized_command()
-                        .after_help(help_info.clone())
-                        .after_long_help(help_info);
-                    let _ = cmd.get_matches_from(&all_args);
-                    e.exit();
-                }
-            }
+    // 4. Clap fallback: subcommands and complex arguments
+    let all_args: Vec<OsString> = std::iter::once(bin.unwrap_or_default())
+        .chain(filtered_args)
+        .collect();
+    use clap::Parser;
+    match Cli::try_parse_from(&all_args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let help_info = get_binary_info_help();
+            let cmd = localized_command()
+                .after_help(help_info.clone())
+                .after_long_help(help_info);
+            let _ = cmd.get_matches_from(&all_args);
+            e.exit();
         }
     }
 }
@@ -481,6 +639,9 @@ fn main() {
             ai_hook::tutorial::print_tutorial(&resolved);
         }
         Some(Commands::Clean { max_files, dry_run }) => handle_clean(max_files, dry_run),
+        Some(Commands::Version) => {
+            outln!("ai-hook {}", env!("CARGO_PKG_VERSION"));
+        }
         None => handle_dispatch(&args),
     }
 }

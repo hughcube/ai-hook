@@ -60,6 +60,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// List specified or configured security rule scripts
+    #[command(alias = "ls")]
     List {
         /// Explicit rule scripts to inspect
         #[arg(trailing_var_arg = true)]
@@ -119,6 +120,7 @@ pub enum Commands {
     },
 
     /// Update ai-hook to the latest release from GitHub
+    #[command(alias = "upgrade")]
     Update {
         /// Force re-installation even if already at latest version
         #[arg(short, long)]
@@ -149,6 +151,9 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Display version information
+    Version,
 }
 
 /// Registers a localized `-h/--help` flag on `cmd`. Every command and
@@ -198,6 +203,7 @@ pub fn localized_command() -> Command {
         ($cmd:expr, $name:literal, $about:ident, [$(($id:literal, $msg:ident)),* $(,)?]) => {{
             let mut c = $cmd;
             c = c.mut_subcommand($name, |sub| {
+                #[allow(unused_mut)]
                 let mut s = sub.about(t(Msg::$about));
                 $( s = s.mut_arg($id, |a| a.help(t(Msg::$msg))); )*
                 with_localized_help_flag(s)
@@ -254,6 +260,6 @@ pub fn localized_command() -> Command {
         [("target_dir", M128), ("force", M130)]
     );
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
-    let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
-    sub_help!(cmd, "clean", M162, [("max_files", M163), ("dry_run", M164)])
+    let cmd = sub_help!(cmd, "clean", M162, [("max_files", M163), ("dry_run", M164)]);
+    sub_help!(cmd, "version", M115, [])
 }
