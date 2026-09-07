@@ -647,48 +647,139 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
 
     outln!("{}...", t(Msg::M047));
 
-    // Replace the running binary with a rollback guard: back up the current
-    // executable (same directory, `.bak`) before handing over to
-    // `self_replace`. On Windows the crate makes room by renaming the running
-    // exe away first; if that rename lands but the new binary does not, the
-    // installed command silently vanishes (`ai-hook: command not found`) and
-    // every hook call starts failing. Restoring the backup on error keeps the
-    // command available no matter where the swap is interrupted.
-    let current_exe = std::env::current_exe().ok();
-    let backup_path = current_exe.as_ref().map(|p| {
-        let mut name = p.as_os_str().to_os_string();
-        name.push(".bak");
-        PathBuf::from(name)
-    });
-    let mut backed_up = false;
-    if let (Some(cur), Some(bak)) = (&current_exe, &backup_path) {
-        let _ = std::fs::remove_file(bak);
-        if std::fs::copy(cur, bak).is_ok() {
-            backed_up = true;
+    let installed_exe = match apply_self_replace(&temp_bin_path) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_bin_path);
+            return Err(e);
         }
-    }
-
-    self_replace::self_replace(&temp_bin_path).map_err(|e| {
-        // Roll the previous binary back so the hook command never disappears.
-        if backed_up && let (Some(cur), Some(bak)) = (&current_exe, &backup_path) {
-            let _ = std::fs::remove_file(cur);
-            let _ = std::fs::copy(bak, cur);
-        }
-        let _ = std::fs::remove_file(&temp_bin_path);
-        tf(Msg::M048, &[&e])
-    })?;
-
+    };
     let _ = std::fs::remove_file(&temp_bin_path);
-    if backed_up && let Some(bak) = &backup_path {
-        let _ = std::fs::remove_file(bak);
-    }
 
-    let current_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "ai-hook".to_string());
-
+    let current_exe_str = installed_exe.to_string_lossy().to_string();
     outln!("✨ {} {}!", t(Msg::M049), tag_name);
-    outln!("   {}: {}", t(Msg::M050), current_exe);
+    outln!("   {}: {}", t(Msg::M050), current_exe_str);
 
     Ok(())
+}
+
+/// Cleans up any leftover temporary files or rotated binaries from previous updates.
+pub fn clean_old_temp_files(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                if file_name.starts_with("ai-hook")
+                    && (file_name.contains(".old")
+                        || file_name.contains(".bak")
+                        || file_name.contains(".tmp")
+                        || file_name.contains(".new"))
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
+/// Atomically replaces the currently running executable with the newly downloaded binary.
+///
+/// On Windows:
+/// 1. Stages the file in the target directory (same volume guarantees atomic metadata rename);
+/// 2. Renames the running binary to `.old-<nonce>.tmp` (supported by Windows NT for executing images);
+/// 3. Renames the staged binary into the official destination slot;
+/// 4. Rolls back on error;
+/// 5. Attempts to unlink the old binary (deferred cleanup if file lock persists).
+///
+/// On Unix:
+/// Standard copy-and-rename atomic overwrite.
+fn apply_self_replace(new_binary_path: &Path) -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("无法确定当前正在运行的可执行文件路径: {}", e))?;
+
+    let parent_dir = current_exe
+        .parent()
+        .ok_or_else(|| "无法确定当前可执行文件所在目录".to_string())?;
+
+    clean_old_temp_files(parent_dir);
+
+    #[cfg(windows)]
+    {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("ai-hook.exe");
+
+        let staging_path = parent_dir.join(format!("{}.new-{}.tmp", exe_name, nonce));
+        let old_exe_path = parent_dir.join(format!("{}.old-{}.tmp", exe_name, nonce));
+
+        // 1. Stage in the SAME directory
+        std::fs::copy(new_binary_path, &staging_path).map_err(|e| {
+            format!(
+                "无法将下载的新版本复制到安装目录 '{}' 进行暂存: {}",
+                staging_path.display(),
+                e
+            )
+        })?;
+
+        // 2. Rename running binary away
+        if let Err(e) = std::fs::rename(&current_exe, &old_exe_path) {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(format!(
+                "重命名当前正在运行的二进制文件失败 (可能正被其他进程独占占用): {}",
+                e
+            ));
+        }
+
+        // 3. Move staged binary into official slot
+        if let Err(e) = std::fs::rename(&staging_path, &current_exe) {
+            // Roll back
+            let _ = std::fs::rename(&old_exe_path, &current_exe);
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(format!("就位新版本失败，已安全回滚至原版本: {}", e));
+        }
+
+        // 4. Best-effort delete of the rotated old executable.
+        let _ = std::fs::remove_file(&old_exe_path);
+
+        Ok(current_exe)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("ai-hook");
+
+        let staging_path = parent_dir.join(format!(".{}.new-{}.tmp", exe_name, nonce));
+
+        std::fs::copy(new_binary_path, &staging_path).map_err(|e| {
+            format!(
+                "无法暂存新版本到 '{}': {}",
+                staging_path.display(),
+                e
+            )
+        })?;
+
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o755));
+
+        if let Err(e) = std::fs::rename(&staging_path, &current_exe) {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(format!("替换可执行文件失败: {}", e));
+        }
+
+        Ok(current_exe)
+    }
 }

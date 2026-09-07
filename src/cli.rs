@@ -11,7 +11,8 @@ use std::path::PathBuf;
     // regular args, so `mut_arg` cannot touch them; we disable them and
     // register our own localized copies in `localized_command()`.
     disable_help_flag = true,
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -164,6 +165,14 @@ pub enum Commands {
 
     /// Display version information
     Version,
+
+    /// Print this message or the help of the given subcommand(s)
+    #[command(alias = "h")]
+    Help {
+        /// The subcommand whose help should be displayed
+        #[arg()]
+        subcommand: Option<String>,
+    },
 }
 
 /// Registers a localized `-h/--help` flag on `cmd`. Every command and
@@ -197,7 +206,14 @@ fn with_localized_version_flag(cmd: Command) -> Command {
 /// every other user-visible help string (about, command/argument/flag
 /// descriptions, -h/-V rows) is localized at runtime via `t(Msg)`.
 pub fn localized_command() -> Command {
-    let cmd = Cli::command().about(t(Msg::M105)).long_about(t(Msg::M106));
+    let version_str = env!("CARGO_PKG_VERSION");
+    let about_text = format!("ai-hook {} - {}", version_str, t(Msg::M105));
+    let long_about_text = format!("ai-hook {} - {}", version_str, t(Msg::M106));
+
+    let cmd = Cli::command()
+        .version(version_str)
+        .about(about_text)
+        .long_about(long_about_text);
 
     // Overwrite the help text of top-level arguments by their clap arg id.
     macro_rules! args_help {
@@ -249,6 +265,8 @@ pub fn localized_command() -> Command {
             ("tool", M120),
             ("file", M121),
             ("platform", M155),
+            ("event", M165),
+            ("prompt", M166),
             ("scripts", M122),
         ]
     );
@@ -270,6 +288,8 @@ pub fn localized_command() -> Command {
         [("target_dir", M128), ("force", M130)]
     );
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
+    let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
     let cmd = sub_help!(cmd, "clean", M162, [("max_files", M163), ("dry_run", M164)]);
-    sub_help!(cmd, "version", M115, [])
+    let cmd = sub_help!(cmd, "version", M115, []);
+    sub_help!(cmd, "help", M167, [("subcommand", M167)])
 }

@@ -261,10 +261,13 @@ fn get_binary_info_help() -> String {
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| ".".to_string());
+    let l = ai_hook::i18n::lang();
 
     format!(
-        "{}\n  {}: {}\n  {}: {}",
-        t(Msg::M051),
+        "{}\n  {}: v{}\n  {}: {}\n  {}: {}",
+        l.pick("二进制信息", "Binary Information"),
+        l.pick("版本", "Version"),
+        env!("CARGO_PKG_VERSION"),
         t(Msg::M052),
         current_exe.display(),
         t(Msg::M053),
@@ -597,6 +600,11 @@ fn main() {
     // any output happens when the GUI-subsystem binary lacks handles.
     #[cfg(windows)]
     attach_parent_console();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            ai_hook::update::clean_old_temp_files(parent);
+        }
+    }
     prof_init!();
     // First mark = the invisible prefix: PE mapping, DLL loading, relocations,
     // C + Rust runtime init. On Windows this is most of the hook's latency.
@@ -648,6 +656,20 @@ fn main() {
         Some(Commands::Clean { max_files, dry_run }) => handle_clean(max_files, dry_run),
         Some(Commands::Version) => {
             outln!("ai-hook {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some(Commands::Help { ref subcommand }) => {
+            let mut cmd = localized_command();
+            let help_info = get_binary_info_help();
+            cmd = cmd.after_help(help_info.clone()).after_long_help(help_info);
+            if let Some(sub) = subcommand {
+                if let Some(subcmd) = cmd.find_subcommand_mut(sub) {
+                    let _ = subcmd.print_help();
+                    outln!();
+                    return;
+                }
+            }
+            let _ = cmd.print_help();
+            outln!();
         }
         None => handle_dispatch(&args),
     }

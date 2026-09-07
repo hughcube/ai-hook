@@ -326,6 +326,12 @@ pub enum Msg {
     M163,
     /// CLI help text for clean --dry-run.
     M164,
+    /// CLI help text for test --event.
+    M165,
+    /// CLI help text for test --prompt.
+    M166,
+    /// Subcommand help description.
+    M167,
     /// Dialog allow-button word.
     AllowWord,
     /// Dialog deny-button word.
@@ -1124,6 +1130,20 @@ impl Msg {
             Msg::M164 => match l {
                 Lang::Zh => "仅预览拟清理的文件而不实际执行删除",
                 Lang::En => "Preview files to be cleaned without deleting them",
+            },
+            Msg::M165 => match l {
+                Lang::Zh => "模拟的生命周期事件名(默认: PreToolUse)",
+                Lang::En => "Simulated lifecycle event name (default: PreToolUse)",
+            },
+            Msg::M166 => match l {
+                Lang::Zh => "用户输入的提示词内容(仅在 event 为 UserPromptSubmit/BeforeAgent 时有效)",
+                Lang::En => {
+                    "User prompt text (only evaluated when event is UserPromptSubmit/BeforeAgent)"
+                }
+            },
+            Msg::M167 => match l {
+                Lang::Zh => "打印帮助信息或指定子命令的帮助信息",
+                Lang::En => "Print this message or the help of the given subcommand(s)",
             },
             Msg::AllowWord => match l {
                 Lang::Zh => "允许",
