@@ -4787,7 +4787,10 @@ fn sys_fs_and_env_tolerate_null_without_failing_closed() {
             // Rust 侧的 None 落到 JS 是 undefined,用宽松比较覆盖 null/undefined
             if (sys.fs.readText(ctx.file && ctx.file.path) != null) return { deny: "should be null" };
             if (sys.env("AI_HOOK_DEFINITELY_UNSET_VAR") != null) return { deny: "env should be null" };
-            if (sys.fs.list(undefined).length === 0) return { deny: "list should default to cwd" };
+            // 断言"返回数组"而非"非空":cwd 的内容随环境而异
+            // (macOS CI 的 /tmp 就是空的),不能依赖目录非空。
+            if (!Array.isArray(sys.fs.list(undefined))) return { deny: "list should default to cwd" };
+            if (!Array.isArray(sys.fs.list(null))) return { deny: "list(null) should default to cwd" };
             return { allow: true };
         }"#,
     );
