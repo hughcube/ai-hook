@@ -146,11 +146,22 @@ fn chinese_tutorial_body() -> String {
   return { deny: "…" };          → 硬拒绝,绝对不弹窗
   return { keepGoing: "…" };     → Stop 类事件:让宿主继续执行(附原因)。
                                    ⚠️ Stop 类事件上写 deny 的语义随宿主而异:
-                                   claude_code 恰好也输出 decision:block(=继续),
+                                   claude_code / codebuddy / workbuddy / codex
+                                   恰好都输出 decision:block(=继续),
                                    antigravity 则输出 decision:deny
                                    (官方:非 continue 一律允许停止);
                                    要"别停下"必须用 keepGoing。
-  return { inject: "…" };        → 向宿主注入上下文规范提示(PostToolUse 提示注入)
+                                   注:codebuddy 官方 hooks.md 写的是
+                                   continue:false,但其实现要求 blocking=true,
+                                   只有 decision:block 能满足 —— ai-hook 按
+                                   实现输出。
+  return { inject: "…" };        → 向宿主注入上下文规范提示(模型可见:
+                                   additionalContext / injectSteps)。
+                                   ⚠️ 该事件没有模型上下文通道时(如 Gemini 的
+                                   SessionEnd / PreCompress,官方明确忽略流程控制
+                                   字段),文本会降级为**只给用户看**的 systemMessage
+                                   并在 stderr 提示,不会进入模型上下文;连
+                                   systemMessage 都没有的宿主则整体丢弃。
   return { mutateInput: {...} };             → 改写工具参数(PreToolUse)。
                                    仅 PreToolUse 类 gate 事件可用;宿主/事件无改写
                                    通道时(如在 PostToolUse 或不支持改参的事件上)由引擎
@@ -200,10 +211,24 @@ fn chinese_tutorial_body() -> String {
   workbuddy      ✓ ask(终端)         ✓ ask(同上)          同上
   gemini         ✗ 协议无 ask        ✗                    顶层 {decision, reason}
   antigravity    ✓ force_ask         ✗(bypass 不弹,走 GUI) 顶层 {decision, reason}
+  opencode       ✗ 桥未实现 ask      ✗                    见下方 opencode 专节
   generic        ✗ 无 ask 协议       ✗                    hookSpecificOutput 形态(尽力)
   confirm 通道选择(gui 三态 × can_ask):
   · 缺省(不配置):can_ask 宿主直接走协议 ask;不能 ask 的宿主 GUI 可用则
     弹窗兜底,不可用(CI/--no-gui/测试)自动拒绝;
+
+  ── opencode(桥)专节:能力比其它宿主窄很多 ─────────────────────
+  opencode 没有进程外 hook 协议,ai-hook 经社区桥 opencode-claude-hooks 接入
+  (桥会设 OPENCODE_COMPAT=1 以便识别)。按桥的实现(src/executor.ts 只认
+  exitCode === 2;src/index.ts 的 tool.execute.before 只判 result.blocked,
+  permission.ask 只读 permissionDecision),实际可用通道只有:
+    · PreToolUse 阻断 → ai-hook 用**退出码 2** 表达,原因写 stderr
+      (桥:blockReason = output.stopReason ?? stderr);
+    · PreToolUse 改参 → hookSpecificOutput.updatedInput;
+    · PermissionRequest → permissionDecision: allow/deny(不是 decision.behavior)。
+  桥未接线 Stop / UserPromptSubmit,且丢弃 tool.execute.after 的全部输出,
+  故这些事件在 opencode 上不可决策(能力矩阵为 NONE),ask 亦不可用 ——
+  规则写 confirm 时会降级为 GUI 弹窗或 fail-closed 拒绝,不会静默放行。
   · gui:true / forceGui:true:全宿主强制弹窗(穿透 --no-gui);
   · gui:false:can_ask 宿主走 ask;不能 ask 宿主直接拒绝(禁弹窗 fail-closed)。
 
@@ -449,12 +474,26 @@ IV. Decision protocol (rule return values)
   return { keepGoing: "…" };     → on Stop-like events: tell the host to keep
                                    going (with reason). ⚠️ A `deny` on Stop-like
                                    events means different things per host:
-                                   claude_code happens to emit decision:block
+                                   claude_code / codebuddy / workbuddy / codex
+                                   all happen to emit decision:block
                                    (= keep going), while antigravity emits
                                    decision:deny (official: any value other
                                    than "continue" allows the stop). To prevent
                                    stopping you must use keepGoing.
-  return { inject: "…" };        → inject guidance context to host (PostToolUse)
+                                   Note: codebuddy's hooks.md says
+                                   `continue: false`, but its implementation
+                                   requires `blocking === true`, which only
+                                   `decision: "block"` produces — ai-hook
+                                   follows the implementation.
+  return { inject: "…" };        → inject guidance context the model will see
+                                   (additionalContext / injectSteps).
+                                   ⚠️ When the event has no model-context
+                                   channel (Gemini's SessionEnd / PreCompress:
+                                   the docs say flow-control fields are
+                                   ignored), the text is downgraded to a
+                                   **user-only** systemMessage and stderr says
+                                   so; on a host without even that, it is
+                                   dropped.
   return { mutateInput: {...} };             → rewrite tool arguments
                                    (PreToolUse). Only gate events expose a
                                    rewrite channel; when the host/event has
@@ -519,11 +558,29 @@ V. Host decision matrix (can_ask × mode; output is mapped automatically)
   gemini         ✗ no ask in protocol ✗                      top-level {decision, reason}
   antigravity    ✓ force_ask        ✗ (bypass: no prompt,
                                     GUI fallback)          top-level {decision, reason}
+  opencode       ✗ bridge has no ask ✗                       see the opencode section below
   generic        ✗ no ask protocol ✗                         hookSpecificOutput shape
   Confirm channel selection (gui tri-state × can_ask):
   · unset: can-ask hosts get the protocol ask directly; hosts that cannot
     ask fall back to the GUI dialog when available, or auto-deny when it is
     not (CI / --no-gui / tests);
+
+  ── opencode (bridge): a much narrower surface ─────────────────
+  opencode has no out-of-process hook protocol; ai-hook reaches it through the
+  community bridge `opencode-claude-hooks` (it sets `OPENCODE_COMPAT=1` so the
+  payload can be recognised). Per the bridge implementation (`src/executor.ts`
+  only treats `exitCode === 2` as a block; `src/index.ts` checks just
+  `result.blocked` in `tool.execute.before` and reads only `permissionDecision`
+  in `permission.ask`), the channels that actually work are:
+    · PreToolUse deny → ai-hook exits **2** with the reason on stderr
+      (the bridge uses `output.stopReason ?? stderr` as the block reason);
+    · PreToolUse rewrite → `hookSpecificOutput.updatedInput`;
+    · PermissionRequest → `permissionDecision: allow/deny`
+      (not `decision.behavior`).
+  The bridge wires neither `Stop` nor `UserPromptSubmit` and discards
+  everything a `tool.execute.after` hook returns, so those events carry no
+  capability on opencode and `ask` is unavailable — a `confirm` degrades to the
+  GUI dialog or a fail-closed deny, never a silent allow.
   · gui:true / forceGui:true: force the dialog on every host (pierces --no-gui);
   · gui:false: can-ask hosts get ask; hosts that cannot ask are denied
     (no dialog, fail-closed).

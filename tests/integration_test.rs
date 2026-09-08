@@ -1279,8 +1279,13 @@ fn test_cli_unparsable_payload_asks_not_silently_allows() {
         !stdout.trim().is_empty(),
         "unparsable payload must never produce empty (allow) output"
     );
+    // 未建模事件上不存在协议 ask,能力矩阵把 Confirm 降级为 Deny;
+    // 宿主最终看到的是 deny / block / block-behavior 之一,绝不是放行。
     assert!(
-        stdout.contains("\"ask\"") || stdout.contains("\"deny\""),
+        stdout.contains("\"ask\"")
+            || stdout.contains("\"deny\"")
+            || stdout.contains("\"block\"")
+            || stdout.contains("\"behavior\""),
         "unparsable payload must ask or deny: {stdout}"
     );
 }
@@ -1851,10 +1856,19 @@ fn gemini_before_tool_has_no_inject_channel() {
         ..Mutation::default()
     })
     .to_json_output(&ctx, None);
-    // Gemini 工具事件上降级后是显式 allow(不是空串);关键是既不能塞
-    // additionalContext(该事件未文档化),也不能拿 systemMessage 顶替
-    // (它是给用户看的终端消息,规则作者会误以为模型收到了)。
-    assert_eq!(out, r#"{"decision":"allow"}"#, "got: {out}");
+    // 该事件官方 Output Fields 没有 additionalContext,塞进去会被忽略 ——
+    // 所以不能伪造模型上下文。唯一真实存在的文本通道是
+    // `systemMessage`(官方:"Displayed immediately to the user in the
+    // terminal"),引擎降级到它并在 stderr 明确提示"不会进入模型上下文",
+    // 让信息至少到达人,而不是被静默吞掉。
+    assert!(
+        out.contains(r#""systemMessage":"注意当前是生产库""#),
+        "got: {out}"
+    );
+    assert!(
+        !out.contains("additionalContext"),
+        "BeforeTool 未文档化 additionalContext,不得输出: {out}"
+    );
 }
 
 #[test]
@@ -1929,8 +1943,8 @@ fn antigravity_invocation_events_have_no_flow_channel() {
     assert_eq!(ctx.event_kind(), HookEvent::PreInvocation);
     // flow=false → keepGoing 降级为 allow(空操作),不输出宿主不支持的字段。
     let caps = ai_hook::protocol::capabilities(Platform::Antigravity, HookEvent::PreInvocation);
-    assert!(caps.inject);
-    assert!(!caps.control_flow);
+    assert!(caps.can_inject());
+    assert!(!caps.can_flow());
     let out = HookDecision::KeepGoing {
         reason: "continue the loop".into(),
     }
@@ -1939,7 +1953,7 @@ fn antigravity_invocation_events_have_no_flow_channel() {
 
     // 对照:AGY Stop 拥有唯一的 flow 通道。
     let stop_caps = ai_hook::protocol::capabilities(Platform::Antigravity, HookEvent::Stop);
-    assert!(stop_caps.control_flow);
+    assert!(stop_caps.can_flow());
 }
 
 /// Gemini 没有 Stop 事件；AfterAgent 的 `decision:"deny"` 会拒绝响应并强制重试，
@@ -2572,9 +2586,14 @@ fn codebuddy_stop_and_prompt_block_use_continue_false() {
         reason: "keep working".into(),
     }
     .to_json_output(&cb_stop, None);
-    assert!(
-        out.contains(r#""continue":false"#),
-        "CB Stop keepGoing 必须是 continue:false: {out}"
+    // 官方 hooks.md 写的是 `continue: false`,但随包实现要求 blocking=true
+    // (`SessionHookManager.executeStopHooks`: `!allowed && message && blocking`),
+    // 而 `parseHookOutput` 只对 `decision:"block"` / permissionDecision deny /
+    // 退出码 2 置 blocking —— `continue:false` 只是空操作,宿主照常停止。
+    // 所以"继续"必须用 decision:"block"。
+    assert_eq!(
+        out, r#"{"decision":"block","reason":"keep working"}"#,
+        "CB Stop keepGoing 必须是 decision:block: {out}"
     );
 
     let cb_ups = HookContext::parse(
@@ -2621,9 +2640,10 @@ fn codebuddy_stop_and_prompt_block_use_continue_false() {
         "CC UPS 阻断仍是顶层 decision:block: {out}"
     );
 
-    // 此前漏测的一条:CB/WB 的 **Stop + Deny** 也曾落到通用分支输出
-    // `decision:"block"`,而该字段在 CodeBuddy 官方已标注废弃
-    // ("请使用 `continue: false`")。补上断言防止回归。
+    // CB/WB 的 **Stop + Deny**:官方 hooks.md 说 `decision:"block"` 已废弃、
+    // 请用 `continue: false`,但按随包实现那会让"继续"变成空操作(见上面的
+    // keepGoing 断言)。Stop 上 deny 与 keepGoing 本就同形,统一输出
+    // `decision:"block"` —— 唯一能让宿主真的不停下来的形状。补上断言防回归。
     unsafe {
         std::env::set_var("CODEBUDDY_HOST", "cli");
     }
@@ -2641,12 +2661,13 @@ fn codebuddy_stop_and_prompt_block_use_continue_false() {
     }
     .to_json_output(&cb_stop_deny, None);
     assert!(
-        out.contains(r#""continue":false"#),
-        "CB/WB Stop 上的阻断必须是 continue:false(decision:block 已废弃): {out}"
+        out.contains(r#""decision":"block""#),
+        "CB/WB Stop 上的阻断必须是 decision:block(continue:false 在实现里是空操作): {out}"
     );
 
-    // PreCompact 同理:官方只记载退出码 2 阻止压缩,JSON 侧用通用的
-    // `continue: false`,而不是废弃的 decision:block。
+    // PreCompact 不同:官方只记载退出码 2 阻止压缩,而 `continue: false` 是
+    // CodeBuddy 通用的阻断形态(`parseHookOutput` 据此置 allowed=false,
+    // 压缩流程随之中止),故这里用 continue:false。
     let cb_precompact = HookContext::parse(
         &serde_json::json!({
             "hook_event_name":"PreCompact",
@@ -2863,7 +2884,7 @@ fn setup_event_has_no_inject_channel_and_degrades_to_allow() {
         assert_eq!(ctx.event_enum, HookEvent::Setup);
         let caps = ai_hook::protocol::capabilities(ctx.platform, HookEvent::Setup);
         assert!(
-            !caps.inject && !caps.gate,
+            !caps.can_inject() && !caps.gate,
             "Setup 不得开放任何能力: {ctx:?} caps={caps:?}"
         );
 
@@ -3120,7 +3141,7 @@ fn stop_keepgoing_never_emits_continue_false_for_claude_code() {
 fn antigravity_mutate_input_is_dropped() {
     let caps = ai_hook::protocol::capabilities(Platform::Antigravity, HookEvent::PreToolUse);
     assert!(
-        !caps.mutate_input,
+        !caps.can_mutate(),
         "AGY 官方输出字段表没有改参通道,能力矩阵不得开放 mutate_input"
     );
 
@@ -3139,6 +3160,7 @@ fn antigravity_mutate_input_is_dropped() {
 
     let decision = HookDecision::Modify(Mutation {
         inject: None,
+        notify: None,
         mutate_input: Some(serde_json::json!({ "CommandLine": "echo safe" })),
         replace_output: None,
     });
@@ -4650,4 +4672,207 @@ fn test_real_fixture_generic_empty_payload() {
     let raw = "";
     let ctx = HookContext::parse(raw);
     assert_eq!(ctx.platform, Platform::Generic);
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-08 取证修复的回归测试
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+/// Antigravity 的委托类工具(官方工具表里的 invoke_subagent 等)此前未建模,
+/// `ctx.agent` 恒为 null → 所有"禁止派发子 agent"的规则在该宿主上静默放行。
+#[test]
+fn antigravity_delegation_tools_normalize() {
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": { "Subagents": [ { "Prompt": "refactor the auth module", "Role": "coder" } ] }
+            },
+            "conversationId": "c1"
+        })
+        .to_string(),
+    );
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    let agent = ctx
+        .agent
+        .as_ref()
+        .expect("invoke_subagent 必须归一化到 ctx.agent");
+    assert_eq!(agent.kind, AgentKind::Agent);
+    assert_eq!(agent.prompt.as_deref(), Some("refactor the auth module"));
+
+    for tool in ["manage_task", "schedule"] {
+        let c = HookContext::parse(
+            &serde_json::json!({
+                "toolCall": { "name": tool, "args": { "Prompt": "run the tests hourly" } },
+                "conversationId": "c1"
+            })
+            .to_string(),
+        );
+        let a = c
+            .agent
+            .as_ref()
+            .unwrap_or_else(|| panic!("{tool} 必须归一化"));
+        assert_eq!(a.kind, AgentKind::Task, "{tool} 应是 Task 类");
+    }
+}
+
+/// Gemini CLI 的搜索工具用 `dir_path` 官方键、遗留名 `search_file_content`;
+/// Antigravity 的 `find_by_name` 用 `SearchDirectory` + `Pattern`。
+/// 缺这些键会让 `ctx.search.path` 在半数宿主上恒为 null。
+#[test]
+fn search_tools_read_host_specific_path_keys() {
+    // Gemini:glob / grep_search -> {pattern, dir_path}
+    let g = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "BeforeTool",
+            "tool_name": "glob",
+            "tool_input": { "pattern": "*.rs", "dir_path": "/srv/app" },
+            "session_id": "s1",
+            "cwd": "/tmp"
+        })
+        .to_string(),
+    );
+    let s = g.search.as_ref().expect("glob 必须归一化");
+    assert_eq!(s.kind, SearchKind::Glob);
+    assert_eq!(s.path.as_deref(), Some("/srv/app"));
+    assert_eq!(s.pattern.as_deref(), Some("*.rs"));
+
+    // Gemini 遗留别名
+    let legacy = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "BeforeTool",
+            "tool_name": "search_file_content",
+            "tool_input": { "pattern": "secret", "dir_path": "/srv" },
+            "session_id": "s1",
+            "cwd": "/tmp"
+        })
+        .to_string(),
+    );
+    let s = legacy
+        .search
+        .as_ref()
+        .expect("search_file_content 必须归一化");
+    assert_eq!(s.kind, SearchKind::Grep);
+    assert_eq!(s.path.as_deref(), Some("/srv"));
+
+    // Antigravity:find_by_name -> {SearchDirectory, Pattern}
+    let a = HookContext::parse(
+        &serde_json::json!({
+            "toolCall": {
+                "name": "find_by_name",
+                "args": { "SearchDirectory": "/srv", "Pattern": "*.ts" }
+            },
+            "conversationId": "c1"
+        })
+        .to_string(),
+    );
+    let s = a.search.as_ref().expect("find_by_name 必须归一化");
+    assert_eq!(s.kind, SearchKind::Glob);
+    assert_eq!(s.path.as_deref(), Some("/srv"));
+    assert_eq!(s.pattern.as_deref(), Some("*.ts"));
+}
+
+/// `sys.fs.*` / `sys.env` 的字符串参数此前是严格类型:规则里写
+/// `sys.fs.exists(ctx.file.path)` 而 path 为 null 会抛 TypeError,
+/// 整条规则 fail-closed 拒绝 —— 与 console.log 用的 Coerced 语义不一致。
+#[test]
+fn sys_fs_and_env_tolerate_null_without_failing_closed() {
+    let runner = RuleRunner::new().expect("runner");
+    let r = rule(
+        "null-safe-sys",
+        r#"export default function(ctx, sys) {
+            // Write 工具没有 file_path(只有 content)→ ctx.file.path 为 null
+            if (sys.fs.exists(ctx.file && ctx.file.path)) return { deny: "should not exist" };
+            // Rust 侧的 None 落到 JS 是 undefined,用宽松比较覆盖 null/undefined
+            if (sys.fs.readText(ctx.file && ctx.file.path) != null) return { deny: "should be null" };
+            if (sys.env("AI_HOOK_DEFINITELY_UNSET_VAR") != null) return { deny: "env should be null" };
+            if (sys.fs.list(undefined).length === 0) return { deny: "list should default to cwd" };
+            return { allow: true };
+        }"#,
+    );
+    let ctx = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": { "content": "x" },
+            "transcript_path": "/x/.claude/projects/s.jsonl",
+            "cwd": "/tmp"
+        })
+        .to_string(),
+    );
+    let res = runner.execute_rule(&r, &ctx);
+    assert!(res.error.is_none(), "规则不应抛异常: {:?}", res.error);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Allow),
+        "null 参数不应触发 fail-closed: {:?}",
+        res.decision
+    );
+}
+
+/// `git diff/log/show --ext-diff` / `--textconv` 会让 git 执行配置的外部
+/// 驱动 = 任意代码执行。白名单宣称"只放行单条只读命令",必须挡掉。
+#[test]
+fn fast_path_rejects_external_drivers() {
+    for cmd in [
+        "git diff --ext-diff",
+        "git log --textconv -p",
+        "git show --ext-diff HEAD",
+        "git diff --output=/tmp/x",
+    ] {
+        let ctx = ctx_for(cmd);
+        assert!(
+            check_fast_path(&ctx).is_none(),
+            "{cmd} 不得命中只读白名单旁路"
+        );
+    }
+    // 对照:普通只读命令仍然走旁路。
+    assert!(check_fast_path(&ctx_for("git status --short")).is_some());
+}
+
+/// Gemini CLI 的 base input schema 带 `timestamp`(官方 hooks/reference),
+/// 这是 Gemini 独有的公共字段。事件名速查覆盖不到 SessionStart /
+/// SessionEnd / Notification(与 Claude 家族同名),缺了这个信号它们会被
+/// 误判成 claude_code,从而用错能力矩阵。
+#[test]
+fn gemini_session_events_are_detected_by_timestamp() {
+    let g = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "reason": "other",
+            "session_id": "s1",
+            "cwd": "/tmp",
+            "timestamp": "2026-09-08T00:00:00Z"
+        })
+        .to_string(),
+    );
+    assert_eq!(g.platform, Platform::Gemini);
+    // Gemini 的 SessionEnd 只有 systemMessage(给用户),没有模型上下文通道。
+    let out = HookDecision::Modify(Mutation {
+        inject: Some("收尾提示".into()),
+        ..Mutation::default()
+    })
+    .to_json_output(&g, None);
+    assert!(out.contains(r#""systemMessage":"收尾提示""#), "got: {out}");
+    assert!(!out.contains("additionalContext"), "{out}");
+
+    // 没有 timestamp 的同名事件仍按 Claude 家族处理(那里连 systemMessage
+    // 都会被丢弃)。
+    let cc = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "reason": "other",
+            "session_id": "s1",
+            "cwd": "/tmp"
+        })
+        .to_string(),
+    );
+    assert_eq!(cc.platform, Platform::ClaudeCode);
+    let out = HookDecision::Modify(Mutation {
+        inject: Some("收尾提示".into()),
+        ..Mutation::default()
+    })
+    .to_json_output(&cc, None);
+    assert_eq!(out, "", "CC SessionEnd 没有任何文本通道: {out}");
 }

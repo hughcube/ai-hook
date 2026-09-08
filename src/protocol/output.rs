@@ -1,8 +1,9 @@
+use super::capability::{AskShape, DenyShape, FlowShape, InjectShape, MutateShape, ReplaceShape};
 use super::decision::{HookDecision, Mutation};
-use super::{Capabilities, HookContext, HookEvent, Platform, capabilities};
+use super::{Capabilities, HookContext, Platform, capabilities};
 use crate::errln;
 use crate::i18n::{Msg, t, tf};
-use serde_json::json;
+use serde_json::{Map, json};
 
 /// Derives a human-friendly action description from context.
 pub fn resolve_action_description(ctx: &HookContext) -> &'static str {
@@ -150,13 +151,48 @@ fn append_target(reason: &str, label: &str, target: &str) -> String {
 ///
 /// `HookDecision` (what the rule meant) is first normalized into an `Op` (what
 /// can actually be said to this host on this event, after the capability
-/// matrix downgraded anything unsupported). Only `render()` knows host JSON.
+/// matrix downgraded anything unsupported). `render()` then turns the `Op`
+/// into the shape the capability matrix declared for this (host, event) —
+/// there is no per-platform branch left in it.
 enum Op {
     Allow,
     Deny { reason: String },
     Ask { reason: String },
     KeepGoing { reason: String },
     Modify(Mutation),
+}
+
+/// The finished decision in the form the host consumes.
+///
+/// Almost every host reads a JSON object on stdout, but a host that does not
+/// parse hook JSON at all (the opencode bridge only looks at the exit code)
+/// needs the process to exit non-zero with the reason on stderr instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rendered {
+    /// JSON to write to stdout. An empty string means "no decision" = allow.
+    Json(String),
+    /// Write `reason` to stderr and exit with `code`; print nothing to stdout.
+    Exit { code: i32, reason: String },
+}
+
+impl Rendered {
+    /// The stdout payload (empty for the exit-code channel).
+    #[must_use]
+    pub fn json(&self) -> &str {
+        match self {
+            Self::Json(s) => s,
+            Self::Exit { .. } => "",
+        }
+    }
+
+    /// `Some` when the decision must be expressed through the exit code.
+    #[must_use]
+    pub fn exit(&self) -> Option<(i32, &str)> {
+        match self {
+            Self::Json(_) => None,
+            Self::Exit { code, reason } => Some((*code, reason)),
+        }
+    }
 }
 
 /// Guarantees a non-empty denial reason.
@@ -221,7 +257,7 @@ impl HookDecision {
                 None => {
                     // Two gates must pass: the protocol has an ask (matrix)
                     // and the host still prompts in this mode (can_ask).
-                    if caps.ask && ctx.can_ask() {
+                    if caps.can_ask() && ctx.can_ask() {
                         Op::Ask {
                             reason: format_ask_prompt(title.as_deref(), reason, ctx),
                         }
@@ -250,13 +286,28 @@ impl HookDecision {
                 }
                 // Only warn when a modifier the rule actually supplied is
                 // dropped — an already-empty slot is not a capability loss.
-                if m.inject.is_some() && !caps.inject {
-                    drop_modifier!("inject", &mut m.inject);
+                //
+                // `inject` is the one slot with a降级路径:宿主只有
+                // `systemMessage`(给用户)而没有模型上下文通道时,把文本
+                // 挪到 `notify`,规则至少还能把话说出去。
+                if m.inject.is_some() && !caps.can_inject() {
+                    if caps.notify_user && m.notify.is_none() {
+                        let text = m.inject.take().unwrap_or_default();
+                        let ev: &str = ctx.event_enum.as_str();
+                        let args: [&dyn std::fmt::Display; 1] = [&ev];
+                        errln!("[ai-hook] {}", tf(Msg::M169, &args));
+                        m.notify = Some(text);
+                    } else {
+                        drop_modifier!("inject", &mut m.inject);
+                    }
                 }
-                if m.mutate_input.is_some() && !caps.mutate_input {
+                if m.notify.is_some() && !caps.notify_user {
+                    drop_modifier!("notify", &mut m.notify);
+                }
+                if m.mutate_input.is_some() && !caps.can_mutate() {
                     drop_modifier!("mutateInput", &mut m.mutate_input);
                 }
-                if m.replace_output.is_some() && !caps.replace_output {
+                if m.replace_output.is_some() && !caps.can_replace() {
                     drop_modifier!("replaceOutput", &mut m.replace_output);
                 }
                 // A Modify whose modifiers were all dropped must read as a
@@ -271,7 +322,7 @@ impl HookDecision {
             }
 
             Self::KeepGoing { reason } => {
-                if caps.control_flow {
+                if caps.can_flow() {
                     Op::KeepGoing {
                         reason: reason.clone(),
                     }
@@ -287,7 +338,8 @@ impl HookDecision {
     /// `gui_approved` carries the outcome of ai-hook's own dialog:
     /// `Some(true)` = user allowed, `Some(false)` = user refused, `None` = no
     /// dialog was shown (the host should ask, or the decision stands as is).
-    pub fn to_json_output(&self, ctx: &HookContext, gui_approved: Option<bool>) -> String {
+    #[must_use]
+    pub fn render(&self, ctx: &HookContext, gui_approved: Option<bool>) -> Rendered {
         // Hosts validate `hookEventName` against the event they actually fired;
         // a hard-coded "PreToolUse" would make every decision on PostToolUse /
         // Stop / ... silently discarded while the rule looks like it works.
@@ -298,254 +350,247 @@ impl HookDecision {
 
         let caps = capabilities(ctx.platform, ctx.event_enum);
         let op = self.to_op(ctx, &caps, gui_approved);
-        render(ctx.platform, ctx.event_enum, op, event_name)
+        render(ctx.platform, op, event_name, &caps)
+    }
+
+    /// The stdout JSON of [`Self::render`] — an empty string means "no
+    /// decision" (allow) in every host protocol, and also covers hosts that
+    /// only understand exit codes.
+    #[must_use]
+    pub fn to_json_output(&self, ctx: &HookContext, gui_approved: Option<bool>) -> String {
+        self.render(ctx, gui_approved).json().to_string()
     }
 }
 
-fn render(platform: Platform, event: HookEvent, op: Op, event_name: &str) -> String {
-    match platform {
-        Platform::Antigravity => render_antigravity(event, op),
-        Platform::Gemini => render_gemini(event, op, event_name),
-        _ => render_cc_family(platform, event, op, event_name),
-    }
-}
-
-/// Claude Code / Codex / CodeBuddy / WorkBuddy / OpenCode / unknown hosts.
+/// Turns an `Op` into whatever this (host, event) actually understands.
 ///
-/// They share the `hookSpecificOutput` envelope; only Stop handling and the
-/// input-rewrite keys differ.
-fn render_cc_family(platform: Platform, event: HookEvent, op: Op, event_name: &str) -> String {
+/// Every branch reads its shape straight out of the capability matrix — the
+/// only remaining platform switch is [`fallback_deny_shape`], used when a deny
+/// lands on an event that has no blocking slot at all (a deny is never
+/// downgraded: the host may ignore the output, but must never read it as an
+/// allow).
+fn render(platform: Platform, op: Op, event_name: &str, caps: &Capabilities) -> Rendered {
     match op {
-        Op::Allow => String::new(),
+        // Antigravity 与 Gemini 把 `decision` 声明为必填字段(AGY 官方:
+        // "`decision` | string | **Required.**"),所以"放行"也要显式写出来;
+        // 其余宿主读空 stdout 就是放行,多打一个 JSON 反而要承担被误解析的风险。
+        Op::Allow if host_requires_explicit_allow(platform) => {
+            Rendered::Json(r#"{"decision":"allow"}"#.to_string())
+        }
+        Op::Allow => Rendered::Json(String::new()),
 
         Op::Deny { reason } => {
-            // PermissionRequest speaks `decision: {behavior, message}` on
-            // both Claude Code and Codex; PreToolUse gates through
-            // `hookSpecificOutput.permissionDecision`; CodeBuddy/WorkBuddy
-            // prompt blocking uses `continue: false` (their official docs
-            // deprecate `decision: "block"`); every other blocking event
-            // (UserPromptSubmit on CC/Codex, PreCompact, ...) uses the
-            // top-level `decision: "block"` shape. Unknown events keep the
-            // `hookSpecificOutput` shape as the best-effort default.
-            if event == HookEvent::PermissionRequest {
+            let shape = match caps.deny {
+                DenyShape::None => fallback_deny_shape(platform),
+                declared => declared,
+            };
+            render_deny(shape, event_name, &reason)
+        }
+
+        Op::Ask { reason } => match caps.ask {
+            AskShape::PermissionAsk => Rendered::Json(
                 json!({
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
-                        "decision": { "behavior": "deny", "message": reason }
-                    }
-                })
-                .to_string()
-            } else if matches!(event, HookEvent::PreToolUse | HookEvent::Other) {
-                // `Other` = 宿主事件名 ai-hook 未建模(如 Claude Code 的
-                // TaskCompleted / ConfigChange)。它们的官方决策形态各不相同
-                // (TaskCompleted 用 `continue:false` 或退出码 2),没有通用解;
-                // 这里沿用 `permissionDecision` 形态属于**尽力而为**:能力矩阵
-                // 已把它们标成 NONE(调用方会打 stderr 告警),而 Deny 从不降级,
-                // 最坏结果是宿主忽略这条输出 —— 不会变成相反的语义。
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "permissionDecision": "deny",
+                        "permissionDecision": "ask",
                         "permissionDecisionReason": reason
                     }
                 })
-                .to_string()
-            } else if matches!(platform, Platform::CodeBuddy | Platform::WorkBuddy)
-                && matches!(
-                    event,
-                    HookEvent::UserPromptSubmit
-                        | HookEvent::Stop
-                        | HookEvent::SubagentStop
-                        | HookEvent::PreCompact
-                )
-            {
-                // CodeBuddy / WorkBuddy 官方(`@tencent-ai/codebuddy-code` 随包
-                // hooks.md)在三处明确标注:
-                //   "**注意**：`decision: "block"` 字段已废弃,请使用 `continue: false`。"
-                // (PostToolUse / UserPromptSubmit / Stop·SubagentStop)
-                // PreCompact 官方只记载「退出码 2 阻止压缩」,JSON 决策控制节缺失,
-                // 而 `continue: false` 是这两个宿主通用的阻断形态,故一并使用。
-                json!({ "continue": false, "reason": reason }).to_string()
-            } else if platform == Platform::Codex && event == HookEvent::PreCompact {
-                // Codex 官方 PreCompact 节原文:"If a matching PreCompact hook
-                // returns `continue: false`, Codex stops before compacting."
-                // 官方没有给该事件 `decision: "block"` 形态(那是 PreToolUse 的
-                // legacy 形状 + UserPromptSubmit / Stop / SubagentStop 三处),
-                // 输出它可能被忽略 → 压缩照常进行(即门禁失效)。
-                json!({ "continue": false, "reason": reason }).to_string()
-            } else {
+                .to_string(),
+            ),
+            // `force_ask` ignores the session's "Always Allow" cache.
+            AskShape::ForceAsk => {
+                Rendered::Json(json!({ "decision": "force_ask", "reason": reason }).to_string())
+            }
+            // Unreachable: `to_op` only produces `Op::Ask` when the matrix has
+            // an ask slot. Keep it deny-shaped rather than empty so a future
+            // divergence can never become a silent allow.
+            AskShape::None => render_deny(fallback_deny_shape(platform), event_name, &reason),
+        },
+
+        Op::KeepGoing { reason } => Rendered::Json(match caps.flow {
+            // Claude Code / Codex / CodeBuddy / WorkBuddy.
+            FlowShape::BlockDecision => {
                 json!({ "decision": "block", "reason": reason }).to_string()
             }
+            // Antigravity Stop: any value other than "continue" allows the stop.
+            FlowShape::ContinueDecision => {
+                json!({ "decision": "continue", "reason": reason }).to_string()
+            }
+            // Gemini AfterAgent: reject the response and force a retry.
+            FlowShape::RetryDecision => json!({ "decision": "deny", "reason": reason }).to_string(),
+            // Unreachable: `to_op` downgrades to `Op::Allow` first.
+            FlowShape::None => String::new(),
+        }),
+
+        Op::Modify(m) => render_modify(platform, m, event_name, caps),
+    }
+}
+
+/// Hosts whose protocol marks the top-level `decision` field as required, so
+/// even "no objection" has to be spelled out.
+///
+/// This is the one place `render` still looks at the platform: it is a property
+/// of the host's wire format rather than of a (host, event) capability, so it
+/// does not belong in the matrix.
+const fn host_requires_explicit_allow(platform: Platform) -> bool {
+    matches!(platform, Platform::Antigravity | Platform::Gemini)
+}
+
+/// The best-effort denial shape for an event with no documented blocking slot
+/// (Claude Code's `Notification` / `SessionEnd` / `PostCompact`, Antigravity's
+/// invocation hooks, …).
+const fn fallback_deny_shape(platform: Platform) -> DenyShape {
+    match platform {
+        Platform::Antigravity | Platform::Gemini => DenyShape::HostDecisionDeny,
+        _ => DenyShape::TopLevelBlock,
+    }
+}
+
+/// Writes one denial shape into `out`. Returns `None` when the host has no JSON
+/// channel at all and the caller must fall back to the exit code.
+fn apply_deny_shape(
+    out: &mut Map<String, serde_json::Value>,
+    shape: DenyShape,
+    event_name: &str,
+    reason: &str,
+) -> Option<i32> {
+    match shape {
+        DenyShape::None => {}
+        DenyShape::PermissionDecision => {
+            out.insert(
+                "hookSpecificOutput".into(),
+                json!({
+                    "hookEventName": event_name,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason
+                }),
+            );
         }
-
-        Op::Ask { reason } => json!({
-            "hookSpecificOutput": {
-                "hookEventName": event_name,
-                "permissionDecision": "ask",
-                "permissionDecisionReason": reason
-            }
-        })
-        .to_string(),
-
-        Op::KeepGoing { reason } => {
-            // CodeBuddy / WorkBuddy stop the loop with `continue: false`;
-            // Claude Code, Codex and the OpenCode bridge use a blocking
-            // decision whose meaning on Stop is "keep going".
-            if matches!(platform, Platform::CodeBuddy | Platform::WorkBuddy) {
-                json!({ "continue": false, "reason": reason }).to_string()
-            } else {
-                json!({ "decision": "block", "reason": reason }).to_string()
-            }
+        DenyShape::BehaviorDeny => {
+            out.insert(
+                "hookSpecificOutput".into(),
+                json!({
+                    "hookEventName": event_name,
+                    "decision": { "behavior": "deny", "message": reason }
+                }),
+            );
         }
+        DenyShape::TopLevelBlock => {
+            out.insert("decision".into(), json!("block"));
+            out.insert("reason".into(), json!(reason));
+        }
+        DenyShape::ContinueFalse => {
+            out.insert("continue".into(), json!(false));
+            out.insert("reason".into(), json!(reason));
+        }
+        DenyShape::HostDecisionDeny => {
+            out.insert("decision".into(), json!("deny"));
+            out.insert("reason".into(), json!(reason));
+        }
+        DenyShape::ExitCode2 => return Some(2),
+    }
+    None
+}
 
-        Op::Modify(m) => {
-            let mut hso = json!({ "hookEventName": event_name });
-            if let Some(text) = m.inject {
-                hso["additionalContext"] = json!(text);
-            }
-            // Rewriting arguments is a gate-event concern: Codex rejects
-            // `updatedInput` unless paired with `permissionDecision: "allow"`,
-            // and CodeBuddy's docs and implementation disagree on the key
-            // (`modifiedInput` vs `updatedInput`), so both keys are emitted
-            // there.
-            if event.is_gate_event()
-                && let Some(input) = m.mutate_input
-            {
-                hso["permissionDecision"] = json!("allow");
-                hso["updatedInput"] = input.clone();
-                if matches!(platform, Platform::CodeBuddy | Platform::WorkBuddy) {
-                    hso["modifiedInput"] = input;
-                }
-            }
-            if event.is_post_event()
-                && let Some(out) = m.replace_output
-            {
-                // Codex parses `updatedToolOutput` but does not implement it;
-                // its feedback channel is the top-level blocking decision.
-                if platform == Platform::Codex {
-                    let reason = match out {
-                        serde_json::Value::String(s) => s,
-                        other => other.to_string(),
-                    };
-                    return json!({ "decision": "block", "reason": reason }).to_string();
-                }
+fn render_deny(shape: DenyShape, event_name: &str, reason: &str) -> Rendered {
+    let mut out = Map::new();
+    match apply_deny_shape(&mut out, shape, event_name, reason) {
+        // No JSON channel: the host reads the exit code and stderr.
+        Some(code) => Rendered::Exit {
+            code,
+            reason: reason.to_string(),
+        },
+        None => Rendered::Json(serde_json::Value::Object(out).to_string()),
+    }
+}
+
+fn render_modify(
+    platform: Platform,
+    m: Mutation,
+    event_name: &str,
+    caps: &Capabilities,
+) -> Rendered {
+    let mut out = Map::new();
+    let mut hso = Map::new();
+
+    // 1. Tool-result replacement. Hosts without an `updatedToolOutput`
+    //    equivalent borrow the denial shape instead: the replacement text is
+    //    delivered as the `reason`, which the host feeds back to the model
+    //    (Codex: "replaces the tool result with that feedback"; Gemini
+    //    AfterTool: "replaces the tool result sent back to the model").
+    if let Some(value) = m.replace_output {
+        match caps.replace_output {
+            ReplaceShape::UpdatedToolOutput => {
                 // Structured values pass through as-is so a rule can match the
                 // tool's output shape (Claude Code ignores shape mismatches on
                 // built-in tools); strings stay strings (CodeBuddy wraps them).
-                hso["updatedToolOutput"] = out;
+                hso.insert("updatedToolOutput".into(), value);
             }
-            json!({ "hookSpecificOutput": hso }).to_string()
-        }
-    }
-}
-
-/// Antigravity: top-level `decision`, and context only via `injectSteps`.
-fn render_antigravity(event: HookEvent, op: Op) -> String {
-    match op {
-        Op::Allow => r#"{"decision":"allow"}"#.to_string(),
-        Op::Deny { reason } => json!({ "decision": "deny", "reason": reason }).to_string(),
-        // `force_ask` ignores the session's "Always Allow" cache.
-        Op::Ask { reason } => json!({ "decision": "force_ask", "reason": reason }).to_string(),
-        Op::KeepGoing { reason } => {
-            // Only `Stop` reaches here on AGY (capability `flow=true`): the
-            // official "continue" prevents the stop and re-enters the loop;
-            // any other value allows the stop.
-            json!({ "decision": "continue", "reason": reason }).to_string()
-        }
-        Op::Modify(m) => {
-            // No `mutate_input` branch on purpose: Antigravity's official
-            // PreToolUse output fields are `decision` / `reason` /
-            // `permissionOverrides` only, so the capability matrix keeps
-            // mutate_input closed and `to_op` drops the modifier before it
-            // ever reaches here. Emitting an undocumented key (e.g.
-            // `overwrite`) would make AGY honour the `decision:"allow"` and run
-            // the **original** arguments while the rule believes it rewrote
-            // them — strictly worse than dropping it.
-            debug_assert!(
-                m.mutate_input.is_none(),
-                "AGY has no input-rewrite channel; the modifier must be dropped upstream"
-            );
-            let injectable = matches!(event, HookEvent::PreInvocation | HookEvent::PostInvocation);
-            if let Some(text) = m.inject
-                && injectable
-            {
-                return json!({ "injectSteps": [{ "ephemeralMessage": text }] }).to_string();
-            }
-            // Anything left over (a modifier that reached the renderer
-            // without a channel) is emitted as an explicit allow, never as an
-            // empty object — AGY requires `decision` on gating events.
-            r#"{"decision":"allow"}"#.to_string()
-        }
-    }
-}
-
-/// Gemini CLI: top-level `decision`, no `ask` in the protocol at all.
-///
-/// Two different "show this text" channels exist and must not be mixed up:
-/// - `hookSpecificOutput.additionalContext` → **the model** sees it (documented
-///   for `BeforeAgent`, `AfterTool`, `SessionStart`).
-/// - `systemMessage` → "Displayed immediately to the user in the terminal".
-fn render_gemini(event: HookEvent, op: Op, event_name: &str) -> String {
-    let context_for_model = matches!(
-        event,
-        HookEvent::BeforeAgent | HookEvent::AfterTool | HookEvent::SessionStart
-    );
-
-    match op {
-        Op::Allow => r#"{"decision":"allow"}"#.to_string(),
-        Op::Deny { reason } | Op::Ask { reason } => {
-            json!({ "decision": "deny", "reason": reason }).to_string()
-        }
-        // Gemini has no Stop event. On `AfterAgent`, `decision:"deny"` rejects
-        // the response and forces a retry — that is Gemini's "keep going".
-        Op::KeepGoing { reason } => {
-            if event == HookEvent::AfterAgent {
-                json!({ "decision": "deny", "reason": reason }).to_string()
-            } else {
-                String::new()
-            }
-        }
-        Op::Modify(m) => {
-            let mut out = json!({});
-            // `AfterTool`: deny hides the real output and `reason` becomes the
-            // result the model sees. It composes with `additionalContext`.
-            // Gemini's reason is a string; structured replacements are
-            // serialized.
-            if let Some(text) = m.replace_output {
-                let text = match text {
+            ReplaceShape::AsReason(shape) => {
+                let text = match value {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
                 };
-                out["decision"] = json!("deny");
-                out["reason"] = json!(text);
-            }
-            // `BeforeTool`: `hookSpecificOutput.tool_input` "merges with and
-            // overrides the model's arguments before execution" (official
-            // reference). Emitted alone or next to a deny.
-            let mut hso = serde_json::Map::new();
-            if let Some(input) = m.mutate_input {
-                hso.insert("hookEventName".into(), json!(event_name));
-                hso.insert("tool_input".into(), input);
-            }
-            if let Some(text) = m.inject {
-                if context_for_model {
-                    if hso.is_empty() {
-                        hso.insert("hookEventName".into(), json!(event_name));
-                    }
-                    hso.insert("additionalContext".into(), json!(text));
-                } else {
-                    out["systemMessage"] = json!(text);
+                if let Some(code) = apply_deny_shape(&mut out, shape, event_name, &text) {
+                    // A host that neither replaces nor reads JSON decisions has
+                    // no way to carry the replacement at all.
+                    return Rendered::Exit { code, reason: text };
                 }
             }
-            if !hso.is_empty() {
-                out["hookSpecificOutput"] = serde_json::Value::Object(hso);
-            }
-            if out.as_object().is_none_or(|o| o.is_empty()) {
-                String::new()
-            } else {
-                out.to_string()
-            }
+            ReplaceShape::None => {}
         }
+    }
+
+    // 2. Model-visible context.
+    if let Some(text) = m.inject {
+        match caps.inject {
+            InjectShape::AdditionalContext => {
+                hso.insert("additionalContext".into(), json!(text));
+            }
+            InjectShape::InjectSteps => {
+                return Rendered::Json(
+                    json!({ "injectSteps": [{ "ephemeralMessage": text }] }).to_string(),
+                );
+            }
+            InjectShape::None => {}
+        }
+    }
+
+    // 3. Rewriting arguments. Codex rejects `updatedInput` unless it is paired
+    //    with `permissionDecision:"allow"`, and CodeBuddy's docs and
+    //    implementation disagree on the key (`modifiedInput` vs `updatedInput`)
+    //    — its two code paths each read one of them, so both are emitted.
+    if let Some(input) = m.mutate_input {
+        match caps.mutate_input {
+            MutateShape::UpdatedInput => {
+                hso.insert("permissionDecision".into(), json!("allow"));
+                hso.insert("updatedInput".into(), input.clone());
+                if matches!(platform, Platform::CodeBuddy | Platform::WorkBuddy) {
+                    hso.insert("modifiedInput".into(), input);
+                }
+            }
+            MutateShape::ToolInput => {
+                hso.insert("tool_input".into(), input);
+            }
+            MutateShape::None => {}
+        }
+    }
+
+    // 4. User-visible text (`systemMessage`) — never reaches the model.
+    if let Some(text) = m.notify {
+        out.insert("systemMessage".into(), json!(text));
+    }
+
+    if !hso.is_empty() {
+        hso.insert("hookEventName".into(), json!(event_name));
+        out.insert("hookSpecificOutput".into(), serde_json::Value::Object(hso));
+    }
+
+    if out.is_empty() {
+        Rendered::Json(String::new())
+    } else {
+        Rendered::Json(serde_json::Value::Object(out).to_string())
     }
 }
 

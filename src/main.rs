@@ -712,6 +712,30 @@ fn print_output(output: &str) {
     std::process::exit(0);
 }
 
+/// Renders a decision and delivers it in whichever channel this host reads.
+///
+/// Most hosts parse a JSON object on stdout; a host that never looks at hook
+/// JSON (the opencode bridge only checks `exitCode === 2`) gets the reason on
+/// stderr plus a non-zero exit instead. Exiting is intentional: every path in
+/// `handle_dispatch` ends here, and exit 0 with empty stdout is how a host
+/// reads "allow".
+fn emit(decision: &HookDecision, ctx: &HookContext, gui_approved: Option<bool>) {
+    let rendered = decision.render(ctx, gui_approved);
+    match rendered.exit() {
+        Some((code, reason)) => {
+            // The bridge (`src/executor.ts`) uses `output?.stopReason ??
+            // stderr` as the block reason, so the text must go to stderr.
+            errln!("{}", reason);
+            prof_mark!("⑦ 输出已写出");
+            prof_flush!();
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            std::process::exit(code);
+        }
+        None => print_output(rendered.json()),
+    }
+}
+
 /// Fail-closed policy can be relaxed explicitly via CLI flag or environment.
 fn allow_on_error_requested(args: &Cli) -> bool {
     args.allow_on_error || env_flag_true("AI_HOOK_ALLOW_ON_ERROR")
@@ -798,7 +822,7 @@ fn handle_dispatch(args: &Cli) {
             });
             col.record("generic", Some(&ctx), &dec, &out, 0);
         }
-        print_output(&out);
+        emit(&dec, &ctx, None);
         return;
     }
 
@@ -849,7 +873,7 @@ fn handle_dispatch(args: &Cli) {
             });
             col.record("generic", Some(&ctx), &dec, &out, 0);
         }
-        print_output(&out);
+        emit(&dec, &ctx, None);
         return;
     }
 
@@ -965,7 +989,7 @@ fn handle_dispatch(args: &Cli) {
                 });
                 col.record(&prompt_agent, Some(&ctx), &dec, &out, 0);
             }
-            print_output(&out);
+            emit(&dec, &ctx, None);
         } else {
             // No dialog: hand the decision to the renderer as a Confirm.
             // An unparseable payload has no host identity at all
@@ -1025,7 +1049,7 @@ fn handle_dispatch(args: &Cli) {
                 });
                 col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
             }
-            print_output(&out);
+            emit(&dec, &ctx, None);
         }
         return;
     }
@@ -1078,7 +1102,7 @@ fn handle_dispatch(args: &Cli) {
             });
             col.record(&ctx.platform.to_string(), Some(&ctx), &decision, &out, 0);
         }
-        print_output(&out);
+        emit(&decision, &ctx, None);
         return;
     }
 
@@ -1122,7 +1146,7 @@ fn handle_dispatch(args: &Cli) {
             });
             col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
         }
-        print_output(&out);
+        emit(&dec, &ctx, None);
         return;
     }
 
@@ -1170,7 +1194,7 @@ fn handle_dispatch(args: &Cli) {
                     });
                     col.record(&agent_str, Some(&ctx), &dec, &out, 0);
                 }
-                print_output(&out);
+                emit(&dec, &ctx, None);
                 return;
             }
         };
@@ -1241,7 +1265,7 @@ fn handle_dispatch(args: &Cli) {
             // dialog fallback never ran and the confirm degraded to a hard
             // deny with no way to authorize. The renderer applies the same
             // conjunction, so both layers now agree.
-            let ask_ok = ctx.can_ask() && ctx.capabilities().ask;
+            let ask_ok = ctx.can_ask() && ctx.capabilities().can_ask();
             let c_path = confirm_path(*gui, forced, ask_ok, gui_enabled, args.dry_run);
 
             let prompt_target = ctx
@@ -1585,7 +1609,7 @@ fn handle_dispatch(args: &Cli) {
             });
             col.record(&agent_str, Some(&ctx), &decision, &out, 0);
         }
-        print_output(&out);
+        emit(&decision, &ctx, gui_approved);
     }));
 
     if outcome.is_err() {
@@ -1621,7 +1645,7 @@ fn handle_dispatch(args: &Cli) {
             });
             col.record(&agent_str, Some(&ctx_panic), &dec, &out, 0);
         }
-        print_output(&out);
+        emit(&dec, &ctx_panic, None);
     }
 }
 

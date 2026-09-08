@@ -135,8 +135,15 @@ pub fn check_fast_path(ctx: &HookContext) -> Option<HookDecision> {
         // output to disk — that is a write, not a read. `--o…` long options
         // are excluded from the short-form check so `git log --oneline`
         // keeps its fast path.
+        // `--output=<file>` / `-o <file>` 把输出写到磁盘;
+        // `--ext-diff` / `--textconv` 更危险:它们让 git 去执行
+        // `diff.<driver>.command` 或 `*.txt diff=foo` 配置的外部驱动 ——
+        // 白名单宣称"只放行单条只读命令",而这两个开关会拉起任意可执行
+        // 文件(config 里配什么就是什么),等于把旁路变成代码执行入口。
         "git diff" | "git log" | "git show" => {
             let writes = trimmed.contains("--output")
+                || trimmed.contains("--ext-diff")
+                || trimmed.contains("--textconv")
                 || trimmed
                     .split_whitespace()
                     .any(|tok| tok.starts_with("-o") && !tok.starts_with("--"));

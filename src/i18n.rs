@@ -339,6 +339,9 @@ pub enum Msg {
     AllowWord,
     /// Dialog deny-button word.
     DenyWord,
+    /// `inject` downgraded to the user-visible `systemMessage` channel.
+    /// Takes one argument: the event name.
+    M169,
 }
 
 impl Msg {
@@ -1156,6 +1159,14 @@ impl Msg {
                 }
                 Lang::En => {
                     "a rule file may only export these three forms: `export default function(ctx, sys) {…}`, `export function PreToolUse(ctx, sys) {…}`, `export async function Stop(ctx, sys) {…}`; anything else (e.g. `export const …`) is not valid syntax in QuickJS"
+                }
+            },
+            Msg::M169 => match l {
+                Lang::Zh => {
+                    "当前宿主×事件({})没有模型上下文通道,注入文本已降级为仅用户可见的 systemMessage(不会进入模型上下文)"
+                }
+                Lang::En => {
+                    "This host×event ({}) has no model-context channel; the injected text was downgraded to a user-visible systemMessage (it will not reach the model)"
                 }
             },
             Msg::AllowWord => match l {

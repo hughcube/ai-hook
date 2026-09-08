@@ -1,4 +1,9 @@
-use rquickjs::{Ctx, Function, Object, Result};
+// `Coerced<String>` 而非裸 `String`:rquickjs 的 `FromJs for String` 是**严格**
+// 类型(只接受真正的 JS string)。规则里写 `sys.fs.exists(ctx.file.path)`
+// 而 path 为 null 就会抛 TypeError → 整条规则 fail-closed 拒绝。用 Coerced
+// 走 JS 自己的转换语义(与 `console.log` / `sys.log` 一致),让
+// null / undefined / 数字变成字符串而不是把门禁炸掉。
+use rquickjs::{Coerced, Ctx, Function, Object, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -120,9 +125,12 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     let sys = Object::new(js_ctx.clone())?;
 
     // 1. sys.env(key): pure in-memory environment lookup (< 1 µs).
-    let env_fn = Function::new(js_ctx.clone(), |name: Option<String>| -> Option<String> {
-        name.and_then(|n| std::env::var(n).ok())
-    })?;
+    let env_fn = Function::new(
+        js_ctx.clone(),
+        |name: Option<Coerced<String>>| -> Option<String> {
+            name.and_then(|n| std::env::var(n.0).ok())
+        },
+    )?;
     sys.set("env", env_fn)?;
 
     // (sys.cwd() does not exist: the working directory is `ctx.cwd`, and
@@ -131,23 +139,32 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     // 2. sys.fs: Rust-native file I/O. One name per operation.
     let fs_obj = Object::new(js_ctx.clone())?;
     let sys_for_exists = sys_ctx.clone();
-    let exists_fn = Function::new(js_ctx.clone(), move |path: String| -> bool {
-        sys_for_exists.fs_exists(&path)
-    })?;
+    let exists_fn = Function::new(
+        js_ctx.clone(),
+        move |path: Option<Coerced<String>>| -> bool {
+            // null / undefined 直接视为"不存在":coerce 成空串会退化成
+            // "当前目录存在",把规则带偏。
+            path.is_some_and(|p| !p.0.is_empty() && sys_for_exists.fs_exists(&p.0))
+        },
+    )?;
     fs_obj.set("exists", exists_fn)?;
 
     let sys_for_read = sys_ctx.clone();
-    let read_fn = Function::new(js_ctx.clone(), move |path: String| -> Option<String> {
-        sys_for_read.fs_read_text(&path)
-    })?;
+    let read_fn = Function::new(
+        js_ctx.clone(),
+        move |path: Option<Coerced<String>>| -> Option<String> {
+            path.filter(|p| !p.0.is_empty())
+                .and_then(|p| sys_for_read.fs_read_text(&p.0))
+        },
+    )?;
     fs_obj.set("readText", read_fn)?;
 
     let sys_for_list = sys_ctx.clone();
     let list_fn = Function::new(
         js_ctx.clone(),
-        move |dir_path: Option<String>| -> Vec<String> {
+        move |dir_path: Option<Coerced<String>>| -> Vec<String> {
             let target = match dir_path {
-                Some(p) => sys_for_list.resolve_path(&p),
+                Some(p) => sys_for_list.resolve_path(&p.0),
                 None => sys_for_list.cwd.clone(),
             };
             if let Ok(entries) = std::fs::read_dir(target) {
@@ -205,28 +222,36 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     let exec_fn = Function::new(
         js_ctx.clone(),
         move |ctx: Ctx<'js>,
-              cmd: String,
-              args: rquickjs::function::Opt<Vec<String>>,
+              cmd: Coerced<String>,
+              args: rquickjs::function::Opt<Vec<Coerced<String>>>,
               options: rquickjs::function::Opt<Object<'js>>|
               -> Result<Object<'js>> {
-            let raw_args = args.0.unwrap_or_default();
+            let raw_args: Vec<String> = args
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| a.0)
+                .collect();
             let mut opt_input = None;
             let mut target_cwd = sys_for_exec.cwd.clone();
             let mut timeout_ms: u64 = 10_000;
 
             if let Some(ref opt) = options.0 {
-                if let Ok(cwd_val) = opt.get::<_, String>("cwd") {
-                    target_cwd = sys_for_exec.resolve_path(&cwd_val);
+                // 可选键必须保留"缺席"语义:`Coerced<String>` 会把 undefined
+                // 转成字符串 "undefined"(实测把 cwd 拼成 `.../undefined`,
+                // 子进程直接 CreateProcess 失败),所以用 Option 包一层。
+                if let Ok(Some(cwd_val)) = opt.get::<_, Option<Coerced<String>>>("cwd") {
+                    target_cwd = sys_for_exec.resolve_path(&cwd_val.0);
                 }
-                if let Ok(inp) = opt.get::<_, String>("input") {
-                    opt_input = Some(inp);
+                if let Ok(Some(inp)) = opt.get::<_, Option<Coerced<String>>>("input") {
+                    opt_input = Some(inp.0);
                 }
                 if let Ok(t) = opt.get::<_, u64>("timeout") {
                     timeout_ms = t;
                 }
             }
 
-            let resolved = resolve_executable(&cmd, raw_args, &target_cwd);
+            let resolved = resolve_executable(&cmd.0, raw_args, &target_cwd);
             let mut cmd_obj = std::process::Command::new(&resolved.program);
             cmd_obj.args(&resolved.args);
             cmd_obj.current_dir(&target_cwd);
@@ -255,8 +280,8 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
                 && let Ok(env_obj) = opt.get::<_, Object<'js>>("env")
             {
                 for k in env_obj.keys::<String>().flatten() {
-                    if let Ok(v) = env_obj.get::<_, String>(&k) {
-                        cmd_obj.env(k, v);
+                    if let Ok(Some(v)) = env_obj.get::<_, Option<Coerced<String>>>(&k) {
+                        cmd_obj.env(k, v.0);
                     }
                 }
             }
@@ -379,7 +404,7 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     fn execute_http_request<'js>(
         ctx: Ctx<'js>,
         method: &str,
-        url: String,
+        url: Coerced<String>,
         options: rquickjs::function::Opt<Object<'js>>,
     ) -> Result<Object<'js>> {
         let mut timeout_ms = 10000u64;
@@ -390,13 +415,13 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             if let Ok(t) = opt.get::<_, u64>("timeout") {
                 timeout_ms = t;
             }
-            if let Ok(b) = opt.get::<_, String>("body") {
-                body_str = Some(b);
+            if let Ok(Some(b)) = opt.get::<_, Option<Coerced<String>>>("body") {
+                body_str = Some(b.0);
             }
             if let Ok(hdr_obj) = opt.get::<_, Object<'js>>("headers") {
                 for k in hdr_obj.keys::<String>().flatten() {
-                    if let Ok(v) = hdr_obj.get::<_, String>(&k) {
-                        headers.insert(k, v);
+                    if let Ok(Some(v)) = hdr_obj.get::<_, Option<Coerced<String>>>(&k) {
+                        headers.insert(k, v.0);
                     }
                 }
             }
@@ -406,7 +431,7 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build();
 
-        let mut req = agent.request(method, &url);
+        let mut req = agent.request(method, &url.0);
         for (k, v) in &headers {
             req = req.set(k, v);
         }
@@ -459,7 +484,7 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     let get_fn = Function::new(
         js_ctx.clone(),
         |ctx: Ctx<'js>,
-         url: String,
+         url: Coerced<String>,
          options: rquickjs::function::Opt<Object<'js>>|
          -> Result<Object<'js>> { execute_http_request(ctx, "GET", url, options) },
     )?;
@@ -468,7 +493,7 @@ pub fn create_sys_object<'js>(js_ctx: &Ctx<'js>, sys_ctx: Rc<SysContext>) -> Res
     let post_fn = Function::new(
         js_ctx.clone(),
         |ctx: Ctx<'js>,
-         url: String,
+         url: Coerced<String>,
          options: rquickjs::function::Opt<Object<'js>>|
          -> Result<Object<'js>> { execute_http_request(ctx, "POST", url, options) },
     )?;

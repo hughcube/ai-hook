@@ -3,12 +3,17 @@ use serde_json::Value;
 
 /// Non-gating changes a rule can ask for on top of "let it through".
 ///
-/// All three are optional and can be combined; the renderer drops the ones the
+/// All four are optional and can be combined; the renderer drops the ones the
 /// host cannot express and reports the rest through stderr.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Mutation {
-    /// Text handed to the model (`additionalContext` / `systemMessage`).
+    /// Text handed to **the model** (`additionalContext` / `injectSteps`).
     pub inject: Option<String>,
+    /// Text shown to **the user only** (`systemMessage`), never fed to the
+    /// model. Used when a rule asked to inject context on an event whose only
+    /// text channel is the user-facing one (Gemini `SessionEnd` /
+    /// `PreCompress`, for example).
+    pub notify: Option<String>,
     /// Replacement tool arguments (`updatedInput` / `modifiedInput`).
     pub mutate_input: Option<Value>,
     /// Replacement tool result (`updatedToolOutput` / feedback).
@@ -24,7 +29,10 @@ pub struct Mutation {
 impl Mutation {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inject.is_none() && self.mutate_input.is_none() && self.replace_output.is_none()
+        self.inject.is_none()
+            && self.notify.is_none()
+            && self.mutate_input.is_none()
+            && self.replace_output.is_none()
     }
 }
 

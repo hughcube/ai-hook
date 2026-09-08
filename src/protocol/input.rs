@@ -346,6 +346,15 @@ fn detect_cc_family(val: &serde_json::Value, _raw_json: &str) -> Platform {
     {
         return Platform::Gemini;
     }
+    // Gemini CLI 的 base input schema(官方 hooks/reference)带 `timestamp`
+    // (ISO 8601),这是 Gemini 独有的公共字段 —— CC / Codex / CodeBuddy /
+    // Antigravity 的公共输入里都没有。它补上了事件名速查覆盖不到的
+    // `SessionStart` / `SessionEnd` / `Notification`(这三个与 Claude 家族
+    // 同名,无法靠名字区分);缺了它,Gemini 的会话级事件在没有
+    // transcript_path 可嗅探时会被误判成 claude_code,从而用错能力矩阵。
+    if val.get("hook_event_name").is_some() && val.get("timestamp").is_some() {
+        return Platform::Gemini;
+    }
     // OpenCode has no process hook protocol of its own; the community bridge
     // (opencode-claude-hooks) forwards Claude Code envelopes and marks them.
     if env_flag_true("OPENCODE_COMPAT") {
@@ -596,30 +605,36 @@ fn normalize_semantics(
     }
 
     // 4. Code-search tools: glob (path patterns) / grep (content search).
-    //    Claude Code / Codex: Glob {pattern, path}, Grep {pattern, path}.
-    //    Antigravity (official tool schema): grep_search {SearchPath, Query}.
-    if lower == "grep_search" {
-        return Normalized {
-            search: Some(SearchContext {
-                kind: SearchKind::Grep,
-                path: get_str(args, &["SearchPath", "path"]).map(str::to_string),
-                pattern: get_str(args, &["Query", "query", "pattern"]).map(str::to_string),
-            }),
-            ..Normalized::default()
-        };
-    }
+    //
+    //    目录键与模式键随宿主差异很大,统一在这里收敛 —— 否则 `ctx.search.path`
+    //    在半数宿主上恒为 null,规则只能靠 null 判断而静默放行:
+    //    - Claude Code / Codex:  Glob/Grep {pattern, path}
+    //    - Antigravity(官方工具表):grep_search {SearchPath, Query},
+    //      find_by_name {SearchDirectory, Pattern}
+    //    - Gemini CLI(官方 Tools reference 的 JSON argument keys):
+    //      glob / grep_search {pattern, dir_path};`search_file_content` 是其
+    //      遗留别名("Legacy alias: search_file_content")
+    const SEARCH_PATH_KEYS: &[&str] = &[
+        "SearchPath",
+        "SearchDirectory",
+        "dir_path",
+        "DirPath",
+        "path",
+        "Path",
+    ];
+    const SEARCH_PATTERN_KEYS: &[&str] = &["pattern", "Pattern", "Query", "query"];
+
     let search_kind = match lower.as_str() {
-        "glob" => Some(SearchKind::Glob),
-        "grep" => Some(SearchKind::Grep),
+        "glob" | "find_by_name" => Some(SearchKind::Glob),
+        "grep" | "grep_search" | "search_file_content" => Some(SearchKind::Grep),
         _ => None,
     };
     if let Some(kind) = search_kind {
         return Normalized {
             search: Some(SearchContext {
                 kind,
-                path: get_str(args, &["path", "Path"]).map(str::to_string),
-                pattern: get_str(args, &["pattern", "Pattern", "query", "Query"])
-                    .map(str::to_string),
+                path: get_str(args, SEARCH_PATH_KEYS).map(str::to_string),
+                pattern: get_str(args, SEARCH_PATTERN_KEYS).map(str::to_string),
             }),
             ..Normalized::default()
         };
@@ -629,16 +644,37 @@ fn normalize_semantics(
     //    Claude Code: Agent {description, prompt?, subagent_type?},
     //    Workflow {name?, prompt?}. Codex: Agent {description, prompt}.
     //    CodeBuddy: Task {description, prompt?}.
+    //    Antigravity(官方工具表):invoke_subagent {Subagents:[{Prompt, Role,
+    //    TypeName, Workspace?}]}、define_subagent / manage_subagents、
+    //    manage_task {Action,…}、schedule {Prompt,…}。
+    //    不建模这些名字会让 `ctx.agent` 在 Antigravity 上恒为 null,所有
+    //    "禁止派发子 agent / 定时任务"的规则在该宿主上静默放行。
     let agent_kind = match lower.as_str() {
-        "agent" | "spawn_agent" | "subagent" | "start_agent" => Some(AgentKind::Agent),
+        "agent" | "spawn_agent" | "subagent" | "start_agent" | "invoke_subagent"
+        | "define_subagent" | "manage_subagents" => Some(AgentKind::Agent),
         "workflow" | "run_workflow" => Some(AgentKind::Workflow),
-        "task" | "create_task" | "new_task" => Some(AgentKind::Task),
+        "task" | "create_task" | "new_task" | "manage_task" | "schedule" => Some(AgentKind::Task),
         _ => None,
     };
     if let Some(kind) = agent_kind {
         let description =
             get_str(args, &["description", "Description", "name", "Name"]).map(str::to_string);
-        let prompt = get_str(args, &["prompt", "Prompt", "instructions"]).map(str::to_string);
+        let mut prompt = get_str(args, &["prompt", "Prompt", "instructions"]).map(str::to_string);
+        // Antigravity 的 invoke_subagent 没有顶层 prompt 键:目标写在
+        // `Subagents` 数组的元素里。取第一个元素的 Prompt 作为委派目标,
+        // 规则才能像在其它宿主上一样读到 `ctx.agent.prompt`。
+        if prompt.is_none()
+            && let Some(first) = args
+                .get("Subagents")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+        {
+            prompt = first
+                .get("Prompt")
+                .or_else(|| first.get("prompt"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
         // A workflow/task without an explicit description often carries the
         // goal in `name`; keep the pair host-free either way.
         let description = description.or_else(|| prompt.clone());
@@ -1066,15 +1102,17 @@ impl HookContext {
     ///   `ask`(尊重 "Always Allow")与 `force_ask`(忽略缓存)。
     /// - Gemini CLI `https://geminicli.com/docs/hooks/reference/`:
     ///   `decision` 仅 `allow`/`deny`(别名 `block`),协议无 ask。
+    /// - opencode 桥(`github.com/magarcia/opencode-claude-hooks` 0.1.0):
+    ///   `src/index.ts` 的 `tool.execute.before` 与 `permission.ask` 都只处理
+    ///   allow / deny,**没有 ask 分支** → 发 ask 等于静默放行。
     #[must_use]
     pub fn can_ask(&self) -> bool {
         match self.platform {
-            Platform::ClaudeCode
-            | Platform::CodeBuddy
-            | Platform::WorkBuddy
-            | Platform::OpenCode => true,
+            Platform::ClaudeCode | Platform::CodeBuddy | Platform::WorkBuddy => true,
             // Codex 全模式均无协议 ask(输出 ask = 静默放行),故恒 false。
             Platform::Codex => false,
+            // 桥未实现 ask,输出会被完全忽略(fail-open)。
+            Platform::OpenCode => false,
             Platform::Antigravity => !self.is_yolo,
             Platform::Gemini | Platform::Generic => false,
         }

@@ -832,6 +832,9 @@ impl RuleRunner {
 
                 let mutation = Mutation {
                     inject: obj.get::<_, String>("inject").ok(),
+                    // 规则侧不直接提供 notify:它是 inject 在无模型上下文通道
+                    // 时的降级归宿,由能力矩阵决定。
+                    notify: None,
                     mutate_input: obj
                         .get::<_, rquickjs::Value>("mutateInput")
                         .ok()

@@ -263,10 +263,12 @@ export default function(ctx, sys) {
 
 - **Gemini CLI** 使用自己的事件词汇(`BeforeTool`/`AfterTool`/`BeforeAgent`/`AfterAgent`/`PreCompress`),它们折叠进上表规范名——这正是 `ctx.event` 的意义;原始拼写仍可经 `ctx.eventRaw`(如 `"AfterTool"`)读取,具名导出也按规范名书写即可命中。
 - **Antigravity 的 stdin 根本不携带事件名**(官方输入字段只有 `conversationId`/`workspacePaths`/`transcriptPath`…加 `toolCall`),ai-hook 按载荷形状推断事件;`PreInvocation` 与 `PostInvocation` 输入形状逐字节相同,故统一归类为 `PreInvocation`(AGY 的 `ctx.eventRaw` 保持 `null`——它确实没有宿主拼写可报告)。AGY 的 `PostToolUse` 也被**刻意不**用 `error` 键推断(`error` 在 PreToolUse 上是否出现无官方记载,误判会静默丢失 gate 能力),因此 post-tool 载荷会显示为 `PreToolUse`——规则仍可读取 tool/cwd,但其输出的任何决策都会被宿主忽略(AGY 的 PostToolUse 输出 schema 就是空对象 `{}`)。
-- **OpenCode** 没有进程外 hook 协议;经 `opencode-claude-hooks` 桥转发 Claude Code 形态信封(`OPENCODE_COMPAT=1`),规范名列与 Claude Code 列一致。
+- **OpenCode** 没有进程外 hook 协议;经 `opencode-claude-hooks` 桥转发 Claude Code 形态信封(`OPENCODE_COMPAT=1`),规范名列与 Claude Code 列一致。**但桥的能力比 Claude Code 窄得多**:`src/executor.ts` 只把 `exitCode === 2` 当阻断,`src/index.ts` 的 `tool.execute.before` 只判 `result.blocked`,所以 PreToolUse 的 deny 走**退出码 2 + stderr 原因**(发 `permissionDecision` 会被忽略 = fail open);`PermissionRequest` 用 `permissionDecision`(不是 `decision.behavior`)。桥未接线 `Stop` / `UserPromptSubmit`,且丢弃 `tool.execute.after` 的全部返回,也没有实现 `ask` —— 这些事件在 opencode 上没有任何能力,规则写 confirm 会降级为 GUI 弹窗或 fail-closed 拒绝。
 - **`Setup`(\*)** 可观测但无决策/注入通道:Claude Code 官方 Setup decision control 丢弃 Setup hook 的全部 JSON 输出(含 `hookSpecificOutput.additionalContext`)。CodeBuddy / WorkBuddy 的官方事件表里根本没有 Setup,Codex 也没有,所以只有 Claude Code 会触发它。
 - ai-hook 未建模的事件(如 Claude Code 的 `TaskCompleted`/`Notification`/`ConfigChange`/`WorktreeCreate`…)不会丢失:它们以**宿主原名**出现在 `ctx.event` 中可观测(记日志/分支判断),只是不能驱动决策。
 - **CodeBuddy 与 WorkBuddy 共用同一内核**:WorkBuddy 以 CodeBuddy Code CLI 内核 + 独立配置目录运行,其 hooks 文档即 CodeBuddy 同一份文档。
+- **按实现而非文档落地**:CodeBuddy 的 `hooks.md` 说 Stop/SubagentStop 用 `continue: false`,但随包 CLI 要求 `blocking === true`(`SessionHookManager.executeStopHooks`),只有 `decision:"block"` / permissionDecision deny / 退出码 2 能置位 —— `continue: false` 是空操作,宿主照常停止。ai-hook 在那里输出 `decision:"block"`;而 UserPromptSubmit / PreCompact 只需 `allowed=false`,故仍用 `continue: false`。
+- **Gemini CLI 已并入 Antigravity CLI**:Google 自 2026-06-18 起对免费与 AI Pro/Ultra 档停止服务([公告](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli)),Antigravity CLI 保留了 Hooks。Gemini 列保留给付费/自建场景,识别依据是官方的 `BeforeTool`/`AfterTool`/… 词表加上独有的 `timestamp` 输入字段。
 
 #### 1.2 matcher:如何唤醒 ai-hook,以及如何写与工具名无关的规则
 
