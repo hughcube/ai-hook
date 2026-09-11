@@ -1062,9 +1062,34 @@ fn take_ident(s: &str) -> String {
         .collect()
 }
 
+/// Picks a regex literal vs. a division slash. Heuristic on the previous
+/// significant byte: after a value (identifier/number/`)`/`]`/`}`/`.`) a slash
+/// divides; anywhere else it opens a regex literal. This is the classic lexer
+/// ambiguity, resolved the same pragmatic way most regex-aware scanners do.
+fn is_regex_start(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(c) => {
+            !(c.is_ascii_alphanumeric()
+                || c == b'_'
+                || c == b'$'
+                || c == b')'
+                || c == b']'
+                || c == b'}'
+                || c == b'.')
+        }
+    }
+}
+
 /// Locates every top-level `export` occurrence that is NOT inside a comment or
-/// a string literal, is preceded by a non-identifier boundary and is the first
-/// code on its line.
+/// a string / regex literal, is preceded by a non-identifier boundary and is
+/// the first code on its line.
+///
+/// Regex literals are skipped whole: a regex such as `/("[^"]+"|'[^']+')/`
+/// legitimately contains quote bytes, and treating those as string delimiters
+/// desynchronises the scan and silently drops the real `export` — which then
+/// surfaces only as `SyntaxError: unsupported keyword: export` from
+/// `new Function` (fail-closed, but the author sees no useful cause).
 ///
 /// This is deliberately conservative: candidates we cannot prove to be real
 /// module exports are skipped (the code is then passed through as-is and any
@@ -1076,6 +1101,9 @@ fn find_exports(code: &str) -> Vec<ExportHit> {
     let n = bytes.len();
     let mut hits = Vec::new();
     let mut i = 0usize;
+    // Last significant byte seen outside comments/strings/regexes, used to tell
+    // a regex literal apart from division.
+    let mut prev: Option<u8> = None;
 
     while i < n {
         let b = bytes[i];
@@ -1094,6 +1122,47 @@ fn find_exports(code: &str) -> Vec<ExportHit> {
                 }
                 i = (i + 2).min(n);
             }
+            // Regex literal — must be matched after the two comment arms above,
+            // so `//` and `/*` keep their meaning.
+            b'/' if is_regex_start(prev) => {
+                i += 1;
+                let mut in_class = false;
+                while i < n {
+                    let c = bytes[i];
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'[' {
+                        in_class = true;
+                        i += 1;
+                        continue;
+                    }
+                    if c == b']' {
+                        in_class = false;
+                        i += 1;
+                        continue;
+                    }
+                    if c == b'/' && !in_class {
+                        break;
+                    }
+                    if c == b'\n' {
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                while i < n
+                    && matches!(
+                        bytes[i],
+                        b'g' | b'i' | b'm' | b's' | b'u' | b'y' | b'v' | b'd'
+                    )
+                {
+                    i += 1;
+                }
+                // A regex is a value: a following slash divides.
+                prev = Some(b')');
+            }
             // String / template literals (with escape handling)
             b'\'' | b'"' | b'`' => {
                 let quote = b;
@@ -1109,6 +1178,8 @@ fn find_exports(code: &str) -> Vec<ExportHit> {
                     i += 1;
                 }
                 i += 1;
+                // A string is a value: a following slash divides.
+                prev = Some(b')');
             }
             _ => {
                 if b == b'e' && bytes[i..].starts_with(EXPORT.as_bytes()) {
@@ -1151,6 +1222,9 @@ fn find_exports(code: &str) -> Vec<ExportHit> {
                             }
                         }
                     }
+                }
+                if !b.is_ascii_whitespace() {
+                    prev = Some(b);
                 }
                 i += 1;
             }
