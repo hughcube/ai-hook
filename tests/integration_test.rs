@@ -4879,3 +4879,52 @@ fn gemini_session_events_are_detected_by_timestamp() {
     .to_json_output(&cc, None);
     assert_eq!(out, "", "CC SessionEnd 没有任何文本通道: {out}");
 }
+
+#[test]
+fn test_prelude_aihook_helpers_available() {
+    let runner = RuleRunner::new().expect("Failed to initialize runner");
+
+    // The injected `aiHook` prelude must be reachable from a rule body and
+    // honour its contract: quote-aware segmentation, no single-pipe split by
+    // default (opt-in via splitPipe), newline handling, and the predicates.
+    let rule_code = r#"
+        export default function(ctx, sys) {
+            if (typeof aiHook !== "object" || aiHook === null) return { deny: "no prelude" };
+
+            // separators split, quoted separators do not
+            var a = aiHook.splitTopCommands('cd ~ && rm -f x; echo "a;b"');
+            if (a.length !== 3) return { deny: "seg-count=" + a.length };
+            if (a[0] !== "cd ~ ") return { deny: "seg0=[" + a[0] + "]" };
+            if (a[2] !== ' echo "a;b"') return { deny: "seg2=[" + a[2] + "]" };
+
+            // single pipe is not a separator by default, but is when requested
+            if (aiHook.splitTopCommands("a | b").length !== 1) return { deny: "pipe-default" };
+            if (aiHook.splitTopCommands("a | b", { splitPipe: true }).length !== 2) return { deny: "pipe-opt" };
+            // '||' remains a separator even with splitPipe on
+            if (aiHook.splitTopCommands("a || b", { splitPipe: true }).length !== 2) return { deny: "or-sep" };
+
+            // newline is a separator; flatten collapses it
+            if (aiHook.splitTopCommands("a\nb").length !== 2) return { deny: "newline" };
+            if (aiHook.flatten("a\nb\r\nc") !== "a b c") return { deny: "flatten" };
+
+            // predicates
+            if (!aiHook.isSearchPrefix("  grep -a err app.log")) return { deny: "search" };
+            if (aiHook.isSearchPrefix("mysql -e x")) return { deny: "search-fp" };
+            if (!aiHook.isGitCommit('git commit -m "x"')) return { deny: "commit" };
+            if (aiHook.isGitCommit("git status")) return { deny: "commit-fp" };
+            if (!aiHook.hasCmdSubstitution("psql -c $(cat x)")) return { deny: "subst" };
+            if (!aiHook.hasWriteVector("echo x > f")) return { deny: "write" };
+            if (aiHook.hasWriteVector("echo x 2>&1")) return { deny: "write-fp" };
+
+            // non-string inputs (ctx.cmd is null for non-command tools) are safe
+            if (aiHook.splitTopCommands(null).length !== 0) return { deny: "null-split" };
+            if (aiHook.flatten(null) !== "") return { deny: "null-flatten" };
+
+            return { allow: true };
+        }
+    "#;
+
+    let res = runner.execute_rule(&rule("prelude-test", rule_code), &ctx_for("echo hi"));
+    assert_eq!(res.error, None, "prelude rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+}

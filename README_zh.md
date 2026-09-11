@@ -417,7 +417,22 @@ export default function (ctx, sys) {
 | `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;默认保留最后 14 个文件;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义,`AI_HOOK_LOG_MAX_FILES` 调整保留数量) |
 | **标准 JS 原生能力** | - | `new Date()` 时钟（星期几/小时/封网期）、`JSON` / `RegExp` / `Math` / `Map` / `Set` 均为 QuickJS 原生内建，无需 sys —— sys 只补 JS 没有的 I/O 能力 |
 
-### 3. 决策返回值：精确控制是强制阻断、弹窗确认还是提示注入
+### 3. `aiHook` 引擎注入的规则公共 prelude（全局纯函数，零 I/O）
+
+命令文本分析类规则过去只能各自复制一份 helper（同一个 `splitTopCommands` 曾在 7 个规则里重复，且已出现语义分叉）。引擎现在在**每条规则执行前**注入一个全局 `aiHook`，提供一组**纯函数、无状态、零 I/O** 的公共解析能力；规则直接调用、**禁止再在规则内重复定义**（引号语义同 bash）：
+
+| 方法 | 返回类型 | 说明 |
+| :--- | :--- | :--- |
+| `aiHook.splitTopCommands(cmd, opt?)` | `string[]` | **引号感知的顶层命令切段**：按 `&&` `\|\|` `;` 与换行切分，引号内一律不切（双引号内反斜杠转义消费、单引号内不消费）；单管道 `\|` 默认不作为分隔符（保住 `echo ... \| mysql` 的管道流向判定）；`opt.splitPipe = true` 时单管道也切（rm-root 口径） |
+| `aiHook.flatten(cmd)` | `string` | 多行命令压平为单行（换行→空格），让下游正则与引号状态不跨行错乱 |
+| `aiHook.isSearchPrefix(seg)` | `boolean` | 检索类前缀（`grep`/`rg`/`git`/`find`/`cat`/`head`/`tail`/`sed`/`awk`/`echo`/`printf`）——「只说不做」，其中的关键词不算执行 |
+| `aiHook.isGitCommit(seg)` | `boolean` | `git commit` 段：消息是描述性文本，不执行 SQL/Redis、也不读取文件 |
+| `aiHook.hasCmdSubstitution(seg)` | `boolean` | 含命令替换 `$(`：内容不可静态判定，命中应默认人工确认 |
+| `aiHook.hasWriteVector(cmd)` | `boolean` | 写向量：重定向落盘 `>` / `>>`（放行 `2>&1`）或管道写入 `tee` |
+
+> 职责分离：`ctx` 描述**宿主输入**，`sys` 提供 **I/O 能力**，`aiHook` 提供**纯文本解析**。仅当规则来源可信时才用 `sys.exec` / `sys.http`；`aiHook` 是纯函数，不涉及任何沙箱逃逸。
+
+### 4. 决策返回值：精确控制是强制阻断、弹窗确认还是提示注入
 
 JS 规则文件通过返回值精确控制拦截行为：
 

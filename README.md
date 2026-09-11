@@ -427,7 +427,22 @@ Subprocess spawning is eliminated for standard reads. In addition, command execu
 | `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; keeps latest 14 files by default; disable `AI_HOOK_LOG=0`, override `AI_HOOK_LOG_FILE`, configure retention via `AI_HOOK_LOG_MAX_FILES`) |
 | **Standard JS builtins** | - | `new Date()` clock (days, hours, freeze windows), `JSON` / `RegExp` / `Math` / `Map` / `Set` are QuickJS builtins — no sys needed; sys only adds the I/O that JS has no primitive for |
 
-### 3. Controlling Decisions: Hard Block vs GUI Prompt vs Zero-Token Intercept
+### 3. `aiHook` — Shared Rule-Parsing Prelude (Global, Pure Functions, Zero I/O)
+
+Command-text rules used to copy their own helpers (the same `splitTopCommands` had been duplicated across seven rules and had already diverged). The engine now injects a global `aiHook` **before each rule runs**, exposing a set of **pure, stateless, zero-I/O** parsing primitives. Call them directly and **never redefine them inside a rule** (quote handling follows bash):
+
+| Method | Returns | Description |
+| :--- | :--- | :--- |
+| `aiHook.splitTopCommands(cmd, opt?)` | `string[]` | **Quote-aware top-level segmentation**: splits on `&&` `\|\|` `;` and newlines, never inside quotes (a backslash escapes inside `"…"`, stays literal inside `'…'`); a single `\|` is not a separator by default (keeps `echo ... \| mysql` pipe-flow detection intact); `opt.splitPipe = true` also splits on a single pipe (rm-root semantics) |
+| `aiHook.flatten(cmd)` | `string` | Collapse a multi-line command to one line (newlines→spaces) so downstream regex and quote state do not straddle lines |
+| `aiHook.isSearchPrefix(seg)` | `boolean` | Search-style prefix (`grep`/`rg`/`git`/`find`/`cat`/`head`/`tail`/`sed`/`awk`/`echo`/`printf`) — "only talks"; a keyword inside is not an execution |
+| `aiHook.isGitCommit(seg)` | `boolean` | `git commit` segment: its message is descriptive text (not SQL/Redis/file access) |
+| `aiHook.hasCmdSubstitution(seg)` | `boolean` | Contains command substitution `$(` — undecidable statically, so default to asking |
+| `aiHook.hasWriteVector(cmd)` | `boolean` | Write vector: redirect to disk `>` / `>>` (`2>&1` allowed) or a pipe into `tee` |
+
+> Division of labour: `ctx` describes the **host input**, `sys` provides **I/O capabilities**, `aiHook` provides **pure text parsing**. Use `sys.exec` / `sys.http` only when the rule source is trusted; `aiHook` is pure and never escapes the sandbox.
+
+### 4. Controlling Decisions: Hard Block vs GUI Prompt vs Zero-Token Intercept
 
 Your rule's return object determines the exact action:
 

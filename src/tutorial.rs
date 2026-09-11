@@ -139,6 +139,18 @@ fn chinese_tutorial_body() -> String {
   覆盖/关闭:AI_HOOK_LOG_FILE=自定义路径;AI_HOOK_LOG=0|false 完全关闭;
   超过 20MB 自动轮转为同文件 .1。
 
+  aiHook —— 规则公共解析 prelude(全局纯函数,无状态零 I/O;引号语义同 bash)
+  引擎在每条规则执行前注入,规则直接调用,禁止在规则内重复定义:
+  aiHook.splitTopCommands(cmd, {splitPipe=false})  string[] 顶层命令切段:
+                                       切 && || ; 换行,引号内一律不切;
+                                       splitPipe=true 时单管道 | 也作为分隔符(rm-root 口径)
+  aiHook.flatten(cmd)              string    多行命令压平(换行→空格)
+  aiHook.isSearchPrefix(seg)       bool      检索类前缀(grep/rg/git/find/cat/sed/echo…
+                                             「只说不做」,关键词不算执行)
+  aiHook.isGitCommit(seg)          bool      git commit 段(消息是描述性文本,不执行)
+  aiHook.hasCmdSubstitution(seg)   bool      含命令替换 $( (内容不可静态判定)
+  aiHook.hasWriteVector(cmd)       bool      写向量:重定向落盘或管道 tee
+
 四、决策协议(规则返回值)
 --------------------------------------------------------------------------------
   return null / undefined / 漏写 return → 未表态,继续下一规则
@@ -465,6 +477,21 @@ III. sys — host-capability SDK (one name per capability; exec/http escape the 
   session's story with grep '"sessionId":"…"'. Disk I/O happens only when a
   rule actually logs (zero logs = zero I/O). Overrides: AI_HOOK_LOG_FILE=<path>;
   disable with AI_HOOK_LOG=0|false; >20MB auto-rotates to <name>.1.
+
+  aiHook — shared rule-parsing prelude (a global; pure, stateless, zero I/O;
+  quote handling follows bash). Injected by the engine before each rule runs;
+  call it directly and never redefine these inside a rule file:
+  aiHook.splitTopCommands(cmd, {splitPipe=false})  string[] top-level segmentation:
+                                       splits && || ; newlines, never inside quotes;
+                                       splitPipe=true also treats a single '|' as a
+                                       separator (rm-root semantics)
+  aiHook.flatten(cmd)              string    collapse a multi-line command to one line
+  aiHook.isSearchPrefix(seg)       bool      search-style prefix (grep/rg/git/find/cat/
+                                             sed/echo… — "only talks"; a keyword is not
+                                             an execution)
+  aiHook.isGitCommit(seg)          bool      git commit segment (message is descriptive text)
+  aiHook.hasCmdSubstitution(seg)   bool      contains command substitution $( (undecidable)
+  aiHook.hasWriteVector(cmd)       bool      write vector: redirect to disk or pipe to tee
 
 IV. Decision protocol (rule return values)
 --------------------------------------------------------------------------------

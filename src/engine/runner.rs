@@ -802,7 +802,12 @@ impl RuleRunner {
                 })
             "#;
 
-            let eval_fn: Function = js_ctx.eval(wrapper)?;
+            // Prepend the shared rule prelude (global `aiHook`) so every rule
+            // sees one copy of the pure command-text helpers instead of a
+            // per-file duplicate. Prepending keeps this to a single
+            // compile+eval per rule (rather than a second `eval`).
+            let program = format!("{}\n{}", super::prelude::PRELUDE_JS, wrapper);
+            let eval_fn: Function = js_ctx.eval(program)?;
             emark!("wrapper_eval");
             let raw_val: Value = eval_fn.call((prepared_code, ctx_obj, sys_obj, event_name))?;
             emark!("rule_exec");

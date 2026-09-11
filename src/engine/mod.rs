@@ -1,5 +1,6 @@
 pub mod debug;
 pub mod loader;
+pub mod prelude;
 pub mod runner;
 pub mod sys;
 
