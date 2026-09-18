@@ -77,7 +77,7 @@ pub struct RuleExecutionResult {
 // Rule log sink: stderr (default) + optional file channel.
 //
 // Design (per user decision):
-// - Location:     ~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log  (UTC day)
+// - Location:     ~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log  (UTC day)
 // - Aggregation:  one file per agent per day; every line is JSONL with
 //                 ts/sessionId/rule/level/msg so one session's story can be
 //                 reconstructed with `grep '"sessionId":"..."' file.log`.
@@ -108,12 +108,8 @@ fn resolve_log_path(agent: &str) -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(custom));
         }
     }
-    let home = crate::paths::home_dir()?;
-    Some(home.join(".ai-hook").join("logs").join(format!(
-        "ai-hook-{}-{}.log",
-        agent,
-        utc_date_ymd()
-    )))
+    let dir = crate::paths::log_dir()?;
+    Some(dir.join(format!("ai-hook-{}-{}.log", agent, utc_date_ymd())))
 }
 
 /// Days since 1970-01-01 -> (y, m, d) in UTC (civil-from-days, Hinnant).
@@ -207,7 +203,7 @@ fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: 
 // shape / platform-detection / parse bugs can be diagnosed from the exact
 // bytes the host delivered. Defaults to off; costs zero I/O when off.
 //
-// - File:    ~/.ai-hook/logs/ai-hook-inbound-{YYYYMMDD}.log
+// - File:    ~/.log/ai-hook/ai-hook-inbound-{YYYYMMDD}.log
 // - Format:  JSONL: {time, date, ts, agent, type, bytes, truncated, payload}
 // - Bounds:  payloads over 1 MiB store only their head (truncated: true) so
 //            a huge transcript cannot balloon the log; 20MB rotation like the
@@ -229,13 +225,10 @@ pub fn log_inbound_payload(raw: &str) {
     let cut = raw.floor_char_boundary(MAX_RAW_BYTES);
     let stored = if truncated { &raw[..cut] } else { raw };
 
-    let Some(home) = crate::paths::home_dir() else {
+    let Some(dir) = crate::paths::log_dir() else {
         return;
     };
-    let path = home
-        .join(".ai-hook")
-        .join("logs")
-        .join(format!("ai-hook-inbound-{}.log", utc_date_ymd()));
+    let path = dir.join(format!("ai-hook-inbound-{}.log", utc_date_ymd()));
 
     // Rotate once if oversized (checked at open time — cheap).
     if let Ok(meta) = std::fs::metadata(&path)

@@ -2110,11 +2110,10 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, platform: &str, sc
 fn handle_clean(max_files: Option<usize>, dry_run: bool) {
     let limit = max_files.unwrap_or_else(ai_hook::engine::debug::resolve_max_log_files);
 
-    let Some(home) = ai_hook::paths::home_dir() else {
+    let Some(logs_dir) = ai_hook::paths::log_dir() else {
         eprintln!("[ai-hook] Could not determine user home directory.");
         std::process::exit(1);
     };
-    let logs_dir = home.join(".ai-hook").join("logs");
     let lang = ai_hook::i18n::lang();
 
     if !logs_dir.is_dir() {

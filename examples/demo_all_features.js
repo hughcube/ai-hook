@@ -84,7 +84,7 @@ export default function(ctx, sys) {
     }
   }
 
-  // 3.8 结构化日志 (sys.log)：默认进 stderr 与 ~/.ai-hook/logs/ 当日文件
+  // 3.8 结构化日志 (sys.log)：默认进 stderr 与 ~/.log/ai-hook/ 当日文件
   if (ctx.file) sys.log("info", `file op: ${ctx.file.action} ${ctx.file.path || ""}`);
   if (ctx.cmd) sys.log("debug", `cmd: ${ctx.cmd}`);
 

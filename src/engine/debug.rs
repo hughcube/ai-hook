@@ -345,7 +345,7 @@ pub fn decision_to_value(decision: &HookDecision) -> serde_json::Value {
 }
 
 /// Resolves the debug log file path for a given agent.
-/// Defaults to `~/.ai-hook/logs/ai-hook-debug-{agent}-{YYYYMMDD}.log`.
+/// Defaults to `~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log`.
 /// Can be overridden via `AI_HOOK_DEBUG_FILE`.
 pub fn resolve_debug_log_path(agent: &str) -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("AI_HOOK_DEBUG_FILE") {
@@ -354,12 +354,8 @@ pub fn resolve_debug_log_path(agent: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(custom));
         }
     }
-    let home = crate::paths::home_dir()?;
-    Some(home.join(".ai-hook").join("logs").join(format!(
-        "ai-hook-debug-{}-{}.log",
-        agent,
-        utc_date_ymd()
-    )))
+    let dir = crate::paths::log_dir()?;
+    Some(dir.join(format!("ai-hook-debug-{}-{}.log", agent, utc_date_ymd())))
 }
 
 /// Prunes old log files in `dir` that match `prefix`, retaining only the newest `max_files`.

@@ -34,3 +34,13 @@ pub fn data_local_dir() -> Option<PathBuf> {
     }
     home_dir()
 }
+
+/// Default log directory: `~/.log/ai-hook`.
+///
+/// Single source of truth for the rule log, debug log and inbound payload
+/// log; individual files can still be redirected with `AI_HOOK_LOG_FILE` /
+/// `AI_HOOK_DEBUG_FILE`. `~/.log` is deliberately shared with other tools so
+/// user-level diagnostics stay in one place.
+pub fn log_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join(".log").join("ai-hook"))
+}

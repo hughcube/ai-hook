@@ -194,7 +194,7 @@ ai-hook install
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | 默认倒计时弹窗秒数（超时自动拒绝关闭） |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (开启) | 设置为 `0` 或 `false` 可完全静默关闭桌面弹窗 |
 | `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (关闭) | **强制弹出**：即使 Agent (如 Claude Code) 支持原生终端 ask，亦强制唤起系统弹窗确认（硬阻断 deny 场景除外） |
-| `AI_HOOK_DEBUG` / `--debug` | `0` (关闭) | **全量调试模式**：记录原生宿主输入、上下文、规则执行链与决策结果到 `~/.ai-hook/logs/ai-hook-debug-{agent}-{YYYYMMDD}.log` |
+| `AI_HOOK_DEBUG` / `--debug` | `0` (关闭) | **全量调试模式**：记录原生宿主输入、上下文、规则执行链与决策结果到 `~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log` |
 | `AI_HOOK_DEBUG_MAX_FILES` | `14` | 调试日志保留最大文件数（默认保留最后 14 个文件，超出自动删除最老历史文件） |
 | `AI_HOOK_DEBUG_FILE` | (自动) | 自定义调试日志写入路径（覆盖默认路径） |
 
@@ -414,7 +414,7 @@ export default function (ctx, sys) {
 | `sys.http.get(url, opt?)` | `object` | **轻量同步 HTTP GET**：支持 `headers`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `sys.http.post(url, opt?)` | `object` | **轻量同步 HTTP POST**：支持 `headers`/`body`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | 调试日志到 stderr(绝不污染决策 JSON) |
-| `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.ai-hook/logs/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;默认保留最后 14 个文件;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义,`AI_HOOK_LOG_MAX_FILES` 调整保留数量) |
+| `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;默认保留最后 14 个文件;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义,`AI_HOOK_LOG_MAX_FILES` 调整保留数量) |
 | **标准 JS 原生能力** | - | `new Date()` 时钟（星期几/小时/封网期）、`JSON` / `RegExp` / `Math` / `Map` / `Set` 均为 QuickJS 原生内建，无需 sys —— sys 只补 JS 没有的 I/O 能力 |
 
 ### 3. `aiHook` 引擎注入的规则公共 prelude（全局纯函数，零 I/O）
