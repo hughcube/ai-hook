@@ -73,10 +73,10 @@ fn chinese_tutorial_body() -> String {
     cwd:    string,    // 会话/命令工作目录(宿主下发或进程目录)
     model:  string|null, // 宿主模型标识(如 Antigravity modelName)
     tool:   string,    // 宿主工具名原文:"Bash"|"run_command"|"Write"|"Edit"|…
-    cmd:    string|null, // 仅命令类工具(Bash/run_command/…),其余为 null
+    cmd:    string|null, // [向后兼容保留] 仅命令类工具,请优先使用 ctx.command.raw
     command:{          // 深度命令语义解析对象(DCG 抽象),仅命令类工具非空;
                        // 别名 ctx.action 保持向后兼容
-      raw: string,     // 完整原始命令文本(与 ctx.cmd 一致)
+      raw: string,     // 完整原始命令文本(推荐优先使用)
       segments: [      // 语义分段数组(深度分词与管道/代码解包)
         {
           raw: string,            // 分段命令文本
@@ -123,8 +123,8 @@ fn chinese_tutorial_body() -> String {
   }
   规则判空惯例:
   - 拦截 Prompt 命令先 `if (ctx.prompt && ...)` 或 `if (ctx.event === "UserPromptSubmit")`;
-  - 命令规则先 `if (ctx.cmd && …)`;文件规则先
-  `if (ctx.file && ctx.file.action === "write" …)`——因为 cmd/file 对非适用
+  - 命令规则先 `if (ctx.command && …)`(推荐使用 ctx.command.raw 访问命令文本);文件规则先
+  `if (ctx.file && ctx.file.action === "write" …)`——因为 command/file 对非适用
   工具恒为 null。mcp/web/search/agent 同理:一次工具调用至多命中一个语义
   视图(命中者非 null,其余恒 null),未建模的工具(如 ExitPlanMode)四个视图
   全为 null,只能经 ctx.tool/ctx.args 访问。
@@ -429,10 +429,10 @@ II. ctx — one normalized view of an invocation (single schema, no aliases)
     cwd:    string,     // command/session working directory
     model:  string|null, // host model identifier (e.g. Antigravity modelName)
     tool:   string,     // host tool name verbatim: "Bash"|"run_command"|"Write"|…
-    cmd:    string|null, // command tools only (Bash/run_command/…); null otherwise
+    cmd:    string|null, // [backwards compatible] command tools only; prefer ctx.command.raw
     command:{           // deep semantic command object (DCG abstraction);
                         // alias ctx.action for backward compatibility
-      raw: string,      // raw command text (identical to ctx.cmd)
+      raw: string,      // raw command text (recommended)
       segments: [       // semantic segment array (tokenization & pipeline/code unpacking)
         {
           raw: string,            // segment text
@@ -480,8 +480,8 @@ II. ctx — one normalized view of an invocation (single schema, no aliases)
   }
   Rule idiom:
   - Guard prompt interception with `if (ctx.prompt && ...)` or `if (ctx.event === "UserPromptSubmit")`;
-  - Guard command rules with `if (ctx.cmd && …)` and file rules with
-    `if (ctx.file && ctx.file.action === "write" …)` — cmd/file are null for
+  - Guard command rules with `if (ctx.command && …)` (prefer ctx.command.raw for command text) and file rules with
+    `if (ctx.file && ctx.file.action === "write" …)` — command/file are null for
     tools they do not describe. mcp/web/search/agent work the same way: one
     tool call populates at most one semantic view (the hit one is non-null,
     the others stay null); tools we do not model (e.g. ExitPlanMode) leave all

@@ -227,8 +227,7 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 | `ctx.session` | `{id, transcriptPath}?` | Session id + full transcript path (read with `sys.fs.readText`) |
 | `ctx.cwd` | `string` | Session/command working directory |
 | `ctx.model` | `string?` | Host model id (e.g. Antigravity `modelName`) |
-| `ctx.tool` | `string` | Host tool name verbatim (`"Bash"`/`"run_command"`/`"Write"`…) |
-| `ctx.cmd` | `string?` | Command tools only; `null` otherwise |
+| `ctx.cmd` | `string?` | [backwards compatible] Command tools only; prefer `ctx.command.raw` |
 | `ctx.command` | `object?` | **Deep command semantic object (DCG abstraction)**: Tokenization and orthogonal unpacking, virtual CWD tracking, operand path resolution, inline/piped code extraction, and SQL AST evaluation; command tools only; alias `ctx.action` for backward compatibility |
 | `ctx.file` | `{path, action}?` | File tools only; `action`: `read`/`write`/`edit`/`delete`/`list` (Codex `apply_patch` targets are extracted from the patch text by the engine) |
 | `ctx.mcp` | `{server, tool}?` | MCP tools only; both host spellings (`mcp__server__tool` / `mcp_server_tool`) normalize to the same pair — server-defined parameters stay verbatim in `ctx.args`. `server`/`tool` are lower-cased for host-free matching; if an MCP tool's exact case matters, compare against `ctx.tool` verbatim |
@@ -324,58 +323,60 @@ Think of it as **two independent filter layers**:
 
 **Rule of thumb: keep the native matcher wide; keep the decision in the rule.**
 A matcher must be rewritten per host anyway (different syntax, different tool
-names), while rules travel everywhere: they test `ctx.cmd` (command text) and
-`ctx.file.action` (`read`/`write`/`edit`/`delete`/`list`), never a host's tool
-spelling. Put the "should this be blocked" logic in the rule — it is then
-testable with `ai-hook test --platform <host>` and auditable in one place — and
-let the matcher only stop unrelated tool calls from paying the hook's process
-cost. **Wide is safe**: a false positive costs one extra hook run; a false
-negative silently disables the gate.
+names), while rules travel everywhere: they test `ctx.command.raw` (command text) and
+`ctx.file.action` (`read`/`write`/`edit`/`delete`/`list`), never binding to
+one host's tool names. Putting the decision inside the rule lets you test
+and audit it in one place (`ai-hook test --platform <host>`); the matcher
+only saves execution overhead on irrelevant tool calls. **Broad matchers are
+safe**: a false positive runs one hook; a false negative silently bypasses
+the gate.
 
-Matchers are **per event**: configuring `PreToolUse` does nothing for
-`PostToolUse`/`UserPromptSubmit`…, and only events that document a matcher
-honour one.
+Matchers **apply per event**: configuring `PreToolUse` does not affect
+`PostToolUse` or `UserPromptSubmit`; only events whose official spec
+declares matcher support use it.
 
-##### Table A — matcher values per intercept goal
+##### Table A — Matcher values by target
 
-| Intercept goal | Claude Code | OpenAI Codex | CodeBuddy / WorkBuddy | Google Antigravity | Gemini CLI | OpenCode (bridge) |
+| Target | Claude Code | OpenAI Codex | CodeBuddy / WorkBuddy | Google Antigravity | Gemini CLI | OpenCode (via bridge) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| Run a command | `Bash`, `PowerShell`\* | `Bash` (official example `^Bash$`) | `Bash` | `run_command` | `run_shell_command` | `bash` |
-| Write a file | `Write` | `Write`/`apply_patch`† | `Write` | `write_to_file` | `write_file` | `write` |
-| Edit a file | `Edit` | `Edit`/`apply_patch`† | `Edit` | `replace_file_content`, `multi_replace_file_content` | `replace` | `edit` |
-| Read a file | `Read` | `Read`† | `Read` | `view_file` | `read_file` (batch: `read_many_files`) | `read` |
-| List a directory | — | — | — | `list_dir` | `list_directory` | — (no built-in `list` tool; use `bash`) |
+| Run command | `Bash`, `PowerShell`\* | `Bash` (official `^Bash$`) | `Bash` | `run_command` | `run_shell_command` | `bash` |
+| Write file | `Write` | `Write`/`apply_patch`† | `Write` | `write_to_file` | `write_file` | `write` |
+| Edit file | `Edit` | `Edit`/`apply_patch`† | `Edit` | `replace_file_content`, `multi_replace_file_content` | `replace` | `edit` |
+| Read file | `Read` | `Read`† | `Read` | `view_file` | `read_file` (batch `read_many_files`) | `read` |
+| List dir | — | — | — | `list_dir` | `list_directory` | — (no built-in list tool, uses `bash`) |
 
-\* Claude Code registers `Bash` and `PowerShell`; on Windows without Git Bash
-only `PowerShell` exists. † Codex's `apply_patch` payload always reports
-`tool_name: "apply_patch"`, whose official aliases include `Edit`/`Write`
-(hooks-doc matcher examples also name `Bash`, `update_plan`, `Agent`,
-`WebSearch`; a read tool is not named there — confirm against the official tool
-list). Prefer anchored patterns (`^Bash$`) like the official example.
+\* Claude Code registers two command tools: `Bash` and `PowerShell`; Windows
+without Git Bash has only `PowerShell`.
+† Codex `apply_patch` payloads always report `tool_name: "apply_patch"`. Its
+official aliases include `Edit`/`Write` (hooks docs matcher examples also show
+`Bash`, `update_plan`, `Agent`, `WebSearch`; read-file tools do not appear in
+hooks docs — verify against the official list). Anchoring (`^Bash$`) is
+recommended as in the official examples.
 
-##### Table B — matcher semantics per host
+##### Table B — Matcher syntax per host
 
-| Host | matcher semantics | Match everything | Notes |
+| Host | Matcher syntax | Match-all | Notes |
 | :--- | :--- | :--- | :--- |
-| Claude Code | exact string / `\|`-`,`-list when the value contains only letters, digits, `_`, `-`, spaces, `,`, `\|`; otherwise an **unanchored** JS regex (`RegExp.prototype.test` — wrap in `^…$` for a whole-name match) | `"*"`, `""`, or omitted | Tool-name filtering applies to PreToolUse/PostToolUse/PostToolUseFailure/PermissionRequest/PermissionDenied; SessionStart/Setup/SessionEnd/Notification filter other fields (`source`/`trigger`/…); a matcher on an unsupported event is silently ignored |
-| OpenAI Codex | "regex string" (official); anchoring/case not stated — the official example anchors (`^Bash$`) | `"*"`, `""`, or omitted | UserPromptSubmit / Stop / Interrupt ignore the matcher; MCP names `mcp__<server>__<tool>` |
-| CodeBuddy / WorkBuddy | regex pattern, **case-sensitive**; a bare `Write` matches any tool name *containing* "Write" — anchor `^Write$` for an exact match | `"*"`, `""`, or omitted | Only PreToolUse / PostToolUse honour it; other events omit the field; hooks run under Git Bash on Windows |
-| Google Antigravity | regex (official examples `run_command`, `run_command\|view_file`, `browser_.*`) | `""` or `"*"` | Only PreToolUse / PostToolUse honour it; PreInvocation / PostInvocation / Stop ignore it |
-| Gemini CLI | regex on tool events; exact strings on lifecycle events (official reference) | `""` or `"*"` | MCP names `mcp_<server>_<tool>` |
-| OpenCode (bridge) | the bridge compiles the CC matcher into a **case-sensitive, anchored** regex `^(pattern)$` against `input.tool` — which is OpenCode's *lowercase* tool id | n/a | ⚠️ A CC-style `"Bash"` matcher does **not** hit OpenCode's `bash` tool; use lowercase matchers (`bash\|write\|edit\|read`) for OpenCode entries (or keep a separate OpenCode section) |
+| Claude Code | String with only letters/digits/`_`/`-`/spaces/`,`/`\|` → exact string or `\|`/`,` list; contains other characters → **unanchored** JS regex (`RegExp.prototype.test`; anchor with `^…$` for exact match) | `"*"` or `""` or omit | Tool-filtering events: PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest / PermissionDenied. SessionStart / Setup / SessionEnd / Notification filter on other fields (`source`/`trigger`/…); matchers on unsupported events are silently ignored |
+| OpenAI Codex | Official docs say "regex string"; anchoring/case unspecified — official examples anchor (`^Bash$`) | `"*"` or `""` or omit | UserPromptSubmit / Stop / Interrupt ignore matchers; MCP names are `mcp__<server>__<tool>` |
+| CodeBuddy / WorkBuddy | Regex, **case-sensitive**; bare `Write` matches anything *containing* "Write" — use `^Write$` to anchor | `"*"` or `""` or omit | Only PreToolUse / PostToolUse support matchers; on Windows, hook commands run under Git Bash |
+| Google Antigravity | Regex (official examples `run_command`, `run_command\|view_file`, `browser_.*`) | `""` or `"*"` | Only PreToolUse / PostToolUse support matchers; PreInvocation / PostInvocation / Stop ignore them |
+| Gemini CLI | Tool events = regex; lifecycle events = exact string (official reference) | `""` or `"*"` | MCP names are `mcp_<server>_<tool>` |
+| OpenCode (via bridge) | Bridge compiles CC matchers to a **case-sensitive, anchored** regex `^(pattern)$` matched against `input.tool` — which is OpenCode's *lowercase* tool id | — | ⚠️ CC-style `"Bash"` **will not** match `bash` on OpenCode; use lowercase matchers (`bash\|write\|edit\|read`) or keep a separate OpenCode block |
 
-##### MCP tools — separators differ per host
+##### MCP tools — delimiters vary by host
 
-MCP-backed tools get server-prefixed names, and the separator is **not the same everywhere** (all examples are official):
+MCP tool names include a server prefix, and delimiters **differ across hosts**
+(examples from official documentation):
 
-| Host | MCP tool-name format | Official examples |
+| Host | MCP tool format | Official example |
 | :--- | :--- | :--- |
 | Claude Code | `mcp__<server>__<tool>` | `mcp__github__search_repositories`, `mcp__memory__.*` |
 | OpenAI Codex | `mcp__<server>__<tool>` | `mcp__filesystem__read_file`, `mcp__filesystem__.*` |
 | CodeBuddy / WorkBuddy | `mcp__<server>__<tool>` | `mcp__memory__.*`, `mcp__.*__write.*` |
 | Gemini CLI | `mcp_<server>_<tool>` (**single** underscore) | reference matcher docs |
-| Google Antigravity | not documented for MCP (matcher is a plain tool-name regex) | — |
-| OpenCode (bridge) | no native matcher; permission rules use `"mymcp_*": "ask"` wildcards; bridge matching of MCP `input.tool` unverified | — |
+| Google Antigravity | MCP naming not documented officially (matcher is regex on tool name) | — |
+| OpenCode (via bridge) | No native matcher; permission rules use `"mymcp_*": "ask"` wildcard | — |
 
 ⚠️ Claude Code foot-gun, stated by the docs: to match every tool of one server
 you must write `mcp__memory__.*` — a bare `mcp__memory` contains only
@@ -387,9 +388,9 @@ exact-match characters, is compared as an exact string, and matches nothing
 
 ```js
 export default function (ctx, sys) {
-  // Command guard: ctx.cmd carries the text whether the host calls the tool
-  // "Bash", "run_command" or "run_shell_command".
-  if (ctx.cmd && /rm\s+-rf\s+(\/|\*)/.test(ctx.cmd)) {
+  // Command guard: ctx.command carries the deep semantic command object
+  // (prefer ctx.command.raw for command text).
+  if (ctx.command && /rm\s+-rf\s+(\/|\*)/.test(ctx.command.raw)) {
     return { deny: "rm -rf on / or glob is forbidden" };
   }
   // File guard: action is normalized across hosts
@@ -441,9 +442,10 @@ Per-host wiring for that rule (wide matcher, one entry per event you guard):
    UserPromptSubmit/Stop/Interrupt; AGY Stop/PreInvocation/PostInvocation): the
    hook still runs — filter inside the rule (`ctx.event`, prompt, payload),
    do not expect the host not to call you.
-5. **In rules, prefer `ctx.file.action` / `ctx.cmd` over `ctx.tool === "Write"`**:
+5. **In rules, prefer `ctx.file.action` / `ctx.command` over `ctx.tool === "Write"`**:
    one logical file write is `Write` (CC/CB), `apply_patch` (Codex),
    `write_to_file` (AGY), `write_file` (Gemini) and `write` (OpenCode).
+   Use `ctx.command.raw` for command inspection and `ctx.file` for file operations.
 
 ### 2. `sys` Native Microsecond Primitives & Safe Extensions
 
@@ -559,7 +561,8 @@ roots), ask-confirm for Redis `FLUSHALL`/`FLUSHDB`:
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // 1. Block root deletion (绝对禁止删除根目录或盘符根)
   if (/rm\s+-rf\s+(\/|[a-zA-Z]:[/\\]|\*|\/\*)(\s+|$)/i.test(cmd)) {
@@ -587,7 +590,8 @@ Autonomous time via plain `new Date()`: blocks production DB resets on Friday
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
   const now = new Date();
   const dayOfWeek = now.getDay(); // 0 is Sunday, 5 is Friday
   const hour = now.getHours();
@@ -626,7 +630,8 @@ force-push (`-f`/`--force`/`--force-with-lease`) on `master`/`main`:
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // Check if current command is a git push
   if (/git\s+push\b/i.test(cmd)) {
@@ -657,7 +662,8 @@ no app-level cache): require confirmation before the privileged DB account
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // 1. Check if database client is invoked
   if (/\b(mysql|mariadb|psql)\b/i.test(cmd)) {

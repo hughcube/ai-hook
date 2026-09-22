@@ -2,11 +2,12 @@
  * Example 01: Basic High-Risk Command Interception (基础高危命令拦截)
  *
  * Demonstrates:
- * - Simple regex testing against `ctx.cmd` (对命令进行正则匹配)
+ * - Simple regex testing against `ctx.command.raw` (对命令进行正则匹配)
  * - Returning { deny: "…" } (硬阻断) or { ask: "…" } (确认)
  */
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // 1. Block root deletion (绝对禁止删除根目录或盘符根)
   if (/rm\s+-rf\s+(\/|[a-zA-Z]:[/\\]|\*|\/\*)(\s+|$)/i.test(cmd)) {

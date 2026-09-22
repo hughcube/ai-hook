@@ -7,7 +7,8 @@
  * - Holiday date freeze list (特定节假日封网名单控制)
  */
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
   const now = new Date();
 
   const dayOfWeek = now.getDay(); // 0 is Sunday, 5 is Friday

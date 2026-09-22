@@ -30,7 +30,8 @@ export default function(ctx, sys) {
   // ctx.raw      : 宿主传入的完整原始 payload（已自动反序列化为 JS 对象）
   // ctx.rawInput : 宿主传入的原始 JSON 字符串
   // ctx.tool     : 当前调用的工具名称（如 "Bash", "run_command", "Write"）
-  // ctx.cmd      : 命令行指令文本；仅命令类工具非 null
+  // ctx.command  : 深度命令语义解析对象（DCG 抽象）；raw 属性为命令完整文本；segments 为语义分段
+  // ctx.cmd      : [向后兼容保留] 命令行指令文本；优先推荐 ctx.command.raw
   // ctx.file     : { path, action } 仅文件类工具非 null；action: read|write|edit|delete|list
   // ctx.session  : { id, transcriptPath } 会话与对话记录（宿主提供时）
   // ctx.mode     : 宿主权限模式 default|plan|acceptEdits|dontAsk|bypassPermissions
@@ -41,7 +42,7 @@ export default function(ctx, sys) {
   // ctx.prompt   : 用户的原始 Prompt（仅在 UserPromptSubmit 等 Prompt 拦截事件中可用）
   console.log(`[Demo] 事件: ${ctx.event}, 工具: ${ctx.tool}, 目录: ${ctx.cwd}`);
   if (ctx.prompt) console.log(`[Demo] 用户 Prompt: ${ctx.prompt}`);
-  if (ctx.cmd) console.log(`[Demo] 命令: ${ctx.cmd}`);
+  if (ctx.command) console.log(`[Demo] 命令: ${ctx.command.raw}`);
   if (ctx.raw) console.log(`[Demo] 原始 Payload Keys: ${Object.keys(ctx.raw).join(", ")}`);
 
   // =========================================================================
@@ -86,7 +87,7 @@ export default function(ctx, sys) {
 
   // 3.8 结构化日志 (sys.log)：默认进 stderr 与 ~/.log/ai-hook/ 当日文件
   if (ctx.file) sys.log("info", `file op: ${ctx.file.action} ${ctx.file.path || ""}`);
-  if (ctx.cmd) sys.log("debug", `cmd: ${ctx.cmd}`);
+  if (ctx.command) sys.log("debug", `cmd: ${ctx.command.raw}`);
 
   // =========================================================================
   // 4. 决策控制：直接强制不通过 vs 弹窗确认 vs 终端确认 vs 零 Token 阻断 vs 上下文注入
@@ -94,7 +95,7 @@ export default function(ctx, sys) {
 
   // 场景 A: 【直接强制不通过，绝对不弹窗】 (Direct Hard Block)
   // 核心分支强推等致命高危动作，直接拒绝，零弹窗打扰！
-  if (ctx.cmd && /git\s+push\b.*(-f|--force)\b/.test(ctx.cmd)) {
+  if (ctx.command && /git\s+push\b.*(-f|--force)\b/.test(ctx.command.raw)) {
     if (currentBranch === "master" || currentBranch === "main") {
       return {
         deny: `【硬阻断】核心分支 '${currentBranch}' 严禁执行强制推送操作 (force-push)！`
@@ -104,7 +105,7 @@ export default function(ctx, sys) {
 
   // 场景 B: 【控制弹窗授权确认】 (Modern Fluent Card GUI Popup)
   // 敏感但允许人工复核的操作，唤起现代化置顶吸附卡片弹窗，支持自定义标题、超时倒计时：
-  if (ctx.cmd && /\b(migrate|wipe|reset)\b/i.test(ctx.cmd)) {
+  if (ctx.command && /\b(migrate|wipe|reset)\b/i.test(ctx.command.raw)) {
     return {
       ask: "检测到数据库重置或变更命令，可能影响现有数据！",
       title: "数据库结构变更授权", // 自定义弹窗标题
@@ -115,7 +116,7 @@ export default function(ctx, sys) {
 
   // 场景 C: 【终端内交互确认，不唤起弹窗】 (Terminal-Only Ask)
   // 命令行内交互问询（如 Claude Code ask / Antigravity force_ask），不弹窗：
-  if (ctx.cmd && /\b(npm\s+publish|cargo\s+publish)\b/i.test(ctx.cmd)) {
+  if (ctx.command && /\b(npm\s+publish|cargo\s+publish)\b/i.test(ctx.command.raw)) {
     return {
       ask: "检测到版本发布命令，是否确认推送到公共制品库？",
       gui: false           // 不弹窗：宿主能 ask 走终端 ask，不能 ask 直接拒绝（fail-closed）

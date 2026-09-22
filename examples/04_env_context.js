@@ -7,7 +7,8 @@
  * - Fine-grained identity-based access control (特权写账户管控，放行只读账户)
  */
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // 1. Check if database client is invoked
   if (/\b(mysql|mariadb|psql)\b/i.test(cmd)) {

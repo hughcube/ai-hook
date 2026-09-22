@@ -226,9 +226,8 @@ export default function(ctx, sys) {
 | `ctx.session` | `{id, transcriptPath}?` | 会话 id 与全量对话记录路径(可用 `sys.fs.readText` 读取上下文) |
 | `ctx.cwd` | `string` | 会话/命令工作目录 |
 | `ctx.model` | `string?` | 宿主模型标识(如 Antigravity `modelName`) |
-| `ctx.tool` | `string` | 宿主工具名原文(`"Bash"`/`"run_command"`/`"Write"`…) |
-| `ctx.cmd` | `string?` | 仅命令类工具非空;其余为 `null` |
-| `ctx.command` | `object?` | **深度命令语义解析对象（DCG 抽象基座）**：自动分词与正交通用解包，追踪虚拟 CWD 转移与受影响目标路径，提取代码槽与数据库 SQL 语义判定；仅命令类工具非空；别名 `ctx.action` 保持向后兼容 |
+| `ctx.cmd` | `string?` | [向后兼容保留] 仅命令类工具非空;其余为 `null`(推荐优先使用 `ctx.command.raw`) |
+| `ctx.command` | `object?` | **深度命令语义解析对象（DCG 抽象基座）**：自动分词与正交通用解包，追踪虚拟 CWD 转移与受影响目标路径，提取代码槽与数据库 SQL 语义判定；仅命令类工具非空；包含 `raw` (完整命令)、`segments` (语义分段数组)、`db`、`find()` 等；别名 `ctx.action` 保持向后兼容 |
 | `ctx.file` | `{path, action}?` | 仅文件类工具;`action`: `read`/`write`/`edit`/`delete`/`list`(按工具名归一;Codex `apply_patch` 的路径由引擎从 patch 文本提取) |
 | `ctx.mcp` | `{server, tool}?` | 仅 MCP 工具;两种宿主拼写(`mcp__server__tool` / `mcp_server_tool`)归一为同一对——server 自定义的参数仍在 `ctx.args` 原文里。`server`/`tool` 已小写归一以跨宿主一致;若某 MCP 工具名的大小写有实际语义,请改用 `ctx.tool` 原文精确比较 |
 | `ctx.web` | `{action, url, query}?` | 仅网页工具;`action`: `fetch`(WebFetch / AGY `read_url_content`,带 `url`)或 `search`(WebSearch / AGY `search_web`,带 `query`) |
@@ -320,7 +319,7 @@ export default function(ctx, sys) {
    决定放行/询问/拒绝/注入,这些字段在所有宿主上含义一致。
 
 **原则:matcher 配宽,判断留在规则里。** matcher 反正要随宿主重写(语法与工具名
-都不同),而规则可以到处走:规则只读 `ctx.cmd`(命令文本)与 `ctx.file.action`
+都不同),而规则可以到处走:规则只读 `ctx.command.raw`(命令文本)与 `ctx.file.action`
 (`read`/`write`/`edit`/`delete`/`list`),绝不依赖某个宿主的具体工具拼写。
 把"要不要拦"的判断放进规则,就能用 `ai-hook test --platform <宿主>` 一处测试、
 一处审计;matcher 只负责让无关工具调用不必付出进程开销。**配宽是安全的**:
@@ -380,8 +379,8 @@ Gemini CLI 上请用单下划线形式。
 ```js
 export default function (ctx, sys) {
   // 命令守卫:无论宿主把该工具叫 "Bash"、"run_command" 还是
-  // "run_shell_command",ctx.cmd 拿到的都是命令文本。
-  if (ctx.cmd && /rm\s+-rf\s+(\/|\*)/.test(ctx.cmd)) {
+  // "run_shell_command",ctx.command 拿到的都是深度命令解析对象(推荐 ctx.command.raw 访问文本)。
+  if (ctx.command && /rm\s+-rf\s+(\/|\*)/.test(ctx.command.raw)) {
     return { deny: "禁止对根目录/通配符执行 rm -rf" };
   }
   // 文件守卫:action 跨宿主归一(Write/write_file/write_to_file/write → "write")。
@@ -430,9 +429,9 @@ export default function (ctx, sys) {
 4. **忽略 matcher 的事件会全量触发**(Codex 的 UserPromptSubmit/Stop/Interrupt,
    AGY 的 Stop/PreInvocation/PostInvocation):hook 照样被调用,请在规则内按
    `ctx.event`/prompt/载荷过滤,别指望宿主不叫你。
-5. **规则里优先用 `ctx.file.action`/`ctx.cmd`,而不是 `ctx.tool === "Write"`**:
+5. **规则里优先用 `ctx.file.action` / `ctx.command`，而不是 `ctx.tool === "Write"`**:
    同一个"写文件"逻辑分别是 Write(CC/CB)、apply_patch(Codex)、write_to_file
-   (AGY)、write_file(Gemini)、write(OpenCode)。
+   (AGY)、write_file(Gemini)、write(OpenCode)。通过 `ctx.command.raw` 访问命令，通过 `ctx.file` 访问文件。
 
 
 ### 2. `sys` 原生极速自治能力（微秒级原生数据获取与安全扩展）
@@ -545,7 +544,8 @@ return null; // 或 return { allow: true };
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // 1. Block root deletion (绝对禁止删除根目录或盘符根)
   if (/rm\s+-rf\s+(\/|[a-zA-Z]:[/\\]|\*|\/\*)(\s+|$)/i.test(cmd)) {
@@ -573,7 +573,8 @@ export default function(ctx, sys) {
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
   const now = new Date();
   const dayOfWeek = now.getDay(); // 0 is Sunday, 5 is Friday
   const hour = now.getHours();
@@ -612,7 +613,8 @@ force-push(`-f`/`--force`/`--force-with-lease`):
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // Check if current command is a git push
   if (/git\s+push\b/i.test(cmd)) {
@@ -642,7 +644,8 @@ export default function(ctx, sys) {
 
 ```js
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // 1. Check if database client is invoked
   if (/\b(mysql|mariadb|psql)\b/i.test(cmd)) {

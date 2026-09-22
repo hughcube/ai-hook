@@ -6,7 +6,8 @@
  * - Block force-push to main/master branches (严禁向主分支强制推送)
  */
 export default function(ctx, sys) {
-  const cmd = ctx.cmd || "";
+  if (!ctx.command) return null;
+  const cmd = ctx.command.raw;
 
   // Check if current command is a git push
   if (/git\s+push\b/i.test(cmd)) {
