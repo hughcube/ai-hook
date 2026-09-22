@@ -1240,6 +1240,7 @@ fn create_command_object<'js>(
     let action_obj = Object::new(js_ctx.clone())?;
 
     action_obj.set("command", action.command.as_str())?;
+    action_obj.set("raw", action.command.as_str())?;
     action_obj.set("normalized", action.normalized.as_str())?;
     action_obj.set("executable", action.executable.as_str())?;
     if let Some(ref sub) = action.subcommand {
@@ -1309,6 +1310,7 @@ fn create_command_object<'js>(
         c_obj.set("command", c.command.as_str())?;
         c_obj.set("normalized", c.normalized.as_str())?;
         c_obj.set("executable", c.executable.as_str())?;
+        c_obj.set("program", c.executable.as_str())?;
         if let Some(ref sub) = c.subcommand {
             c_obj.set("subcommand", sub.as_str())?;
         } else {
@@ -1327,12 +1329,18 @@ fn create_command_object<'js>(
         c_obj.set("args", c_args)?;
 
         c_obj.set("cwd", c.cwd.as_str())?;
+        c_obj.set("virtualCwd", c.cwd.as_str())?;
 
         let c_targets = Array::new(js_ctx.clone())?;
         for (j, t) in c.resolved_targets.iter().enumerate() {
             c_targets.set(j, t.as_str())?;
         }
         c_obj.set("resolvedTargets", c_targets)?;
+        if let Some(first_target) = c.resolved_targets.first() {
+            c_obj.set("operandTarget", first_target.as_str())?;
+        } else {
+            c_obj.set("operandTarget", Value::new_null(js_ctx.clone()))?;
+        }
 
         let c_unwrapped = Array::new(js_ctx.clone())?;
         for (j, u) in c.unwrapped.iter().enumerate() {
@@ -1342,6 +1350,11 @@ fn create_command_object<'js>(
             c_unwrapped.set(j, u_obj)?;
         }
         c_obj.set("unwrapped", c_unwrapped)?;
+        if let Some(first_unwrapped) = c.unwrapped.first() {
+            c_obj.set("code", first_unwrapped.code.as_str())?;
+        } else {
+            c_obj.set("code", Value::new_null(js_ctx.clone()))?;
+        }
 
         segments_arr.set(i, c_obj)?;
     }
@@ -1405,6 +1418,7 @@ fn create_command_object<'js>(
                 seg_obj.set("command", seg.command.as_str())?;
                 seg_obj.set("normalized", seg.normalized.as_str())?;
                 seg_obj.set("executable", seg.executable.as_str())?;
+                seg_obj.set("program", seg.executable.as_str())?;
                 if let Some(ref sub) = seg.subcommand {
                     seg_obj.set("subcommand", sub.as_str())?;
                 } else {
@@ -1421,11 +1435,17 @@ fn create_command_object<'js>(
                 }
                 seg_obj.set("args", seg_args)?;
                 seg_obj.set("cwd", seg.cwd.as_str())?;
+                seg_obj.set("virtualCwd", seg.cwd.as_str())?;
                 let seg_targets = Array::new(js_ctx_call.clone())?;
                 for (j, t) in seg.resolved_targets.iter().enumerate() {
                     seg_targets.set(j, t.as_str())?;
                 }
                 seg_obj.set("resolvedTargets", seg_targets)?;
+                if let Some(first_target) = seg.resolved_targets.first() {
+                    seg_obj.set("operandTarget", first_target.as_str())?;
+                } else {
+                    seg_obj.set("operandTarget", Value::new_null(js_ctx_call.clone()))?;
+                }
                 let seg_unwrapped = Array::new(js_ctx_call.clone())?;
                 for (j, u) in seg.unwrapped.iter().enumerate() {
                     let u_obj = Object::new(js_ctx_call.clone())?;
@@ -1434,6 +1454,11 @@ fn create_command_object<'js>(
                     seg_unwrapped.set(j, u_obj)?;
                 }
                 seg_obj.set("unwrapped", seg_unwrapped)?;
+                if let Some(first_unwrapped) = seg.unwrapped.first() {
+                    seg_obj.set("code", first_unwrapped.code.as_str())?;
+                } else {
+                    seg_obj.set("code", Value::new_null(js_ctx_call.clone()))?;
+                }
                 res_arr.set(idx, seg_obj)?;
             }
             Ok(res_arr)
