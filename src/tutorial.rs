@@ -74,6 +74,29 @@ fn chinese_tutorial_body() -> String {
     model:  string|null, // 宿主模型标识(如 Antigravity modelName)
     tool:   string,    // 宿主工具名原文:"Bash"|"run_command"|"Write"|"Edit"|…
     cmd:    string|null, // 仅命令类工具(Bash/run_command/…),其余为 null
+    command:{          // 深度命令语义解析对象(DCG 抽象),仅命令类工具非空;
+                       // 别名 ctx.action 保持向后兼容
+      raw: string,     // 完整原始命令文本(与 ctx.cmd 一致)
+      segments: [      // 语义分段数组(深度分词与管道/代码解包)
+        {
+          raw: string,            // 分段命令文本
+          program: string,        // 执行程序名(如 "mysql", "rm", "git")
+          args: string[],         // 参数列表
+          flags: string[],        // 选项标志列表
+          virtualCwd: string,     // 该段虚拟工作目录(自动追踪前序 cd 路径转移)
+          operandTarget: string?, // 结合 virtualCwd 解析的操作数目标路径
+          code: string?,          // 提取的内联代码或管道输入代码(如 -e/-c)
+          db: {                   // 数据库语义上下文(仅数据库客户端存在)
+            engine: "mysql"|"postgresql"|"sqlite"|"clickhouse",
+            query: string?,       // 执行的 SQL 语句文本
+            isReadOnly: bool,     // 纯只读判定(多语句分号切割 Fail-Closed 否决)
+            target: { host, port, user, database } // 连接目标与账号
+          }?
+        }
+      ],
+      db: object|null, // 首个数据库分段的 db 上下文快捷引用
+      find: function(prog) // 按程序名快速检索分段的辅助方法
+    } | null,
     file:   { path: string|null, action: "read"|"write"|"edit"|"delete"|"list" } | null,
             // 仅文件类工具;action 由工具名归一(Read→read, Write→write,
             // Edit/apply_patch→edit, Delete→delete, list_dir→list)。
@@ -407,6 +430,29 @@ II. ctx — one normalized view of an invocation (single schema, no aliases)
     model:  string|null, // host model identifier (e.g. Antigravity modelName)
     tool:   string,     // host tool name verbatim: "Bash"|"run_command"|"Write"|…
     cmd:    string|null, // command tools only (Bash/run_command/…); null otherwise
+    command:{           // deep semantic command object (DCG abstraction);
+                        // alias ctx.action for backward compatibility
+      raw: string,      // raw command text (identical to ctx.cmd)
+      segments: [       // semantic segment array (tokenization & pipeline/code unpacking)
+        {
+          raw: string,            // segment text
+          program: string,        // executable name (e.g. "mysql", "rm", "git")
+          args: string[],         // argument list
+          flags: string[],        // option flags
+          virtualCwd: string,     // virtual CWD (tracks prior `cd` path shifts)
+          operandTarget: string?, // operand target resolved against virtualCwd
+          code: string?,          // unpacked inline code or piped payload (-e/-c)
+          db: {                   // database semantic context (DB clients only)
+            engine: "mysql"|"postgresql"|"sqlite"|"clickhouse",
+            query: string?,       // SQL text
+            isReadOnly: bool,     // read-only verdict (Fail-Closed on any non-read)
+            target: { host, port, user, database } // connection target
+          }?
+        }
+      ],
+      db: object|null,  // shorthand reference to the first database segment
+      find: function(prog) // helper to find segment by program name
+    } | null,
     file:   { path: string|null, action: "read"|"write"|"edit"|"delete"|"list" } | null,
             // file tools only; action normalized from tool name
             // (Read→read, Write→write, Edit/apply_patch→edit, Delete→delete, list_dir→list).

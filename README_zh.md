@@ -228,6 +228,7 @@ export default function(ctx, sys) {
 | `ctx.model` | `string?` | 宿主模型标识(如 Antigravity `modelName`) |
 | `ctx.tool` | `string` | 宿主工具名原文(`"Bash"`/`"run_command"`/`"Write"`…) |
 | `ctx.cmd` | `string?` | 仅命令类工具非空;其余为 `null` |
+| `ctx.command` | `object?` | **深度命令语义解析对象（DCG 抽象基座）**：自动分词与正交通用解包，追踪虚拟 CWD 转移与受影响目标路径，提取代码槽与数据库 SQL 语义判定；仅命令类工具非空；别名 `ctx.action` 保持向后兼容 |
 | `ctx.file` | `{path, action}?` | 仅文件类工具;`action`: `read`/`write`/`edit`/`delete`/`list`(按工具名归一;Codex `apply_patch` 的路径由引擎从 patch 文本提取) |
 | `ctx.mcp` | `{server, tool}?` | 仅 MCP 工具;两种宿主拼写(`mcp__server__tool` / `mcp_server_tool`)归一为同一对——server 自定义的参数仍在 `ctx.args` 原文里。`server`/`tool` 已小写归一以跨宿主一致;若某 MCP 工具名的大小写有实际语义,请改用 `ctx.tool` 原文精确比较 |
 | `ctx.web` | `{action, url, query}?` | 仅网页工具;`action`: `fetch`(WebFetch / AGY `read_url_content`,带 `url`)或 `search`(WebSearch / AGY `search_web`,带 `query`) |
@@ -236,9 +237,47 @@ export default function(ctx, sys) {
 | `ctx.args` | `object` | 宿主工具参数原文(`{command}`、`{file_path, content}`、`{CommandLine}`…) |
 | `ctx.raw` | `object?` | 宿主完整原始 payload —— 逃生舱，`ctx` 字段不够用才用；**访问时才解析**，MB 级 transcript 不拖慢未用它的规则 |
 | `ctx.rawInput` | `string` | payload 原始文本 |
-> 设计原则:一语义一属性,无别名;非适用工具时 `cmd`/`file` 为 `null`(规则请先判空)。
+> 设计原则:一语义一属性;非适用工具时 `cmd`/`command`/`file` 为 `null`(规则请先判空)。
 
-#### 1.1 宿主事件名速查:规范名(`ctx.event`)× 各家 Agent 事件对照
+#### 1.1 深度命令语义解析基座 (`ctx.command` / `ctx.action`)
+
+对于 `Bash` / `run_command` 等命令工具，单纯的字符串正则匹配在面对复杂组合命令（如 `cd / && rm *`、管道注入 `printf ... | mysql` 或嵌套解释器执行 `bash -c "..."`）时极易被绕过或误判。`ai-hook` 内置了工业级 **DCG (Destructive Command Guard)** 命令语义解包基座：
+
+```javascript
+export default function(ctx, sys) {
+  if (!ctx.command) return null;
+
+  // 1. 自动追踪虚拟 CWD 状态转移与受影响目标 (即便跨段 cd 也逃不掉)
+  //    例如: "cd ~ && rm -rf temp && cd / && rm *"
+  for (const seg of ctx.command.segments) {
+    if (seg.program === "rm" && (seg.operandTarget === "/" || seg.virtualCwd === "/")) {
+      return { deny: "【硬阻断】禁止删除系统根目录！" };
+    }
+  }
+
+  // 2. 数据库与 SQL AST 判定 (Fail-Closed 只读保障)
+  //    自动提取 mysql -e "..." / psql -c "..." 或管道输送的 SQL 代码
+  if (ctx.command.db) {
+    // 若不是只读查询 (任何写/修改/DDL，或多语句中包含非只读，甚至无法解析时均判定为 false)
+    if (!ctx.command.db.isReadOnly) {
+      return {
+        title: "生产数据库写入确认",
+        ask: `检测到对数据库(${ctx.command.db.target.database})执行写操作: ${ctx.command.db.query}，是否确认允许？`
+      };
+    }
+  }
+
+  // 3. 按程序名快速检索
+  const gitSeg = ctx.command.find("git");
+  if (gitSeg && gitSeg.flags.includes("-f")) {
+    return { title: "强制推送确认", ask: "检测到 git push -f 强推操作，是否允许？" };
+  }
+
+  return null;
+}
+```
+
+#### 1.2 宿主事件名速查:规范名(`ctx.event`)× 各家 Agent 事件对照
 
 `ctx.event` 一律采用 **Claude Code 拼写**,在所有宿主上含义一致。下表把每个规范名映射到各家 Agent 在同一生命周期节点实际触发的事件名(`—` = 该宿主无此事件):
 

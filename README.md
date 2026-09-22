@@ -229,6 +229,7 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 | `ctx.model` | `string?` | Host model id (e.g. Antigravity `modelName`) |
 | `ctx.tool` | `string` | Host tool name verbatim (`"Bash"`/`"run_command"`/`"Write"`…) |
 | `ctx.cmd` | `string?` | Command tools only; `null` otherwise |
+| `ctx.command` | `object?` | **Deep command semantic object (DCG abstraction)**: Tokenization and orthogonal unpacking, virtual CWD tracking, operand path resolution, inline/piped code extraction, and SQL AST evaluation; command tools only; alias `ctx.action` for backward compatibility |
 | `ctx.file` | `{path, action}?` | File tools only; `action`: `read`/`write`/`edit`/`delete`/`list` (Codex `apply_patch` targets are extracted from the patch text by the engine) |
 | `ctx.mcp` | `{server, tool}?` | MCP tools only; both host spellings (`mcp__server__tool` / `mcp_server_tool`) normalize to the same pair — server-defined parameters stay verbatim in `ctx.args`. `server`/`tool` are lower-cased for host-free matching; if an MCP tool's exact case matters, compare against `ctx.tool` verbatim |
 | `ctx.web` | `{action, url, query}?` | Web tools only; `action`: `fetch` (WebFetch / AGY `read_url_content`, has `url`) or `search` (WebSearch / AGY `search_web`, has `query`) |
@@ -237,9 +238,47 @@ Through the `ctx` object, your rule can inspect the AI Agent type, the full raw 
 | `ctx.args` | `object` | Host tool arguments verbatim (`{command}`, `{file_path, content}`, …) |
 | `ctx.raw` | `object?` | Full original host payload — escape hatch, prefer `cmd`/`file`/`args`; **parsed on first access**, so MB-sized transcripts cost nothing to rules that never touch it |
 | `ctx.rawInput` | `string` | Raw payload text |
-> Design rule: one semantic per property, no aliases; `cmd`/`file` are `null` when not applicable — guard rules with truthiness checks.
+> Design rule: one semantic per property; `cmd`/`command`/`file` are `null` when not applicable — guard rules with truthiness checks.
 
-#### 1.1 Host event names at a glance: canonical (`ctx.event`) ↔ every agent
+#### 1.1 Deep Semantic Command Engine (`ctx.command` / `ctx.action`)
+
+For command tools like `Bash` or `run_command`, naive string regexes are vulnerable to bypasses in chained commands (e.g. `cd / && rm *`), pipeline injections (`printf ... | mysql`), or nested interpreter payloads (`bash -c "..."`). `ai-hook` embeds an industrial-grade **DCG (Destructive Command Guard)** engine:
+
+```javascript
+export default function(ctx, sys) {
+  if (!ctx.command) return null;
+
+  // 1. Automatically tracks virtual CWD shifts across command segments
+  //    e.g.: "cd ~ && rm -rf temp && cd / && rm *"
+  for (const seg of ctx.command.segments) {
+    if (seg.program === "rm" && (seg.operandTarget === "/" || seg.virtualCwd === "/")) {
+      return { deny: "[Hard Block] Deleting root directory is prohibited!" };
+    }
+  }
+
+  // 2. Database & SQL AST evaluation (Fail-Closed read-only enforcement)
+  //    Unpacks queries from mysql -e "..." / psql -c "..." or piped stdin
+  if (ctx.command.db) {
+    // If query is not read-only (any write/mutation/DDL, multi-statement write, or unparseable syntax)
+    if (!ctx.command.db.isReadOnly) {
+      return {
+        title: "Database Mutation Authorization",
+        ask: `Detected mutation against database (${ctx.command.db.target.database}): ${ctx.command.db.query}. Allow execution?`
+      };
+    }
+  }
+
+  // 3. Fast lookup by program name
+  const gitSeg = ctx.command.find("git");
+  if (gitSeg && gitSeg.flags.includes("-f")) {
+    return { title: "Force Push Authorization", ask: "Detected git push -f. Allow execution?" };
+  }
+
+  return null;
+}
+```
+
+#### 1.2 Host event names at a glance: canonical (`ctx.event`) ↔ every agent
 
 `ctx.event` is the **Claude Code spelling**, used identically on every host. The table maps each canonical name to the event each agent fires for the same lifecycle point (`—` = the host has no such event):
 
