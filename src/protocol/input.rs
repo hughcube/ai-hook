@@ -428,6 +428,17 @@ fn permission_mode_is_yolo(mode: &str) -> bool {
 /// `conversationId` alone is only accepted when the Claude-Code-family markers
 /// are absent, so a Gemini CLI or Claude Code payload (which always carries
 /// `hook_event_name`) is never misclassified.
+/// True for the Google Antigravity envelope.
+///
+/// Antigravity sends no event name, so it is recognised by its payload shape.
+/// The documented common fields are `conversationId` / `workspacePaths` /
+/// `transcriptPath` / `artifactDirectoryPath` / `modelName`; tool events add
+/// `toolCall`, and `Stop` / `PreInvocation` / `PostInvocation` add
+/// `executionNum` / `invocationNum` instead.
+///
+/// `conversationId` alone is only accepted when the Claude-Code-family markers
+/// are absent, so a Gemini CLI or Claude Code payload (which always carries
+/// `hook_event_name`) is never misclassified.
 fn is_antigravity_envelope(val: &serde_json::Value) -> bool {
     if val.get("toolCall").is_some() {
         return true;
@@ -435,16 +446,84 @@ fn is_antigravity_envelope(val: &serde_json::Value) -> bool {
     val.get("conversationId").is_some()
         && val.get("hook_event_name").is_none()
         && val.get("tool_input").is_none()
+        && val.get("toolInput").is_none()
+        && val.get("tool_args").is_none()
+        && val.get("toolArgs").is_none()
         && val.get("tool_name").is_none()
+        && val.get("toolName").is_none()
 }
 
 /// True for hosts that mirror the Claude Code envelope
-/// (`hook_event_name` + `tool_name` + `tool_input`).
+/// (`hook_event_name` + `tool_name` + `tool_input`), or provide tool arguments
+/// or tool calls in standard aliases.
 fn has_claude_envelope(val: &serde_json::Value) -> bool {
     val.get("tool_input").is_some()
         || val.get("toolInput").is_some()
+        || val.get("tool_args").is_some()
+        || val.get("toolArgs").is_some()
         || val.get("tool_name").is_some()
         || val.get("toolName").is_some()
+        || val.get("toolCalls").is_some()
+        || val.get("tool_calls").is_some()
+}
+
+/// Check whether `name` identifies a known shell / command execution tool.
+pub fn is_supported_command_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "bash"
+            | "sh"
+            | "zsh"
+            | "run_command"
+            | "run_shell_command"
+            | "run-shell-command"
+            | "exec_command"
+            | "shell"
+            | "powershell"
+            | "pwsh"
+            | "cmd"
+            | "cmd.exe"
+            | "command"
+            | "terminal"
+            | "launch-process"
+            | "run_terminal_cmd"
+            | "run_terminal_command"
+            | "runterminalcommand"
+            | "run_in_terminal"
+            | "runinterminal"
+    )
+}
+
+/// Resolves tool arguments into an object.
+///
+/// Handles stringified JSON arguments (e.g. from VS Code Agent Host:
+/// `"args": "{\"command\":\"...\"}"`) as well as bare string commands,
+/// preventing silent fail-open vulnerabilities.
+pub fn resolve_args_object(
+    args: Option<&serde_json::Value>,
+) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
+    let a = args?;
+    match a {
+        serde_json::Value::Object(_) => Some(std::borrow::Cow::Borrowed(a)),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && parsed.is_object()
+            {
+                return Some(std::borrow::Cow::Owned(parsed));
+            }
+            if !trimmed.is_empty() {
+                // If it's a bare string command (e.g. "rm -rf /")
+                return Some(std::borrow::Cow::Owned(serde_json::json!({
+                    "command": trimmed,
+                    "CommandLine": trimmed
+                })));
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Extracts all target paths (and their actions) from a Codex
@@ -530,34 +609,18 @@ fn normalize_semantics(
     args: Option<&serde_json::Value>,
 ) -> Normalized {
     let lower = tool_name.to_ascii_lowercase();
-    let args = match args {
+    let resolved = resolve_args_object(args);
+    let args = match resolved.as_ref() {
         Some(a) if a.is_object() => a,
         _ => return Normalized::default(),
     };
 
     // 1. Command tools: a single shell command string.
     let command_keys = match platform {
-        Platform::Antigravity => &["CommandLine", "command", "cmd"][..],
-        _ => &["command", "CommandLine", "cmd"][..],
+        Platform::Antigravity => &["CommandLine", "commandLine", "command", "Command", "cmd"][..],
+        _ => &["command", "CommandLine", "commandLine", "Command", "cmd"][..],
     };
-    // "run_shell_command" is Gemini CLI's registered shell tool name
-    // (official Tools reference, geminicli.com/docs/reference/tools); without
-    // it every command rule and the fast path are dead on Gemini.
-    // "exec_command" is Codex's unified exec tool: the official Tool coverage
-    // table lists it as firing PreToolUse/PostToolUse ("Match as Bash"), so it
-    // must be recognized or `ctx.cmd` stays null and every command rule on that
-    // path silently degrades to "no opinion" (= allow).
-    let command_tools = [
-        "bash",
-        "run_command",
-        "run_shell_command",
-        "exec_command",
-        "shell",
-        "powershell",
-        "command",
-        "terminal",
-    ];
-    if command_tools.contains(&lower.as_str()) {
+    if is_supported_command_tool(&lower) {
         return Normalized {
             cmd: get_str(args, command_keys).map(str::to_string),
             ..Normalized::default()
@@ -810,12 +873,18 @@ impl HookContext {
 
         // ---- 1. Google Antigravity: no event name, classified by shape ----
         if is_antigravity_envelope(&val) {
-            let tool_call = val.get("toolCall");
+            let tool_call = val.get("toolCall").or_else(|| {
+                val.get("toolCalls")
+                    .or_else(|| val.get("tool_calls"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+            });
             let tool_name = tool_call
                 .and_then(|tc| get_str(tc, &["name", "toolName"]))
                 .unwrap_or("")
                 .to_string();
             let args = tool_call.and_then(|tc| tc.get("args").or_else(|| tc.get("parameters")));
+            let resolved_args = resolve_args_object(args);
             let norm = normalize_semantics(Platform::Antigravity, &tool_name, args);
 
             let conversation = ConversationInfo {
@@ -870,7 +939,10 @@ impl HookContext {
                 web: norm.web,
                 search: norm.search,
                 agent: norm.agent,
-                args: args.cloned().unwrap_or(serde_json::Value::Null),
+                args: resolved_args
+                    .map(|c| c.into_owned())
+                    .or_else(|| args.cloned())
+                    .unwrap_or(serde_json::Value::Null),
                 // Antigravity sends no event name; the envelope shape decides
                 // which of its five events this is.
                 event_enum,
@@ -888,10 +960,46 @@ impl HookContext {
 
         // ---- 2. Claude-Code-shaped hosts: Codex / Claude Code / CodeBuddy ----
         if has_claude_envelope(&val) {
-            let tool_name = get_str(&val, &["tool_name", "toolName"])
+            let mut tool_name = get_str(&val, &["tool_name", "toolName"])
                 .unwrap_or("")
                 .to_string();
-            let tool_input = val.get("tool_input").or_else(|| val.get("toolInput"));
+            let mut tool_input = val
+                .get("tool_input")
+                .or_else(|| val.get("toolInput"))
+                .or_else(|| val.get("tool_args"))
+                .or_else(|| val.get("toolArgs"));
+
+            // Support batched toolCalls[] (e.g. VS Code Agent Host)
+            if (tool_name.is_empty() || tool_input.is_none())
+                && let Some(calls) = val
+                    .get("toolCalls")
+                    .or_else(|| val.get("tool_calls"))
+                    .and_then(|v| v.as_array())
+            {
+                let chosen = calls
+                    .iter()
+                    .find(|tc| {
+                        let n = get_str(tc, &["name", "toolName", "tool_name"]).unwrap_or("");
+                        is_supported_command_tool(n)
+                    })
+                    .or_else(|| calls.first());
+
+                if let Some(tc) = chosen {
+                    if tool_name.is_empty()
+                        && let Some(n) = get_str(tc, &["name", "toolName", "tool_name"])
+                    {
+                        tool_name = n.to_string();
+                    }
+                    if tool_input.is_none() {
+                        tool_input = tc
+                            .get("args")
+                            .or_else(|| tc.get("parameters"))
+                            .or_else(|| tc.get("input"));
+                    }
+                }
+            }
+
+            let resolved_input = resolve_args_object(tool_input);
             let norm = normalize_semantics(
                 Platform::ClaudeCode, // shape is identical for these hosts
                 &tool_name,
@@ -945,7 +1053,10 @@ impl HookContext {
                 web: norm.web,
                 search: norm.search,
                 agent: norm.agent,
-                args: tool_input.cloned().unwrap_or(serde_json::Value::Null),
+                args: resolved_input
+                    .map(|c| c.into_owned())
+                    .or_else(|| tool_input.cloned())
+                    .unwrap_or(serde_json::Value::Null),
                 event_enum: event_or(event.as_deref(), HookEvent::PreToolUse),
                 event: event.clone().or_else(|| Some("PreToolUse".to_string())),
                 event_raw: event,

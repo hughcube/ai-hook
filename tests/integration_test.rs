@@ -1442,7 +1442,8 @@ fn test_claude_confirm_ask_vs_dialog_denied() {
 
 #[test]
 fn test_sys_exec_api() {
-    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let runner = RuleRunner::with_timeout(std::time::Duration::from_secs(15))
+        .expect("Failed to initialize runner");
     let (prog, arg) = if cfg!(windows) {
         ("cmd", "/c")
     } else {
@@ -1471,7 +1472,8 @@ fn test_sys_exec_api() {
 
 #[test]
 fn test_sys_exec_script_file_auto_resolve() {
-    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let runner = RuleRunner::with_timeout(std::time::Duration::from_secs(15))
+        .expect("Failed to initialize runner");
     let tmp = std::env::temp_dir().join(format!("ai-hook-script-resolve-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let (script_name, script_content) = if cfg!(windows) {
@@ -1513,7 +1515,8 @@ fn test_sys_exec_script_file_auto_resolve() {
 
 #[test]
 fn test_sys_exec_sh_shebang_auto_resolve() {
-    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let runner = RuleRunner::with_timeout(std::time::Duration::from_secs(15))
+        .expect("Failed to initialize runner");
     let tmp = std::env::temp_dir().join(format!("ai-hook-sh-shebang-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let script_path = tmp.join("test_sh.sh");
@@ -1540,7 +1543,8 @@ fn test_sys_exec_sh_shebang_auto_resolve() {
 
 #[test]
 fn test_sys_exec_env_shebang_auto_resolve() {
-    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let runner = RuleRunner::with_timeout(std::time::Duration::from_secs(15))
+        .expect("Failed to initialize runner");
     let tmp = std::env::temp_dir().join(format!("ai-hook-env-shebang-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let script_path = tmp.join("test_env.sh");
@@ -1568,7 +1572,8 @@ fn test_sys_exec_env_shebang_auto_resolve() {
 
 #[test]
 fn test_sys_exec_complex_env_s_shebang() {
-    let runner = RuleRunner::new().expect("Failed to initialize runner");
+    let runner = RuleRunner::with_timeout(std::time::Duration::from_secs(15))
+        .expect("Failed to initialize runner");
     let tmp = std::env::temp_dir().join(format!("ai-hook-env-s-shebang-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let script_path = tmp.join("test_env_s.sh");
@@ -4926,5 +4931,527 @@ fn test_prelude_aihook_helpers_available() {
 
     let res = runner.execute_rule(&rule("prelude-test", rule_code), &ctx_for("echo hi"));
     assert_eq!(res.error, None, "prelude rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+}
+
+// ---------------------------------------------------------------------------
+// Enhanced Hook Context Parsing (DCG parity & Agent edges)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_enhanced_hook_context_resolution() {
+    clear_codebuddy_env();
+
+    // 1. VS Code Agent Host with plural toolCalls array and stringified args
+    let vscode_batch = serde_json::json!({
+        "sessionId": "agent-host-session",
+        "cwd": "/workspace",
+        "toolCalls": [
+            {
+                "name": "powershell",
+                "args": "{\"command\":\"Remove-Item -Recurse -Force C:\\\\Temp\"}"
+            }
+        ]
+    });
+    let ctx = HookContext::parse(&vscode_batch.to_string());
+    assert_eq!(
+        ctx.cmd.as_deref(),
+        Some("Remove-Item -Recurse -Force C:\\Temp"),
+        "Failed to extract command from VS Code Agent Host stringified toolCalls"
+    );
+    assert_eq!(ctx.tool_name, "powershell");
+    assert!(
+        ctx.args.is_object(),
+        "ctx.args should be parsed into object"
+    );
+    assert_eq!(
+        ctx.args.get("command").and_then(|v| v.as_str()),
+        Some("Remove-Item -Recurse -Force C:\\Temp")
+    );
+
+    // 2. Claude envelope with tool_args instead of tool_input
+    let tool_args_payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_args": {
+            "command": "git push --force origin main"
+        }
+    });
+    let ctx = HookContext::parse(&tool_args_payload.to_string());
+    assert_eq!(
+        ctx.cmd.as_deref(),
+        Some("git push --force origin main"),
+        "Failed to extract command from tool_args alias"
+    );
+
+    // 3. Newly added command tool names
+    let tools_and_commands = [
+        ("pwsh", "Get-ChildItem -Recurse"),
+        ("cmd", "del /f /q C:\\test.txt"),
+        ("cmd.exe", "rmdir /s /q build"),
+        ("launch-process", "cargo build --release"),
+        ("run_terminal_cmd", "npm run build"), // xAI Grok CLI
+        ("run_terminal_command", "npm test"),
+        ("runterminalcommand", "ls -la"), // VS Code
+        ("run_in_terminal", "pwd"),
+        ("sh", "chmod +x run.sh"),
+        ("zsh", "source ~/.zshrc"),
+    ];
+    for (tool, command) in tools_and_commands {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": command }
+        });
+        let c = HookContext::parse(&payload.to_string());
+        assert_eq!(
+            c.cmd.as_deref(),
+            Some(command),
+            "Failed to recognize command tool name: {}",
+            tool
+        );
+    }
+
+    // 4. Antigravity batched toolCalls array
+    let agy_batch = serde_json::json!({
+        "conversationId": "agy-batch-conv",
+        "toolCalls": [
+            {
+                "name": "run_command",
+                "args": { "CommandLine": "git diff HEAD~1" }
+            }
+        ]
+    });
+    let ctx = HookContext::parse(&agy_batch.to_string());
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    assert_eq!(ctx.cmd.as_deref(), Some("git diff HEAD~1"));
+
+    // 5. Bare string command in tool_input
+    let bare_string_payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": "echo hello world"
+    });
+    let ctx = HookContext::parse(&bare_string_payload.to_string());
+    assert_eq!(ctx.cmd.as_deref(), Some("echo hello world"));
+}
+
+// ---------------------------------------------------------------------------
+// ctx.action semantic analysis and JS helper methods
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ctx_action_properties_and_methods() {
+    let runner = RuleRunner::new().expect("init runner");
+
+    // Test 1: Complex wrapped command with env, sudo, flags, subcommands
+    let rule_code = r#"
+        export default function(ctx) {
+            const a = ctx.action;
+            if (!a) return { deny: "no-action" };
+
+            // Base properties
+            if (a.executable !== "git") return { deny: "bad-exec: " + a.executable };
+            if (a.subcommand !== "push") return { deny: "bad-sub: " + a.subcommand };
+            if (!a.strippedWrappers.includes("sudo") || !a.strippedWrappers.includes("env")) {
+                return { deny: "bad-wrappers: " + JSON.stringify(a.strippedWrappers) };
+            }
+            if (a.env.PGPASSWORD !== "secret") return { deny: "bad-env: " + JSON.stringify(a.env) };
+            if (!a.flags.includes("--force")) return { deny: "bad-flags: " + JSON.stringify(a.flags) };
+
+            // Helper methods
+            if (!a.targets("git")) return { deny: "target-git-fail" };
+            if (!a.targets("other", "git")) return { deny: "targets-multi-fail" };
+            if (!a.targets(["git"])) return { deny: "targets-arr-fail" };
+            if (a.targets("psql", "mysql")) return { deny: "targets-fp" };
+
+            if (!a.hasFlag("--force")) return { deny: "hasFlag-force-fail" };
+            if (!a.hasFlag("-f", "--force")) return { deny: "hasFlag-multi-fail" };
+            if (a.hasFlag("--nonexistent")) return { deny: "hasFlag-fp" };
+
+            if (a.isSearch()) return { deny: "isSearch-fp-on-push" };
+            if (a.isGitCommit()) return { deny: "isGitCommit-fp-on-push" };
+
+            return { allow: true };
+        }
+    "#;
+
+    let cmd = "sudo env PGPASSWORD=secret git push --force origin main";
+    let res = runner.execute_rule(&rule("action-test-1", rule_code), &ctx_for(cmd));
+    assert_eq!(res.error, None, "Rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Test 2: Pipeline sink detection
+    let sink_rule = r#"
+        export default function(ctx) {
+            const a = ctx.action;
+            if (a.executable !== "cat") return { deny: "bad-exec: " + a.executable };
+            if (a.sink !== "psql") return { deny: "bad-sink: " + a.sink };
+            if (!a.targets("psql")) return { deny: "targets-sink-fail" };
+            if (!a.targets("cat")) return { deny: "targets-exec-fail" };
+            return { allow: true };
+        }
+    "#;
+    let pipe_cmd = "cat dump.sql | sudo /usr/bin/psql -U postgres -d testdb";
+    let res = runner.execute_rule(&rule("sink-test", sink_rule), &ctx_for(pipe_cmd));
+    assert_eq!(res.error, None, "Sink rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Test 3: Inline code unwrapping and preservation
+    let inline_rule = r#"
+        export default function(ctx) {
+            const a = ctx.action;
+            if (a.executable !== "python") return { deny: "bad-exec: " + a.executable };
+            if (a.unwrapped.length !== 1) return { deny: "unwrapped-len: " + a.unwrapped.length };
+            if (a.unwrapped[0].interpreter !== "python") return { deny: "bad-interp" };
+            if (!a.unwrapped[0].code.includes("rm -rf")) return { deny: "bad-code: " + a.unwrapped[0].code };
+            if (!a.targets("python")) return { deny: "targets-inline-fail" };
+            return { allow: true };
+        }
+    "#;
+    let inline_cmd = "python -c \"import os; os.system('rm -rf /')\"";
+    let res = runner.execute_rule(&rule("inline-test", inline_rule), &ctx_for(inline_cmd));
+    assert_eq!(res.error, None, "Inline rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Test 4: Masking (executableText) & Span classification
+    let mask_rule = r#"
+        export default function(ctx) {
+            const a = ctx.action;
+            // The commit message and comment should be blanked with spaces
+            if (a.executableText.includes("dangerous rm -rf")) return { deny: "masked-contains-data" };
+            if (a.executableText.includes("comment")) return { deny: "masked-contains-comment" };
+            if (!a.executableText.includes("git commit -m")) return { deny: "masked-lost-code" };
+            if (a.hasDangerousSubst) return { deny: "unexpected-subst" };
+            if (!a.isGitCommit()) return { deny: "isGitCommit-fail" };
+
+            // Check span kinds
+            const kinds = a.spans.map(s => s.kind);
+            if (!kinds.includes("executed")) return { deny: "no-executed-span" };
+            if (!kinds.includes("data")) return { deny: "no-data-span" };
+            if (!kinds.includes("comment")) return { deny: "no-comment-span" };
+
+            return { allow: true };
+        }
+    "#;
+    let commit_cmd = "git commit -m \"dangerous rm -rf / inside msg\" # some comment";
+    let res = runner.execute_rule(&rule("mask-test", mask_rule), &ctx_for(commit_cmd));
+    assert_eq!(res.error, None, "Mask rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Test 5: Command substitution detection
+    let subst_rule = r#"
+        export default function(ctx) {
+            if (!ctx.action.hasDangerousSubst) return { deny: "missing-subst" };
+            return { allow: true };
+        }
+    "#;
+    let subst_cmd = "echo \"$(rm -rf /tmp/data)\"";
+    let res = runner.execute_rule(&rule("subst-test", subst_rule), &ctx_for(subst_cmd));
+    assert_eq!(res.error, None, "Subst rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Test 6: Harmless search tool predicate
+    let search_rule = r#"
+        export default function(ctx) {
+            if (!ctx.action.isSearch()) return { deny: "isSearch-fail" };
+            return { allow: true };
+        }
+    "#;
+    let search_cmd = "grep -rn \"needle\" /var/log";
+    let res = runner.execute_rule(&rule("search-test", search_rule), &ctx_for(search_cmd));
+    assert_eq!(res.error, None, "Search rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Test 7: Non-command tool leaves ctx.action as null
+    let null_action_rule = r#"
+        export default function(ctx) {
+            if (ctx.action !== null) return { deny: "action-not-null" };
+            if (ctx.cmd !== null) return { deny: "cmd-not-null" };
+            return { allow: true };
+        }
+    "#;
+    let file_ctx = HookContext::parse(
+        &serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/tmp/a.txt", "content": "x" }
+        })
+        .to_string(),
+    );
+    let res = runner.execute_rule(&rule("null-action-test", null_action_rule), &file_ctx);
+    assert_eq!(res.error, None, "Null action rule errored: {:?}", res.error);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+}
+
+#[test]
+fn test_xr_prod_complex_command_scenario() {
+    let cmd = r#"cd "c:/Users/hugh.li/Data/xrapp/api-dev" && SUDO_PW=$(tr -d "[:space:]" < storage/app/.prod-sudo-pass) && DB_PW=$(printf "%s\n" "$SUDO_PW" | ssh xrAliYunProdWeb1 "sudo -S -u www-data grep -E '^DB_PASSWORD=' /data/www/xrapp-console/.env" 2>/dev/null | sed -E 's/^DB_PASSWORD=["'"'"']?([^"'"'"']+)["'"'"']?/\1/' | tr -d '\r\n') && export MYSQL_PWD="$DB_PW" && mysql -h 127.0.0.1 -P 41063 -u xrapp_prod_readonly --get-server-public-key=1 -t -e "
+ SELECT b.id AS 失败学员, b.name AS 失败姓名, b.pre_certificate_code AS 冲突编号,
+        c.id AS 占位证书id, c.batch_user AS 占位学员, c.name AS 占位姓名,
+        CONCAT(c.org,'-',c.code,'-',IFNULL(c.subsidiary_key,'<NULL>')) AS 冲突索引项,
+        c.unique_key AS 占位行unique_key,
+        CONCAT(b.org,'-',b.id) AS 待插unique_key,
+        IF(c.unique_key=CONCAT(b.org,'-',b.id),'冲突','不冲突') AS uk对比
+ FROM syllabus_batch_users b
+ JOIN credentials c ON c.org=b.org AND c.code=b.pre_certificate_code AND c.deleted_at IS NULL
+ WHERE b.id IN (10127630,10129705,10128812) AND b.has_credential=0 AND b.deleted_at IS NULL
+ ORDER BY b.id;
+ " xrapp 2>&1 | head -20; unset MYSQL_PWD"#;
+
+    // 1. Semantic engine analysis
+    let action = ai_hook::engine::semantic::analyze_command(cmd);
+    assert_eq!(action.command, cmd);
+    assert_eq!(action.executable, "cd");
+    assert!(
+        action.targets(&["ssh"]),
+        "Semantic engine must detect ssh in pipeline substitution"
+    );
+    assert!(
+        action.targets(&["mysql"]),
+        "Semantic engine must detect mysql in compound chain"
+    );
+    assert!(
+        action.targets(&["grep"]),
+        "Semantic engine must detect grep in remote ssh execution"
+    );
+    assert!(
+        action.targets(&["tr"]),
+        "Semantic engine must detect tr in substitution"
+    );
+    assert!(
+        action.targets(&["head"]),
+        "Semantic engine must detect head sink"
+    );
+    assert!(
+        !action.targets(&["rm", "pkill"]),
+        "Semantic engine must not match rm"
+    );
+    assert!(
+        action.has_flag(&["-P"]),
+        "Semantic engine must detect -P flag"
+    );
+    assert!(
+        action.has_flag(&["-h"]),
+        "Semantic engine must detect -h flag"
+    );
+    assert!(
+        action.has_flag(&["-E"]),
+        "Semantic engine must detect -E flag"
+    );
+    assert!(action.executables.contains(&"ssh".to_string()));
+    assert!(action.executables.contains(&"mysql".to_string()));
+    assert!(action.executables.contains(&"cd".to_string()));
+    assert!(
+        !action.is_search(),
+        "Complex command is not a read-only search"
+    );
+    assert!(
+        action.has_dangerous_subst,
+        "Complex command contains command substitutions like SUDO_PW=$(...) and DB_PW=$(...)"
+    );
+    assert_eq!(
+        action.executable_text.len(),
+        cmd.len(),
+        "Masked text must preserve exact character and byte offsets for Unicode/Chinese characters"
+    );
+
+    // 2. Protocol parsing
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": cmd },
+        "cwd": "c:/Users/hugh.li/Data/xrapp/api-dev"
+    });
+    let ctx = HookContext::parse(&payload.to_string());
+    assert_eq!(ctx.cmd.as_deref(), Some(cmd));
+    assert_eq!(ctx.tool_name, "Bash");
+
+    // 3. Test execution against user's actual rule
+    let rule_path = std::path::Path::new(
+        "C:/Users/hugh.li/.agents/plugins/xr/hooks/protect-prod-server-exec.js",
+    );
+    if rule_path.exists() {
+        let rule_content = std::fs::read_to_string(rule_path).expect("read rule");
+        let runner = RuleRunner::new().expect("init runner");
+        let res = runner.execute_rule(&rule("xr-protect-prod-server", &rule_content), &ctx);
+
+        assert_eq!(
+            res.error, None,
+            "Rule must execute without runtime/syntax errors"
+        );
+        match res.decision {
+            Some(HookDecision::Confirm {
+                ref title,
+                ref reason,
+                timeout,
+                ..
+            }) => {
+                assert_eq!(title.as_deref(), Some("新燃生产服务器操作授权"));
+                assert!(
+                    reason.contains("xrAliYunProdWeb1"),
+                    "Confirm reason must name target host xrAliYunProdWeb1: {reason}"
+                );
+                assert!(
+                    reason.contains("只读白名单"),
+                    "Confirm reason must explain why it was gated: {reason}"
+                );
+                assert_eq!(timeout, Some(60));
+            }
+            other => panic!("Expected HookDecision::Confirm, got: {:?}", other),
+        }
+    }
+
+    // 4. Test ctx.action usage directly inside QuickJS hook rules
+    let test_action_rule = r#"
+        export default function(ctx) {
+            if (!ctx.action) return { deny: "ctx.action is missing" };
+            if (!ctx.action.targets("ssh")) return { deny: "targets('ssh') failed" };
+            if (!ctx.action.targets("mysql")) return { deny: "targets('mysql') failed" };
+            if (!ctx.action.hasFlag("-P")) return { deny: "hasFlag('-P') failed" };
+            if (ctx.action.targets("rm")) return { deny: "targets('rm') falsely returned true" };
+            if (ctx.action.isSearch()) return { deny: "isSearch() falsely returned true" };
+            if (!ctx.action.executables.includes("ssh")) return { deny: "executables missing ssh" };
+            if (!ctx.action.executables.includes("mysql")) return { deny: "executables missing mysql" };
+            return null; // pass
+        }
+    "#;
+    let runner = RuleRunner::new().expect("init runner");
+    let action_res = runner.execute_rule(&rule("test-action-rule", test_action_rule), &ctx);
+    assert_eq!(
+        action_res.error, None,
+        "Action rule must not error: {:?}",
+        action_res.error
+    );
+    assert_eq!(
+        action_res.decision, None,
+        "Action rule must pass verification without deny"
+    );
+}
+
+#[test]
+fn test_ctx_command_and_segments_virtual_cwd_tracking() {
+    let runner = RuleRunner::new().expect("init runner");
+    let cmd = "cd ~ && git push -f && cd ~/.tml && rm -rf aa && cd / && rm *";
+
+    let rule_code = r#"
+        export default function(ctx) {
+            // 1. Verify ctx.command and alias ctx.action
+            if (!ctx.command) return { deny: "ctx.command is missing" };
+            if (!ctx.action) return { deny: "ctx.action alias is missing" };
+            if (ctx.command.command !== ctx.action.command) return { deny: "command and action mismatch" };
+
+            // 2. Verify segments and virtual CWD tracking
+            const segs = ctx.command.segments;
+            if (!segs || segs.length !== 6) return { deny: "expected 6 segments, got " + (segs ? segs.length : 0) };
+
+            // 3. Verify find("git")
+            const gitSegs = ctx.command.find("git");
+            if (gitSegs.length !== 1) return { deny: "expected 1 git segment, got " + gitSegs.length };
+            if (gitSegs[0].subcommand !== "push") return { deny: "expected git push, got " + gitSegs[0].subcommand };
+            if (!gitSegs[0].flags.includes("-f")) return { deny: "expected -f flag on git push" };
+            if (gitSegs[0].cwd !== "~") return { deny: "expected git cwd to be ~, got " + gitSegs[0].cwd };
+
+            // 4. Verify find("rm") and resolvedTargets
+            const rmSegs = ctx.command.find("rm");
+            if (rmSegs.length !== 2) return { deny: "expected 2 rm segments, got " + rmSegs.length };
+
+            // rm 1: in ~/.tml deleting aa
+            const rm1 = rmSegs[0];
+            if (rm1.cwd !== "~/.tml") return { deny: "expected rm1 cwd to be ~/.tml, got " + rm1.cwd };
+            if (!rm1.resolvedTargets.includes("~/.tml/aa")) {
+                return { deny: "expected rm1 resolvedTargets to contain ~/.tml/aa, got " + JSON.stringify(rm1.resolvedTargets) };
+            }
+
+            // rm 2: in / deleting *
+            const rm2 = rmSegs[1];
+            if (rm2.cwd !== "/") return { deny: "expected rm2 cwd to be /, got " + rm2.cwd };
+            if (!rm2.resolvedTargets.includes("/*")) {
+                return { deny: "expected rm2 resolvedTargets to contain /*, got " + JSON.stringify(rm2.resolvedTargets) };
+            }
+
+            // High-risk policy enforcement pattern: block any rm targeting /*
+            if (rmSegs.some(s => s.resolvedTargets.includes("/*") || (s.cwd === "/" && s.args.includes("*")))) {
+                return { deny: "Destructive root directory deletion detected: rm *" };
+            }
+
+            return { allow: true };
+        }
+    "#;
+
+    let res = runner.execute_rule(&rule("cwd-tracking-rule", rule_code), &ctx_for(cmd));
+    assert_eq!(res.error, None, "Rule failed: {:?}", res.error);
+    match res.decision {
+        Some(HookDecision::Deny { ref reason }) => {
+            assert!(
+                reason.contains("Destructive root directory deletion detected"),
+                "Expected denial on rm * in root: {reason}"
+            );
+        }
+        other => panic!("Expected Deny on root rm *, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_ctx_command_dcg_database_and_sql_fail_closed() {
+    let runner = RuleRunner::new().expect("init runner");
+
+    // Case 1: Safe pure SELECT in mysql
+    let safe_cmd = r#"mysql -h 127.0.0.1 -P 41063 -u xrapp_prod_readonly -e "SELECT id, name FROM users WHERE id = 1" dbname"#;
+    let safe_rule = r#"
+        export default function(ctx) {
+            if (!ctx.command.targets("mysql")) return { deny: "expected mysql target" };
+            if (!ctx.command.isSearch()) return { deny: "expected isSearch() true for pure SELECT" };
+            const unwrapped = ctx.command.unwrapped;
+            if (unwrapped.length !== 1 || unwrapped[0].interpreter !== "mysql") {
+                return { deny: "unwrapped mismatch: " + JSON.stringify(unwrapped) };
+            }
+            if (!unwrapped[0].code.includes("SELECT id, name FROM users")) {
+                return { deny: "code mismatch: " + unwrapped[0].code };
+            }
+            return { allow: true };
+        }
+    "#;
+    let res = runner.execute_rule(&rule("safe-mysql-rule", safe_rule), &ctx_for(safe_cmd));
+    assert_eq!(res.error, None);
+    assert_eq!(res.decision, Some(HookDecision::Allow));
+
+    // Case 2: SQL Injection / Multi-statement with DROP TABLE (Fail-Closed)
+    let drop_cmd = r#"mysql -h 127.0.0.1 -P 41063 -u xrapp_prod_readonly -e "SELECT 1; DROP TABLE users; -- comment" dbname"#;
+    let drop_rule = r#"
+        export default function(ctx) {
+            if (ctx.command.isSearch()) {
+                return { deny: "isSearch() MUST NOT return true for DROP TABLE injection!" };
+            }
+            return { deny: "Destructive SQL detected" };
+        }
+    "#;
+    let res = runner.execute_rule(&rule("drop-mysql-rule", drop_rule), &ctx_for(drop_cmd));
+    assert_eq!(res.error, None);
+    assert_eq!(
+        res.decision,
+        Some(HookDecision::Deny {
+            reason: "Destructive SQL detected".to_string()
+        })
+    );
+
+    // Case 3: Piped stdin into mysql consumer
+    let piped_cmd = r#"echo "SELECT COUNT(*) FROM orders" | mysql -u readonly dbname"#;
+    let piped_rule = r#"
+        export default function(ctx) {
+            if (!ctx.command.targets("mysql")) return { deny: "targets mysql fail" };
+            if (!ctx.command.isSearch()) return { deny: "piped search query must be isSearch() true" };
+            const mysqlSeg = ctx.command.find("mysql")[0];
+            if (!mysqlSeg || mysqlSeg.unwrapped.length === 0) {
+                return { deny: "piped mysql segment missing unwrapped payload" };
+            }
+            if (!mysqlSeg.unwrapped[0].code.includes("SELECT COUNT(*) FROM orders")) {
+                return { deny: "unexpected piped payload: " + mysqlSeg.unwrapped[0].code };
+            }
+            return { allow: true };
+        }
+    "#;
+    let res = runner.execute_rule(&rule("piped-mysql-rule", piped_rule), &ctx_for(piped_cmd));
+    assert_eq!(res.error, None);
     assert_eq!(res.decision, Some(HookDecision::Allow));
 }

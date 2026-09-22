@@ -240,18 +240,25 @@ pub fn install_binary_file(
         let _ = std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o755));
     }
 
-    // 自检验证：验证安装后的文件确实可用
-    let verify_ok = std::process::Command::new(&dest_file)
-        .arg("--version")
-        .no_console_window()
-        .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout)
-                    .to_lowercase()
-                    .contains("ai-hook")
-        })
-        .unwrap_or(false);
+    // 自检验证：验证安装后的文件确实可用（Windows 下文件锁或 Defender 扫描可能导致短暂等待，做少量重试）
+    let mut verify_ok = false;
+    for attempt in 0..5 {
+        if let Ok(o) = std::process::Command::new(&dest_file)
+            .arg("--version")
+            .no_console_window()
+            .output()
+            && o.status.success()
+            && String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains("ai-hook")
+        {
+            verify_ok = true;
+            break;
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    }
 
     if !verify_ok {
         if backed_up && let Some(ref bak) = backup_path {

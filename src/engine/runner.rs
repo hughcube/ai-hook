@@ -4,7 +4,7 @@ use crate::errln;
 use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision, Mutation};
 use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp, RegExpCompiler};
-use rquickjs::{Array, Coerced, Context, Function, Object, Runtime, Value};
+use rquickjs::{Array, Coerced, Context, Ctx, Function, Object, Runtime, Value};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -374,8 +374,13 @@ impl RuleRunner {
             ctx_obj.set("tool", ctx.tool_name.as_str())?;
             if let Some(ref c) = ctx.cmd {
                 ctx_obj.set("cmd", c.as_str())?;
+                let cmd_obj = create_command_object(&js_ctx, c.as_str(), &ctx.cwd)?;
+                ctx_obj.set("command", cmd_obj.clone())?;
+                ctx_obj.set("action", cmd_obj)?;
             } else {
                 ctx_obj.set("cmd", Value::new_null(js_ctx.clone()))?;
+                ctx_obj.set("command", Value::new_null(js_ctx.clone()))?;
+                ctx_obj.set("action", Value::new_null(js_ctx.clone()))?;
             }
             if let Some(ref f) = ctx.file {
                 let file_obj = Object::new(js_ctx.clone())?;
@@ -1224,4 +1229,236 @@ fn find_exports(code: &str) -> Vec<ExportHit> {
         }
     }
     hits
+}
+
+fn create_command_object<'js>(
+    js_ctx: &Ctx<'js>,
+    cmd_str: &str,
+    initial_cwd: &str,
+) -> rquickjs::Result<Object<'js>> {
+    let action = crate::engine::semantic::analyze_command_with_cwd(cmd_str, initial_cwd);
+    let action_obj = Object::new(js_ctx.clone())?;
+
+    action_obj.set("command", action.command.as_str())?;
+    action_obj.set("normalized", action.normalized.as_str())?;
+    action_obj.set("executable", action.executable.as_str())?;
+    if let Some(ref sub) = action.subcommand {
+        action_obj.set("subcommand", sub.as_str())?;
+    } else {
+        action_obj.set("subcommand", Value::new_null(js_ctx.clone()))?;
+    }
+
+    let wrappers_arr = Array::new(js_ctx.clone())?;
+    for (i, w) in action.stripped_wrappers.iter().enumerate() {
+        wrappers_arr.set(i, w.as_str())?;
+    }
+    action_obj.set("strippedWrappers", wrappers_arr)?;
+
+    let env_obj = Object::new(js_ctx.clone())?;
+    for (k, v) in &action.env_vars {
+        env_obj.set(k.as_str(), v.as_str())?;
+    }
+    action_obj.set("env", env_obj)?;
+
+    if let Some(ref sink) = action.sink {
+        action_obj.set("sink", sink.as_str())?;
+    } else {
+        action_obj.set("sink", Value::new_null(js_ctx.clone()))?;
+    }
+
+    action_obj.set("executableText", action.executable_text.as_str())?;
+    action_obj.set("hasDangerousSubst", action.has_dangerous_subst)?;
+
+    let flags_arr = Array::new(js_ctx.clone())?;
+    for (i, f) in action.flags.iter().enumerate() {
+        flags_arr.set(i, f.as_str())?;
+    }
+    action_obj.set("flags", flags_arr)?;
+
+    let unwrapped_arr = Array::new(js_ctx.clone())?;
+    for (i, u) in action.unwrapped.iter().enumerate() {
+        let u_obj = Object::new(js_ctx.clone())?;
+        u_obj.set("interpreter", u.interpreter.as_str())?;
+        u_obj.set("code", u.code.as_str())?;
+        unwrapped_arr.set(i, u_obj)?;
+    }
+    action_obj.set("unwrapped", unwrapped_arr)?;
+
+    let spans_arr = Array::new(js_ctx.clone())?;
+    for (i, s) in action.spans.iter().enumerate() {
+        let s_obj = Object::new(js_ctx.clone())?;
+        s_obj.set("kind", s.kind.as_str())?;
+        s_obj.set("start", s.start)?;
+        s_obj.set("end", s.end)?;
+        s_obj.set("text", s.text.as_str())?;
+        spans_arr.set(i, s_obj)?;
+    }
+    action_obj.set("spans", spans_arr)?;
+
+    let executables_arr = Array::new(js_ctx.clone())?;
+    for (i, e) in action.executables.iter().enumerate() {
+        executables_arr.set(i, e.as_str())?;
+    }
+    action_obj.set("executables", executables_arr)?;
+
+    // Segments array with fine-grained tracking
+    let segments_arr = Array::new(js_ctx.clone())?;
+    for (i, c) in action.segments.iter().enumerate() {
+        let c_obj = Object::new(js_ctx.clone())?;
+        c_obj.set("raw", c.raw.as_str())?;
+        c_obj.set("command", c.command.as_str())?;
+        c_obj.set("normalized", c.normalized.as_str())?;
+        c_obj.set("executable", c.executable.as_str())?;
+        if let Some(ref sub) = c.subcommand {
+            c_obj.set("subcommand", sub.as_str())?;
+        } else {
+            c_obj.set("subcommand", Value::new_null(js_ctx.clone()))?;
+        }
+        let c_flags = Array::new(js_ctx.clone())?;
+        for (j, f) in c.flags.iter().enumerate() {
+            c_flags.set(j, f.as_str())?;
+        }
+        c_obj.set("flags", c_flags)?;
+
+        let c_args = Array::new(js_ctx.clone())?;
+        for (j, a) in c.args.iter().enumerate() {
+            c_args.set(j, a.as_str())?;
+        }
+        c_obj.set("args", c_args)?;
+
+        c_obj.set("cwd", c.cwd.as_str())?;
+
+        let c_targets = Array::new(js_ctx.clone())?;
+        for (j, t) in c.resolved_targets.iter().enumerate() {
+            c_targets.set(j, t.as_str())?;
+        }
+        c_obj.set("resolvedTargets", c_targets)?;
+
+        let c_unwrapped = Array::new(js_ctx.clone())?;
+        for (j, u) in c.unwrapped.iter().enumerate() {
+            let u_obj = Object::new(js_ctx.clone())?;
+            u_obj.set("interpreter", u.interpreter.as_str())?;
+            u_obj.set("code", u.code.as_str())?;
+            c_unwrapped.set(j, u_obj)?;
+        }
+        c_obj.set("unwrapped", c_unwrapped)?;
+
+        segments_arr.set(i, c_obj)?;
+    }
+    action_obj.set("segments", segments_arr.clone())?;
+    // commands alias for backwards compatibility
+    action_obj.set("commands", segments_arr)?;
+    action_obj.set("cwd", action.cwd.as_str())?;
+
+    // Helper method: targets(...programs)
+    let action_for_targets = action.clone();
+    let targets_fn = Function::new(
+        js_ctx.clone(),
+        move |args: rquickjs::function::Rest<Value<'js>>| -> bool {
+            let mut progs = Vec::new();
+            for val in args.0 {
+                if let Some(arr) = val.as_array() {
+                    for item in arr.iter::<String>().flatten() {
+                        progs.push(item);
+                    }
+                } else if let Some(s) = val.as_string().and_then(|s| s.to_string().ok()) {
+                    progs.push(s);
+                }
+            }
+            let prog_refs: Vec<&str> = progs.iter().map(|s| s.as_str()).collect();
+            action_for_targets.targets(&prog_refs)
+        },
+    )?;
+    action_obj.set("targets", targets_fn)?;
+
+    // Helper method: hasFlag(...flags)
+    let action_for_flags = action.clone();
+    let has_flag_fn = Function::new(
+        js_ctx.clone(),
+        move |args: rquickjs::function::Rest<Value<'js>>| -> bool {
+            let mut fls = Vec::new();
+            for val in args.0 {
+                if let Some(arr) = val.as_array() {
+                    for item in arr.iter::<String>().flatten() {
+                        fls.push(item);
+                    }
+                } else if let Some(s) = val.as_string().and_then(|s| s.to_string().ok()) {
+                    fls.push(s);
+                }
+            }
+            let fl_refs: Vec<&str> = fls.iter().map(|s| s.as_str()).collect();
+            action_for_flags.has_flag(&fl_refs)
+        },
+    )?;
+    action_obj.set("hasFlag", has_flag_fn)?;
+
+    // Helper method: find(program)
+    let action_for_find = action.clone();
+    let find_fn = Function::new(
+        js_ctx.clone(),
+        move |js_ctx_call: Ctx<'js>, prog: String| -> rquickjs::Result<Array<'js>> {
+            let matching = action_for_find.find(&prog);
+            let res_arr = Array::new(js_ctx_call.clone())?;
+            for (idx, seg) in matching.iter().enumerate() {
+                let seg_obj = Object::new(js_ctx_call.clone())?;
+                seg_obj.set("raw", seg.raw.as_str())?;
+                seg_obj.set("command", seg.command.as_str())?;
+                seg_obj.set("normalized", seg.normalized.as_str())?;
+                seg_obj.set("executable", seg.executable.as_str())?;
+                if let Some(ref sub) = seg.subcommand {
+                    seg_obj.set("subcommand", sub.as_str())?;
+                } else {
+                    seg_obj.set("subcommand", Value::new_null(js_ctx_call.clone()))?;
+                }
+                let seg_flags = Array::new(js_ctx_call.clone())?;
+                for (j, f) in seg.flags.iter().enumerate() {
+                    seg_flags.set(j, f.as_str())?;
+                }
+                seg_obj.set("flags", seg_flags)?;
+                let seg_args = Array::new(js_ctx_call.clone())?;
+                for (j, a) in seg.args.iter().enumerate() {
+                    seg_args.set(j, a.as_str())?;
+                }
+                seg_obj.set("args", seg_args)?;
+                seg_obj.set("cwd", seg.cwd.as_str())?;
+                let seg_targets = Array::new(js_ctx_call.clone())?;
+                for (j, t) in seg.resolved_targets.iter().enumerate() {
+                    seg_targets.set(j, t.as_str())?;
+                }
+                seg_obj.set("resolvedTargets", seg_targets)?;
+                let seg_unwrapped = Array::new(js_ctx_call.clone())?;
+                for (j, u) in seg.unwrapped.iter().enumerate() {
+                    let u_obj = Object::new(js_ctx_call.clone())?;
+                    u_obj.set("interpreter", u.interpreter.as_str())?;
+                    u_obj.set("code", u.code.as_str())?;
+                    seg_unwrapped.set(j, u_obj)?;
+                }
+                seg_obj.set("unwrapped", seg_unwrapped)?;
+                res_arr.set(idx, seg_obj)?;
+            }
+            Ok(res_arr)
+        },
+    )?;
+    action_obj.set("find", find_fn)?;
+
+    // Helper method: isSearch()
+    let action_for_search = action.clone();
+    let is_search_fn = Function::new(js_ctx.clone(), move || -> bool {
+        action_for_search.is_search()
+    })?;
+    action_obj.set("isSearch", is_search_fn)?;
+
+    // Helper method: isGitCommit()
+    let action_for_git = action;
+    let is_git_commit_fn = Function::new(js_ctx.clone(), move || -> bool {
+        action_for_git.is_git_commit()
+    })?;
+    action_obj.set("isGitCommit", is_git_commit_fn)?;
+
+    Ok(action_obj)
+}
+
+#[allow(dead_code)]
+fn create_action_object<'js>(js_ctx: &Ctx<'js>, cmd_str: &str) -> rquickjs::Result<Object<'js>> {
+    create_command_object(js_ctx, cmd_str, ".")
 }
