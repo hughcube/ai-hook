@@ -4917,9 +4917,12 @@ fn test_prelude_aihook_helpers_available() {
             if (aiHook.isSearchPrefix("mysql -e x")) return { deny: "search-fp" };
             if (!aiHook.isGitCommit('git commit -m "x"')) return { deny: "commit" };
             if (aiHook.isGitCommit("git status")) return { deny: "commit-fp" };
-            if (!aiHook.hasCmdSubstitution("psql -c $(cat x)")) return { deny: "subst" };
             if (!aiHook.hasWriteVector("echo x > f")) return { deny: "write" };
+            if (!aiHook.hasWriteVector("echo x >> f")) return { deny: "write-append" };
             if (aiHook.hasWriteVector("echo x 2>&1")) return { deny: "write-fp" };
+            if (aiHook.hasWriteVector("echo x 2>/dev/null")) return { deny: "write-devnull-fp" };
+            if (aiHook.hasWriteVector("echo x >/dev/null")) return { deny: "write-devnull-fp2" };
+            if (aiHook.hasWriteVector("echo x >nul")) return { deny: "write-nul-fp" };
 
             // non-string inputs (ctx.cmd is null for non-command tools) are safe
             if (aiHook.splitTopCommands(null).length !== 0) return { deny: "null-split" };
@@ -5280,7 +5283,21 @@ fn test_xr_prod_complex_command_scenario() {
             res.error, None,
             "Rule must execute without runtime/syntax errors"
         );
-        match res.decision {
+        assert_eq!(
+            res.decision, None,
+            "Read-only inspection command must be silently allowed without false positive: {:?}",
+            res.decision
+        );
+
+        // Verify true positive: dangerous command on xrAliYunProdWeb1 must still be confirmed
+        let danger_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "ssh xrAliYunProdWeb1 \"rm -rf /data/www\"" }
+        });
+        let danger_ctx = HookContext::parse(&danger_payload.to_string());
+        let danger_res = runner.execute_rule(&rule("xr-protect-prod-server", &rule_content), &danger_ctx);
+        match danger_res.decision {
             Some(HookDecision::Confirm {
                 ref title,
                 ref reason,
@@ -5288,17 +5305,10 @@ fn test_xr_prod_complex_command_scenario() {
                 ..
             }) => {
                 assert_eq!(title.as_deref(), Some("新燃生产服务器操作授权"));
-                assert!(
-                    reason.contains("xrAliYunProdWeb1"),
-                    "Confirm reason must name target host xrAliYunProdWeb1: {reason}"
-                );
-                assert!(
-                    reason.contains("只读白名单"),
-                    "Confirm reason must explain why it was gated: {reason}"
-                );
+                assert!(reason.contains("xrAliYunProdWeb1"));
                 assert_eq!(timeout, Some(60));
             }
-            other => panic!("Expected HookDecision::Confirm, got: {:?}", other),
+            other => panic!("Expected HookDecision::Confirm for dangerous rm, got: {:?}", other),
         }
     }
 

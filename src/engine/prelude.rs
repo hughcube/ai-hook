@@ -91,11 +91,11 @@ globalThis.aiHook = (function () {
         return typeof seg === "string" && CMD_SUBSTITUTION.test(seg);
     }
 
-    // Write vector: redirect to disk (`>` / `>>`, `2>&1` allowed) or a pipe
-    // into `tee`.
+    // Write vector: redirect to disk (`>` / `>>`, `2>&1` / `/dev/null` / `nul` allowed)
+    // or a pipe into `tee`.
     function hasWriteVector(cmdStr) {
         if (typeof cmdStr !== "string") return false;
-        if (/(>>|>)\s*[^&]/.test(cmdStr)) return true;
+        if (/(?:>>|>)\s*(?!&|\/dev\/null|nul\b)\S/.test(cmdStr)) return true;
         if (/[>|]\s*[^;&|]*\b(tee)\b/i.test(cmdStr)) return true;
         return false;
     }
