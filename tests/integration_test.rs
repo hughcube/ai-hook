@@ -5296,7 +5296,8 @@ fn test_xr_prod_complex_command_scenario() {
             "tool_input": { "command": "ssh xrAliYunProdWeb1 \"rm -rf /data/www\"" }
         });
         let danger_ctx = HookContext::parse(&danger_payload.to_string());
-        let danger_res = runner.execute_rule(&rule("xr-protect-prod-server", &rule_content), &danger_ctx);
+        let danger_res =
+            runner.execute_rule(&rule("xr-protect-prod-server", &rule_content), &danger_ctx);
         match danger_res.decision {
             Some(HookDecision::Confirm {
                 ref title,
@@ -5308,7 +5309,10 @@ fn test_xr_prod_complex_command_scenario() {
                 assert!(reason.contains("xrAliYunProdWeb1"));
                 assert_eq!(timeout, Some(60));
             }
-            other => panic!("Expected HookDecision::Confirm for dangerous rm, got: {:?}", other),
+            other => panic!(
+                "Expected HookDecision::Confirm for dangerous rm, got: {:?}",
+                other
+            ),
         }
     }
 
