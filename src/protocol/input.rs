@@ -835,6 +835,231 @@ fn normalize_semantics(
     }
 }
 
+#[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
+fn detect_antigravity_parent_yolo() -> bool {
+    use std::ffi::c_void;
+
+    type HANDLE = *mut c_void;
+    type NTSTATUS = i32;
+
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        _exit_status: NTSTATUS,
+        peb_base_address: usize,
+        _affinity_mask: usize,
+        _base_priority: i32,
+        _unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        _maximum_length: u16,
+        buffer: *const u16,
+    }
+
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> HANDLE;
+        fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32)
+        -> HANDLE;
+        fn CloseHandle(h_object: HANDLE) -> i32;
+        fn ReadProcessMemory(
+            h_process: HANDLE,
+            lp_base_address: *const c_void,
+            lp_buffer: *mut c_void,
+            n_size: usize,
+            lp_number_of_bytes_read: *mut usize,
+        ) -> i32;
+        fn GetModuleHandleA(lp_module_name: *const i8) -> HANDLE;
+        fn GetProcAddress(h_module: HANDLE, lp_proc_name: *const i8) -> *const c_void;
+    }
+
+    type FnNtQueryInformationProcess = unsafe extern "system" fn(
+        process_handle: HANDLE,
+        process_information_class: u32,
+        process_information: *mut c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> NTSTATUS;
+
+    unsafe {
+        let ntdll_name = match std::ffi::CString::new("ntdll.dll") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let ntdll = GetModuleHandleA(ntdll_name.as_ptr());
+        if ntdll.is_null() {
+            return false;
+        }
+
+        let proc_name = match std::ffi::CString::new("NtQueryInformationProcess") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let p_fn = GetProcAddress(ntdll, proc_name.as_ptr());
+        if p_fn.is_null() {
+            return false;
+        }
+        let nt_query_information_process: FnNtQueryInformationProcess = std::mem::transmute(p_fn);
+
+        const PROCESS_BASIC_INFO_CLASS: u32 = 0;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+        const PROCESS_VM_READ: u32 = 0x0010;
+
+        let mut current_handle = GetCurrentProcess();
+        let mut is_first = true;
+
+        for _ in 0..6 {
+            let mut pbi = std::mem::zeroed::<ProcessBasicInformation>();
+            let mut ret_len: u32 = 0;
+            let status = nt_query_information_process(
+                current_handle,
+                PROCESS_BASIC_INFO_CLASS,
+                &mut pbi as *mut _ as *mut c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut ret_len,
+            );
+
+            if !is_first {
+                CloseHandle(current_handle);
+            }
+            is_first = false;
+
+            if status != 0 || pbi.inherited_from_unique_process_id == 0 {
+                break;
+            }
+
+            let ppid = pbi.inherited_from_unique_process_id as u32;
+            let mut parent_handle =
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, ppid);
+            if parent_handle.is_null() {
+                parent_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, ppid);
+            }
+
+            if parent_handle.is_null() {
+                break;
+            }
+
+            let mut parent_pbi = std::mem::zeroed::<ProcessBasicInformation>();
+            let p_status = nt_query_information_process(
+                parent_handle,
+                PROCESS_BASIC_INFO_CLASS,
+                &mut parent_pbi as *mut _ as *mut c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut ret_len,
+            );
+
+            if p_status == 0 && parent_pbi.peb_base_address != 0 {
+                let params_offset = if std::mem::size_of::<usize>() == 8 {
+                    0x20
+                } else {
+                    0x10
+                };
+                let cmdline_offset = if std::mem::size_of::<usize>() == 8 {
+                    0x70
+                } else {
+                    0x40
+                };
+
+                let mut params_ptr: usize = 0;
+                let mut bytes_read: usize = 0;
+                if ReadProcessMemory(
+                    parent_handle,
+                    (parent_pbi.peb_base_address + params_offset) as *const c_void,
+                    &mut params_ptr as *mut _ as *mut c_void,
+                    std::mem::size_of::<usize>(),
+                    &mut bytes_read,
+                ) != 0
+                    && params_ptr != 0
+                {
+                    let mut cmdline_us = std::mem::zeroed::<UnicodeString>();
+                    if ReadProcessMemory(
+                        parent_handle,
+                        (params_ptr + cmdline_offset) as *const c_void,
+                        &mut cmdline_us as *mut _ as *mut c_void,
+                        std::mem::size_of::<UnicodeString>(),
+                        &mut bytes_read,
+                    ) != 0
+                        && cmdline_us.length > 0
+                        && !cmdline_us.buffer.is_null()
+                    {
+                        let num_chars = (cmdline_us.length as usize) / 2;
+                        let clamped_chars = num_chars.min(4096);
+                        let mut buf: Vec<u16> = vec![0u16; clamped_chars];
+                        if ReadProcessMemory(
+                            parent_handle,
+                            cmdline_us.buffer as *const c_void,
+                            buf.as_mut_ptr() as *mut c_void,
+                            clamped_chars * 2,
+                            &mut bytes_read,
+                        ) != 0
+                        {
+                            let cmd_str = String::from_utf16_lossy(&buf);
+                            let lower = cmd_str.to_lowercase();
+                            if (lower.contains("agy") || lower.contains("antigravity"))
+                                && lower.contains("--dangerously-skip-permissions")
+                            {
+                                CloseHandle(parent_handle);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            current_handle = parent_handle;
+        }
+
+        if !is_first {
+            CloseHandle(current_handle);
+        }
+
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_antigravity_parent_yolo() -> bool {
+    let mut pid = std::process::id();
+    for _ in 0..6 {
+        let stat_path = format!("/proc/{}/stat", pid);
+        let stat_content = match std::fs::read_to_string(&stat_path) {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        let ppid = match stat_content.rfind(')').and_then(|idx| {
+            stat_content[idx + 1..]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u32>().ok())
+        }) {
+            Some(p) if p > 1 => p,
+            _ => break,
+        };
+
+        let cmdline_path = format!("/proc/{}/cmdline", ppid);
+        if let Ok(cmd_bytes) = std::fs::read(&cmdline_path) {
+            let cmd_str = String::from_utf8_lossy(&cmd_bytes);
+            let lower = cmd_str.to_lowercase();
+            if (lower.contains("agy") || lower.contains("antigravity"))
+                && lower.contains("--dangerously-skip-permissions")
+            {
+                return true;
+            }
+        }
+        pid = ppid;
+    }
+    false
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn detect_antigravity_parent_yolo() -> bool {
+    false
+}
+
 impl HookContext {
     pub fn parse(raw_json: &str) -> Self {
         let trimmed = raw_json.trim();
@@ -918,6 +1143,7 @@ impl HookContext {
                         || get_str(&val, &["permissionMode", "permission_mode"])
                             .map(permission_mode_is_yolo)
                             .unwrap_or(false)
+                        || detect_antigravity_parent_yolo()
                 },
                 conversation,
                 cwd: args
@@ -1093,14 +1319,19 @@ impl HookContext {
             return Self {
                 platform,
                 permission_mode: permission_mode.clone(),
-                is_yolo: (platform == Platform::Codex
-                    && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
-                    || (platform == Platform::Antigravity
-                        && env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS"))
-                    || permission_mode
-                        .as_deref()
-                        .map(permission_mode_is_yolo)
-                        .unwrap_or(false),
+                is_yolo: if let Some(flag) = val.get("is_yolo").and_then(|v| v.as_bool()) {
+                    flag
+                } else {
+                    (platform == Platform::Codex
+                        && env_flag_true("CODEX_DANGEROUSLY_SKIP_PERMISSIONS"))
+                        || (platform == Platform::Antigravity
+                            && (env_flag_true("AGY_DANGEROUSLY_SKIP_PERMISSIONS")
+                                || detect_antigravity_parent_yolo()))
+                        || permission_mode
+                            .as_deref()
+                            .map(permission_mode_is_yolo)
+                            .unwrap_or(false)
+                },
                 conversation,
                 cwd: get_str(&val, &["cwd", "Cwd"])
                     .map(str::to_string)
