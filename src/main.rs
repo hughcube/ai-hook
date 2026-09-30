@@ -2173,7 +2173,7 @@ fn format_log_summary(v: &serde_json::Value, source: &str) -> String {
         let rule = v["hit_rule"].as_str().unwrap_or("-");
         // Rules the engine never reached still occupy a slot in the record;
         // surface the count so a short-circuit is visible without --json.
-        let skipped = v["rules_evaluated"]
+        let skipped = v["rules"]
             .as_array()
             .map(|rules| {
                 rules

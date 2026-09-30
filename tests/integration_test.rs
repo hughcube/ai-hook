@@ -3677,7 +3677,7 @@ fn test_debug_log_collector_and_retention() {
     let ctx = HookContext::parse(&raw_payload);
     let mut collector = DebugCollector::new(AuditLevel::All);
     collector.raw_input = raw_payload.clone();
-    collector.rules_evaluated.push(RuleTrace {
+    collector.rules.push(RuleTrace {
         id: "rule_test".to_string(),
         path: "/path/to/rule.js".to_string(),
         executed: true,
@@ -3708,8 +3708,8 @@ fn test_debug_log_collector_and_retention() {
     assert_eq!(json_line["context"]["platform"], "claude_code");
     assert_eq!(json_line["context"]["tool"], "Bash");
     assert_eq!(json_line["context"]["cmd"], "npm test");
-    assert_eq!(json_line["rules_evaluated"].as_array().unwrap().len(), 1);
-    assert_eq!(json_line["rules_evaluated"][0]["id"], "rule_test");
+    assert_eq!(json_line["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(json_line["rules"][0]["id"], "rule_test");
     assert_eq!(json_line["hit_rule"], "rule_test");
     assert_eq!(json_line["result"]["rule_decision"]["type"], "Allow");
     assert_eq!(json_line["result"]["exit_code"], 0);
@@ -5660,7 +5660,7 @@ fn test_logging_sinks_end_to_end() {
     assert_eq!(rec["outcome"], "block");
     assert_eq!(rec["hit_rule"], "blocker");
     assert!(
-        rec["rules_evaluated"][0]["path"]
+        rec["rules"][0]["path"]
             .as_str()
             .unwrap()
             .contains("blocker.js"),

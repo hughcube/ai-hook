@@ -317,7 +317,11 @@ pub struct DebugLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextView>,
     pub fast_path: FastPathTrace,
-    pub rules_evaluated: Vec<RuleTrace>,
+    /// Every rule this invocation loaded, in evaluation order — including the
+    /// tail that a decisive rule cut short (`executed: false`). Deliberately
+    /// not called `rules_evaluated`: the short-circuited entries were never
+    /// evaluated, so the record lists `rules`.
+    pub rules: Vec<RuleTrace>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hit_rule: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -605,7 +609,7 @@ pub struct DebugCollector {
     pub parse_failed: bool,
     pub fast_path_hit: bool,
     pub fast_path_prefix: Option<String>,
-    pub rules_evaluated: Vec<RuleTrace>,
+    pub rules: Vec<RuleTrace>,
     pub hit_rule: Option<String>,
     pub interaction: Option<InteractionTrace>,
     pub disposition: Option<DispositionTrace>,
@@ -630,7 +634,7 @@ impl DebugCollector {
             parse_failed: false,
             fast_path_hit: false,
             fast_path_prefix: None,
-            rules_evaluated: Vec::new(),
+            rules: Vec::new(),
             hit_rule: None,
             interaction: None,
             disposition: None,
@@ -646,7 +650,7 @@ impl DebugCollector {
     /// is exactly `loaded[ran.len()..]`.
     pub fn record_rules(&mut self, loaded: &[RuleSource], ran: &[RuleExecutionResult]) {
         for r in ran {
-            self.rules_evaluated.push(RuleTrace {
+            self.rules.push(RuleTrace {
                 id: r.rule_id.clone(),
                 path: compact_rule_path(&r.rule_path),
                 executed: true,
@@ -657,7 +661,7 @@ impl DebugCollector {
         }
 
         for r in loaded.iter().skip(ran.len()) {
-            self.rules_evaluated.push(RuleTrace {
+            self.rules.push(RuleTrace {
                 id: r.id.clone(),
                 path: compact_rule_path(&r.path),
                 executed: false,
@@ -764,7 +768,7 @@ impl DebugCollector {
                 hit: self.fast_path_hit,
                 matched_prefix: self.fast_path_prefix,
             },
-            rules_evaluated: self.rules_evaluated,
+            rules: self.rules,
             hit_rule: self.hit_rule,
             interaction: self.interaction,
             disposition,
@@ -816,11 +820,11 @@ mod tests {
         let mut col = DebugCollector::new(AuditLevel::All);
         col.record_rules(&loaded, &ran);
 
-        assert_eq!(col.rules_evaluated.len(), 3, "all loaded rules are listed");
-        assert!(col.rules_evaluated[0].executed);
-        assert_eq!(col.rules_evaluated[0].id, "a");
-        assert!(col.rules_evaluated[0].decision.is_some());
-        for skipped in &col.rules_evaluated[1..] {
+        assert_eq!(col.rules.len(), 3, "all loaded rules are listed");
+        assert!(col.rules[0].executed);
+        assert_eq!(col.rules[0].id, "a");
+        assert!(col.rules[0].decision.is_some());
+        for skipped in &col.rules[1..] {
             assert!(!skipped.executed, "{} never ran", skipped.id);
             assert!(skipped.decision.is_none());
             assert!(skipped.error.is_none());
@@ -1000,7 +1004,7 @@ mod tests {
             parse_failed: false,
             context: None,
             fast_path: FastPathTrace::default(),
-            rules_evaluated: Vec::new(),
+            rules: Vec::new(),
             hit_rule: None,
             interaction: None,
             disposition: Some(DispositionTrace {
