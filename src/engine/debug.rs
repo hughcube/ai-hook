@@ -1,10 +1,16 @@
-use crate::engine::runner::{local_date_str, local_now_str, utc_date_ymd};
+use crate::engine::runner::{local_date_str, local_now_str};
+use crate::logging::{AuditLevel, Outcome};
 use crate::protocol::{HookContext, HookDecision};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Default maximum number of debug log files kept per agent.
 pub const DEFAULT_MAX_LOG_FILES: usize = 14;
+
+/// Maximum characters of the raw hook payload stored in one audit record.
+/// 32 KiB keeps a normal tool call fully recoverable while bounding the line
+/// size for a transcript-heavy payload (which is capped and marked).
+const MAX_RAW_INPUT_CHARS: usize = 32 * 1024;
 
 /// Resolves the retention limit for debug log files (defaults to 14).
 /// Configurable via `AI_HOOK_LOG_MAX_FILES` or `AI_HOOK_DEBUG_MAX_FILES`.
@@ -16,12 +22,6 @@ pub fn resolve_max_log_files() -> usize {
         return parsed;
     }
     DEFAULT_MAX_LOG_FILES
-}
-
-/// Checks whether debug mode is enabled.
-/// Supported via CLI `--debug` or environment variable `AI_HOOK_DEBUG=1|true|on`.
-pub fn is_debug_enabled(cli_debug: bool) -> bool {
-    cli_debug || crate::protocol::input::env_flag_true("AI_HOOK_DEBUG")
 }
 
 /// Fast-path trace in debug log.
@@ -344,18 +344,23 @@ pub fn decision_to_value(decision: &HookDecision) -> serde_json::Value {
     }
 }
 
-/// Resolves the debug log file path for a given agent.
-/// Defaults to `~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log`.
-/// Can be overridden via `AI_HOOK_DEBUG_FILE`.
-pub fn resolve_debug_log_path(agent: &str) -> Option<PathBuf> {
-    if let Ok(custom) = std::env::var("AI_HOOK_DEBUG_FILE") {
-        let custom = custom.trim();
-        if !custom.is_empty() {
-            return Some(PathBuf::from(custom));
-        }
-    }
-    let dir = crate::paths::log_dir()?;
-    Some(dir.join(format!("ai-hook-debug-{}-{}.log", agent, utc_date_ymd())))
+/// True when `name` is a log file of exactly category `prefix`.
+///
+/// The category is `<prefix>{YYYYMMDD}.log` (optionally rotated to `.log.1`).
+/// A plain `starts_with(prefix)` is NOT enough: `ai-hook-` is a prefix of
+/// `ai-hook-console-…` and `ai-hook-audit-…`, so prefix matching would make
+/// each category prune its siblings.
+pub fn log_file_matches(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(stem) = rest
+        .strip_suffix(".log")
+        .or_else(|| rest.strip_suffix(".log.1"))
+    else {
+        return false;
+    };
+    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Prunes old log files in `dir` that match `prefix`, retaining only the newest `max_files`.
@@ -374,18 +379,7 @@ pub fn prune_old_log_files(dir: &Path, prefix: &str, max_files: usize) {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|name| {
-                    if prefix.starts_with("ai-hook-debug-")
-                        || prefix.starts_with("ai-hook-inbound-")
-                    {
-                        name.starts_with(prefix) && name.contains(".log")
-                    } else {
-                        // Standard rule log: exclude debug files to guarantee complete namespace isolation
-                        name.starts_with(prefix)
-                            && !name.contains("-debug-")
-                            && name.contains(".log")
-                    }
-                })
+                .map(|name| log_file_matches(name, prefix))
                 .unwrap_or(false)
         })
         .collect();
@@ -411,40 +405,51 @@ pub fn prune_old_log_files(dir: &Path, prefix: &str, max_files: usize) {
     }
 }
 
-/// Records a debug log entry to disk (appends a single JSONL line).
-/// Performs rotation (>20MB) when oversized; no automatic pruning is done in the hot path.
-pub fn record_debug_log(agent: &str, entry: &DebugLogEntry) {
-    let log_path = resolve_debug_log_path(agent);
-    let Some(path) = log_path else {
-        return;
-    };
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // Rotate once if oversized (>20MB)
-    const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > MAX_LOG_BYTES
-        && let Some(name) = path.file_name()
-    {
-        let rotated_path = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-        let _ = std::fs::rename(&path, &rotated_path);
-    }
-
-    let line = match serde_json::to_string(entry) {
-        Ok(l) => l,
+/// Serializes one audit entry, tags it with its outcome class, and appends it
+/// to the audit log. Rotation/creation is handled by `logging::audit_write`.
+fn write_audit_entry(agent: &str, entry: &DebugLogEntry, outcome: Outcome) {
+    let mut value = match serde_json::to_value(entry) {
+        Ok(v) => v,
         Err(_) => return,
     };
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert(
+            "outcome".to_string(),
+            serde_json::Value::String(outcome.as_str().to_string()),
+        );
+    }
+    crate::logging::audit_write(agent, &value);
+}
 
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", line);
+/// Classifies an invocation from its final decision, disposition and whether a
+/// user interaction (ask/popup) took place.
+fn classify_outcome(
+    decision: &HookDecision,
+    disposition: Option<&DispositionTrace>,
+    interaction: Option<&InteractionTrace>,
+) -> Outcome {
+    let effect = disposition.map(|d| d.final_effect.as_str()).unwrap_or("");
+    match decision {
+        HookDecision::Deny { .. } => Outcome::Block,
+        HookDecision::Modify(_) | HookDecision::KeepGoing { .. } => Outcome::Review,
+        // A confirm is a block only when it ended in a deny (user refusal,
+        // timeout or auto-deny); a approved/pending ask is a review.
+        HookDecision::Confirm { .. } => {
+            if effect == "Blocked" {
+                Outcome::Block
+            } else {
+                Outcome::Review
+            }
+        }
+        // A plain allow is only a "review" when it went through an interaction
+        // (e.g. an unparseable payload the operator approved).
+        HookDecision::Allow => {
+            if interaction.is_some() {
+                Outcome::Review
+            } else {
+                Outcome::Allow
+            }
+        }
     }
 }
 
@@ -570,6 +575,10 @@ pub fn clean_all_logs(dir: &Path, max_files: usize, dry_run: bool) -> CleanRepor
 
 /// Helper collector for accumulating traces during a single hook dispatch.
 pub struct DebugCollector {
+    /// Audit recording scope resolved from the environment; the collector is
+    /// only built when it is not `Off`, and `record` drops invocations the
+    /// level does not cover (checked *before* the snapshot is serialized).
+    pub audit: AuditLevel,
     pub t_start: std::time::Instant,
     pub t_read_done: Option<std::time::Instant>,
     pub t_parse_done: Option<std::time::Instant>,
@@ -587,13 +596,14 @@ pub struct DebugCollector {
 
 impl Default for DebugCollector {
     fn default() -> Self {
-        Self::new()
+        Self::new(AuditLevel::Off)
     }
 }
 
 impl DebugCollector {
-    pub fn new() -> Self {
+    pub fn new(audit: AuditLevel) -> Self {
         Self {
+            audit,
             t_start: std::time::Instant::now(),
             t_read_done: None,
             t_parse_done: None,
@@ -668,6 +678,13 @@ impl DebugCollector {
             })
         });
 
+        // Decide whether this invocation is worth a line BEFORE assembling the
+        // snapshot: a non-triggering call pays no serialization cost at all.
+        let outcome = classify_outcome(decision, disposition.as_ref(), self.interaction.as_ref());
+        if !crate::logging::audit_allows(self.audit, outcome) {
+            return;
+        }
+
         let entry = DebugLogEntry {
             time: local_now_str(),
             date: local_date_str(),
@@ -676,12 +693,15 @@ impl DebugCollector {
                 .map(|d| d.as_millis())
                 .unwrap_or(0),
             agent: agent.to_string(),
-            r#type: "debug".to_string(),
+            r#type: "audit".to_string(),
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             cli_args: self.cli_args,
-            raw_input: if self.raw_input.chars().count() > 1024 {
-                let prefix: String = self.raw_input.chars().take(1024).collect();
+            // The full raw payload is what makes a false-positive block
+            // diagnosable, but a multi-megabyte transcript must not balloon
+            // the line — cap it and mark the truncation.
+            raw_input: if self.raw_input.chars().count() > MAX_RAW_INPUT_CHARS {
+                let prefix: String = self.raw_input.chars().take(MAX_RAW_INPUT_CHARS).collect();
                 format!(
                     "{} ...[truncated, total {} chars]",
                     prefix,
@@ -714,7 +734,7 @@ impl DebugCollector {
             },
         };
 
-        record_debug_log(agent, &entry);
+        write_audit_entry(agent, &entry, outcome);
     }
 }
 
@@ -768,42 +788,90 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_enabled_and_log_path() {
-        // AI_HOOK_DEBUG_FILE alone does not enable debug mode
-        unsafe {
-            std::env::remove_var("AI_HOOK_DEBUG");
-            std::env::set_var("AI_HOOK_DEBUG_FILE", "1");
-        }
-        assert!(!is_debug_enabled(false));
+    fn test_classify_outcome_matrix() {
+        let deny = HookDecision::Deny {
+            reason: "x".to_string(),
+        };
+        assert_eq!(classify_outcome(&deny, None, None), Outcome::Block);
 
-        // AI_HOOK_DEBUG=1 enables debug mode
-        unsafe {
-            std::env::set_var("AI_HOOK_DEBUG", "1");
-        }
-        assert!(is_debug_enabled(false));
-
-        // Test custom log path
-        let custom_file = std::env::temp_dir().join("my-custom-debug.log");
-        unsafe {
-            std::env::set_var(
-                "AI_HOOK_DEBUG_FILE",
-                custom_file.to_string_lossy().to_string(),
-            );
-        }
-        let path = resolve_debug_log_path("claude_code").unwrap();
-        assert_eq!(path, custom_file);
-
-        // Test default path when AI_HOOK_DEBUG_FILE is absent
-        unsafe {
-            std::env::remove_var("AI_HOOK_DEBUG_FILE");
-            std::env::remove_var("AI_HOOK_DEBUG");
-        }
-        let default_path = resolve_debug_log_path("claude_code").unwrap();
-        assert!(
-            default_path
-                .to_string_lossy()
-                .contains("ai-hook-debug-claude_code-")
+        let allow = HookDecision::Allow;
+        assert_eq!(classify_outcome(&allow, None, None), Outcome::Allow);
+        // An allow that went through an ask/popup (e.g. an approved
+        // unparseable payload) is a review, not a plain allow.
+        assert_eq!(
+            classify_outcome(&allow, None, Some(&InteractionTrace::default())),
+            Outcome::Review
         );
+
+        let confirm = HookDecision::Confirm {
+            reason: "x".to_string(),
+            title: None,
+            gui: None,
+            timeout: None,
+            force_gui: None,
+        };
+        let blocked = DispositionTrace {
+            final_effect: "Blocked".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_outcome(&confirm, Some(&blocked), None),
+            Outcome::Block
+        );
+        let asked = DispositionTrace {
+            final_effect: "Asked".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_outcome(&confirm, Some(&asked), None),
+            Outcome::Review
+        );
+
+        assert_eq!(
+            classify_outcome(
+                &HookDecision::Modify(crate::protocol::Mutation::default()),
+                None,
+                None
+            ),
+            Outcome::Review
+        );
+        assert_eq!(
+            classify_outcome(
+                &HookDecision::KeepGoing {
+                    reason: "x".to_string()
+                },
+                None,
+                None
+            ),
+            Outcome::Review
+        );
+    }
+
+    #[test]
+    fn test_log_file_category_exact_match() {
+        assert!(log_file_matches("ai-hook-20261001.log", "ai-hook-"));
+        assert!(log_file_matches("ai-hook-20261001.log.1", "ai-hook-"));
+        assert!(log_file_matches(
+            "ai-hook-console-20261001.log",
+            "ai-hook-console-"
+        ));
+        // The `ai-hook-` prefix must NOT swallow console/audit siblings —
+        // that is exactly the collision that startswith() caused.
+        assert!(!log_file_matches(
+            "ai-hook-console-20261001.log",
+            "ai-hook-"
+        ));
+        assert!(!log_file_matches(
+            "ai-hook-audit-codebuddy-20261001.log",
+            "ai-hook-"
+        ));
+        // Audit keeps the agent in the name: its category is prefix+agent.
+        assert!(log_file_matches(
+            "ai-hook-audit-codebuddy-20261001.log",
+            "ai-hook-audit-codebuddy-"
+        ));
+        assert!(!log_file_matches("ai-hook-2026100x.log", "ai-hook-"));
+        assert!(!log_file_matches("random.log", "ai-hook-"));
     }
 
     #[test]
@@ -839,7 +907,7 @@ mod tests {
             date: "2026-09-07".to_string(),
             timestamp: 1788770000000,
             agent: "antigravity".to_string(),
-            r#type: "debug".to_string(),
+            r#type: "audit".to_string(),
             pid: 12345,
             version: "3.0.4".to_string(),
             cli_args: vec!["ai-hook".to_string()],
@@ -882,7 +950,7 @@ mod tests {
 
         let json_str = serde_json::to_string(&entry).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed["type"], "debug");
+        assert_eq!(parsed["type"], "audit");
         assert_eq!(parsed["disposition"]["engine_action"], "Confirm");
         assert_eq!(parsed["disposition"]["final_effect"], "Allowed");
         assert_eq!(parsed["disposition"]["ask"]["channel"], "DesktopPopup");

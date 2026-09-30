@@ -194,9 +194,15 @@ ai-hook install
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | 默认倒计时弹窗秒数（超时自动拒绝关闭） |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (开启) | 设置为 `0` 或 `false` 可完全静默关闭桌面弹窗 |
 | `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (关闭) | **强制弹出**：即使 Agent (如 Claude Code) 支持原生终端 ask，亦强制唤起系统弹窗确认（硬阻断 deny 场景除外） |
-| `AI_HOOK_DEBUG` / `--debug` | `0` (关闭) | **全量调试模式**：记录原生宿主输入、上下文、规则执行链与决策结果到 `~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log` |
-| `AI_HOOK_DEBUG_MAX_FILES` | `14` | 调试日志保留最大文件数（默认保留最后 14 个文件，超出自动删除最老历史文件） |
-| `AI_HOOK_DEBUG_FILE` | (自动) | 自定义调试日志写入路径（覆盖默认路径） |
+| `AI_HOOK_LOG_FRAMEWORK` | `on` | **日志 #1 — 框架**：ai-hook 自身诊断 → `~/.log/ai-hook/ai-hook-{YYYYMMDD}.log`。路径覆盖 `AI_HOOK_LOG_FRAMEWORK_FILE`。 |
+| `AI_HOOK_LOG_CONSOLE` | `on` | **日志 #2 — 控制台**：规则 `console.log` / `sys.log` 输出 → `~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log`。路径覆盖 `AI_HOOK_LOG_CONSOLE_FILE`（旧名 `AI_HOOK_LOG_FILE`）；旧变量 `AI_HOOK_LOG=off` 仍可关闭。 |
+| `AI_HOOK_LOG_AUDIT` | `off` | **日志 #3 — 审计**：**每次调用一条完整快照**（原始 stdin payload + 规则执行链 + 最终决策）→ `~/.log/ai-hook/ai-hook-audit-{agent}-{YYYYMMDD}.log`。记录范围：`off` / `block`（仅拦截）/ `review`（含确认与改写）/ `all`（每次调用）。路径覆盖 `AI_HOOK_LOG_AUDIT_FILE`（旧名 `AI_HOOK_DEBUG_FILE`）。 |
+| `AI_HOOK_LOG_MAX_FILES` | `14` | 每类日志保留的最大文件数（超出后由 `ai-hook clean` 清理） |
+| `--debug` | `0` (关闭) | **「全量记录」快捷方式**：等价 `AI_HOOK_LOG_AUDIT=all`（旧变量 `AI_HOOK_DEBUG=1` / `AI_HOOK_LOG_EXTERNAL=1` 仍然生效） |
+
+> **取值一律用名字，不认数字**：三个开关只接受 `on` / `off`（以及 `true` / `yes`），`AI_HOOK_LOG_AUDIT` 接受上面四个范围名。`AI_HOOK_LOG_AUDIT=1` 会被**明确拒绝**——`1` 曾在「开关」与「等级」之间含义不清。
+>
+> 用 **`ai-hook logs`** 回读日志（`--source audit|console|framework`、`--tail N`、`--level`、`--agent`、`--json`）。
 
 ---
 
@@ -452,7 +458,7 @@ export default function (ctx, sys) {
 | `sys.http.get(url, opt?)` | `object` | **轻量同步 HTTP GET**：支持 `headers`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `sys.http.post(url, opt?)` | `object` | **轻量同步 HTTP POST**：支持 `headers`/`body`/`timeout`，返回 `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | 调试日志到 stderr(绝不污染决策 JSON) |
-| `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;默认保留最后 14 个文件;`AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_FILE` 自定义,`AI_HOOK_LOG_MAX_FILES` 调整保留数量) |
+| `sys.log(level, ...)` | `void` | 结构化日志:stderr **并**追加 `~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log`(JSONL;仅规则产生日志时写盘;`AI_HOOK_LOG_CONSOLE=off` 或旧名 `AI_HOOK_LOG=0` 关闭,`AI_HOOK_LOG_CONSOLE_FILE` / 旧名 `AI_HOOK_LOG_FILE` 自定义路径,`ai-hook clean` 清理保留) |
 | **标准 JS 原生能力** | - | `new Date()` 时钟（星期几/小时/封网期）、`JSON` / `RegExp` / `Math` / `Map` / `Set` 均为 QuickJS 原生内建，无需 sys —— sys 只补 JS 没有的 I/O 能力 |
 
 ### 3. `aiHook` 引擎注入的规则公共 prelude（全局纯函数，零 I/O）

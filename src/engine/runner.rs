@@ -5,7 +5,6 @@ use crate::i18n::{Msg, t, tf};
 use crate::protocol::{HookContext, HookDecision, Mutation};
 use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp, RegExpCompiler};
 use rquickjs::{Array, Coerced, Context, Ctx, Function, Object, Runtime, Value};
-use std::io::Write;
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -29,9 +28,6 @@ pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Omitted: TypedArrays, Proxy, WeakRef, Performance — no rule shape needs
 /// them, and each adds constructor objects to every single context.
 type RuleIntrinsics = (Date, Eval, RegExpCompiler, RegExp, Json, Promise, MapSet);
-
-/// Maximum size of the rule log file before it rotates to `<name>.1`.
-const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Localized message for rules that return a Promise (async is unsupported).
 fn async_rule_error() -> String {
@@ -73,45 +69,6 @@ pub struct RuleExecutionResult {
     pub error: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Rule log sink: stderr (default) + optional file channel.
-//
-// Design (per user decision):
-// - Location:     ~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log  (UTC day)
-// - Aggregation:  one file per agent per day; every line is JSONL with
-//                 ts/sessionId/rule/level/msg so one session's story can be
-//                 reconstructed with `grep '"sessionId":"..."' file.log`.
-// - Cost:         the file is only opened when a rule actually logs; rules
-//                 that never log cost zero I/O.
-// - Rotation:     >20MB renames to `<name>.1` (checked once per open).
-// - Overrides:    AI_HOOK_LOG_FILE=<path>  custom file,
-//                 AI_HOOK_LOG=0|false|off  disable file logging entirely.
-// ---------------------------------------------------------------------------
-
-fn log_file_disabled() -> bool {
-    if std::env::var("AI_HOOK_LOG_FILE").is_ok_and(|f| !f.trim().is_empty()) {
-        return false;
-    }
-    std::env::var("AI_HOOK_LOG")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "0" || v == "false" || v == "no" || v == "off"
-        })
-        .unwrap_or(false)
-}
-
-/// Returns the default (or AI_HOOK_LOG_FILE-overridden) log file path.
-fn resolve_log_path(agent: &str) -> Option<std::path::PathBuf> {
-    if let Ok(custom) = std::env::var("AI_HOOK_LOG_FILE") {
-        let custom = custom.trim();
-        if !custom.is_empty() {
-            return Some(std::path::PathBuf::from(custom));
-        }
-    }
-    let dir = crate::paths::log_dir()?;
-    Some(dir.join(format!("ai-hook-{}-{}.log", agent, utc_date_ymd())))
-}
-
 /// Days since 1970-01-01 -> (y, m, d) in UTC (civil-from-days, Hinnant).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -149,122 +106,11 @@ pub fn local_date_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// Appends one JSONL line to the rule log (opened on demand, then closed).
-/// Never fails the caller: logging must not break rule evaluation.
+/// Records one rule `console.log` / `sys.log` line to the console sink
+/// (`ai-hook-console-{date}.log`). Kept as a thin wrapper so the JS bindings
+/// above stay unchanged.
 fn append_rule_log(agent: &str, session_id: Option<&str>, rule_id: &str, level: &str, msg: &str) {
-    if log_file_disabled() {
-        return;
-    }
-    let Some(path) = resolve_log_path(agent) else {
-        return;
-    };
-
-    // Rotate once if oversized (checked at open time — cheap).
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > MAX_LOG_BYTES
-        && let Some(name) = path.file_name()
-    {
-        let rotated_path = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-        let _ = std::fs::rename(&path, &rotated_path);
-    }
-
-    let line = serde_json::json!({
-        "time": local_now_str(),
-        "date": local_date_str(),
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-        "agent": agent,
-        "type": "rule",
-        "level": level,
-        "sessionId": session_id,
-        "rule": rule_id,
-        "msg": msg,
-    })
-    .to_string();
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Append-only open: atomic for concurrent hook processes per line.
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{}", line);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Inbound payload log (debug aid): AI_HOOK_LOG_EXTERNAL=1|true records the
-// raw stdin payload every agent sent — captured BEFORE parsing, so payload
-// shape / platform-detection / parse bugs can be diagnosed from the exact
-// bytes the host delivered. Defaults to off; costs zero I/O when off.
-//
-// - File:    ~/.log/ai-hook/ai-hook-inbound-{YYYYMMDD}.log
-// - Format:  JSONL: {time, date, ts, agent, type, bytes, truncated, payload}
-// - Bounds:  payloads over 1 MiB store only their head (truncated: true) so
-//            a huge transcript cannot balloon the log; 20MB rotation like the
-//            rule log.
-// ---------------------------------------------------------------------------
-pub fn log_inbound_payload(raw: &str) {
-    // Enabled only by 1/true, exactly as the tutorial documents
-    // (AI_HOOK_LOG_EXTERNAL=1|true) — same convention as the other env flags.
-    if !crate::protocol::env_flag_true("AI_HOOK_LOG_EXTERNAL") || raw.is_empty() {
-        return;
-    }
-
-    let agent = crate::protocol::HookContext::parse(raw)
-        .platform
-        .to_string();
-
-    const MAX_RAW_BYTES: usize = 1024 * 1024;
-    let truncated = raw.len() > MAX_RAW_BYTES;
-    let cut = raw.floor_char_boundary(MAX_RAW_BYTES);
-    let stored = if truncated { &raw[..cut] } else { raw };
-
-    let Some(dir) = crate::paths::log_dir() else {
-        return;
-    };
-    let path = dir.join(format!("ai-hook-inbound-{}.log", utc_date_ymd()));
-
-    // Rotate once if oversized (checked at open time — cheap).
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > MAX_LOG_BYTES
-        && let Some(name) = path.file_name()
-    {
-        let rotated_path = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-        let _ = std::fs::rename(&path, &rotated_path);
-    }
-
-    let line = serde_json::json!({
-        "time": local_now_str(),
-        "date": local_date_str(),
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-        "agent": agent,
-        "type": "inbound",
-        "bytes": raw.len(),
-        "truncated": truncated,
-        "payload": stored,
-    })
-    .to_string();
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Append-only open: atomic for concurrent hook processes per line.
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{}", line);
-    }
+    crate::logging::console(agent, session_id, rule_id, level, msg);
 }
 
 impl RuleRunner {

@@ -342,6 +342,22 @@ pub enum Msg {
     /// `inject` downgraded to the user-visible `systemMessage` channel.
     /// Takes one argument: the event name.
     M169,
+    /// Subcommand logs description.
+    M170,
+    /// CLI help text for logs --source.
+    M171,
+    /// CLI help text for logs --tail.
+    M172,
+    /// CLI help text for logs --level.
+    M173,
+    /// CLI help text for logs --agent.
+    M174,
+    /// CLI help text for logs --json.
+    M175,
+    /// `ai-hook logs`: no log files were found for the requested source.
+    M176,
+    /// `ai-hook logs`: unknown --source value.
+    M177,
 }
 
 impl Msg {
@@ -1115,10 +1131,10 @@ impl Msg {
             },
             Msg::M161 => match l {
                 Lang::Zh => {
-                    "启用 Debug 模式:将完整的原生宿主输入、规则上下文、执行轨迹与最终决策记录至日志文件"
+                    "启用 Debug 模式:等价 AI_HOOK_LOG_AUDIT=all,把每次调用的完整快照(原始输入/上下文/规则执行轨迹/最终决策)写入审计日志"
                 }
                 Lang::En => {
-                    "Enable debug mode: record full raw input, normalized context, rule trace and decisions to log"
+                    "Enable debug mode: equivalent to AI_HOOK_LOG_AUDIT=all — record a complete snapshot (raw input, context, rule trace, decision) of every invocation to the audit log"
                 }
             },
             Msg::M162 => match l {
@@ -1168,6 +1184,42 @@ impl Msg {
                 Lang::En => {
                     "This host×event ({}) has no model-context channel; the injected text was downgraded to a user-visible systemMessage (it will not reach the model)"
                 }
+            },
+            Msg::M170 => match l {
+                Lang::Zh => "查看 ai-hook 日志文件(框架 / 控制台 / 审计)",
+                Lang::En => "Inspect ai-hook log files (framework / console / audit)",
+            },
+            Msg::M171 => match l {
+                Lang::Zh => "要读取的日志类型: audit(默认) / console / framework",
+                Lang::En => "Which sink to read: audit (default), console or framework",
+            },
+            Msg::M172 => match l {
+                Lang::Zh => "从最新文件末尾展示的记录条数(默认 20)",
+                Lang::En => {
+                    "Number of records to show from the end of the newest files (default 20)"
+                }
+            },
+            Msg::M173 => match l {
+                Lang::Zh => "按等级过滤: 审计用 allow|review|block,其它源匹配其 level 字段",
+                Lang::En => {
+                    "Filter by level: audit uses allow|review|block; other sinks match their level field"
+                }
+            },
+            Msg::M174 => match l {
+                Lang::Zh => "只显示 agent 字段匹配该值的记录",
+                Lang::En => "Only show records whose agent field matches this value",
+            },
+            Msg::M175 => match l {
+                Lang::Zh => "输出原始 JSONL 行而非摘要",
+                Lang::En => "Print raw JSONL lines instead of a summary",
+            },
+            Msg::M176 => match l {
+                Lang::Zh => "未找到匹配的日志文件: {}",
+                Lang::En => "No matching log files found: {}",
+            },
+            Msg::M177 => match l {
+                Lang::Zh => "未知的 --source 取值: {}(可选 audit / console / framework)",
+                Lang::En => "Unknown --source value: {} (expected audit / console / framework)",
             },
             Msg::AllowWord => match l {
                 Lang::Zh => "允许",

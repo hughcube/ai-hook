@@ -3,6 +3,7 @@ pub mod engine;
 pub mod fast_path;
 pub mod i18n;
 pub mod install;
+pub mod logging;
 pub mod paths;
 pub mod protocol;
 pub mod tutorial;

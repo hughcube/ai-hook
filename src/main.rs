@@ -9,11 +9,12 @@
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::debug::{
     AskTrace, DebugCollector, DispositionTrace, InteractionTrace, RuleTrace, UserActionTrace,
-    decision_to_value, is_debug_enabled,
+    decision_to_value,
 };
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
-use ai_hook::i18n::{Msg, lang, t};
+use ai_hook::i18n::{Msg, lang, t, tf};
+use ai_hook::logging;
 use ai_hook::protocol::input::env_flag_true;
 use ai_hook::protocol::{
     ConfirmPath, HookContext, HookDecision, confirm_path, format_ask_prompt,
@@ -277,9 +278,9 @@ fn get_binary_info_help() -> String {
 
 /// Subcommand names defined by the derive macro. When the first positional
 /// argument is one of these, argument handling belongs to clap.
-const SUBCOMMANDS: [&str; 13] = [
+const SUBCOMMANDS: [&str; 15] = [
     "list", "ls", "test", "bench", "install", "update", "upgrade", "tutorial", "guide", "clean",
-    "prune", "version", "help",
+    "prune", "logs", "log", "version", "help",
 ];
 
 /// Returns true if the token is a recognized subcommand name or alias.
@@ -335,6 +336,13 @@ fn is_known_flag(flag_name: &str, subcmd: Option<&str>) -> (bool, bool) {
             },
             "tutorial" | "guide" => match flag_name {
                 "l" | "lang" => return (true, true),
+                _ => {}
+            },
+            "logs" | "log" => match flag_name {
+                "s" | "source" | "n" | "tail" | "l" | "level" | "a" | "agent" => {
+                    return (true, true);
+                }
+                "json" => return (true, false),
                 _ => {}
             },
             "test" => match flag_name {
@@ -654,6 +662,13 @@ fn main() {
             ai_hook::tutorial::print_tutorial(&resolved);
         }
         Some(Commands::Clean { max_files, dry_run }) => handle_clean(max_files, dry_run),
+        Some(Commands::Logs {
+            ref source,
+            tail,
+            ref level,
+            ref agent,
+            json,
+        }) => handle_logs(source, tail, level.as_deref(), agent.as_deref(), json),
         Some(Commands::Version) => {
             outln!("ai-hook {}", env!("CARGO_PKG_VERSION"));
         }
@@ -775,11 +790,15 @@ fn handle_dispatch(args: &Cli) {
         return;
     }
 
-    let is_debug = is_debug_enabled(args.debug);
-    let mut debug_collector = if is_debug {
-        Some(DebugCollector::new())
-    } else {
+    // Audit sink #3: `--debug` (and the legacy AI_HOOK_DEBUG /
+    // AI_HOOK_LOG_EXTERNAL switches) mean "record every invocation". The
+    // collector is only built when a level other than `off` is configured, so
+    // the default path keeps paying zero logging cost.
+    let audit_level = logging::audit_level(args.debug);
+    let mut debug_collector = if audit_level.is_off() {
         None
+    } else {
+        Some(DebugCollector::new(audit_level))
     };
 
     let mut buffer = String::new();
@@ -788,6 +807,7 @@ fn handle_dispatch(args: &Cli) {
         // payload. Empty output means "allow" to every host protocol, so an
         // unreadable payload must deny rather than return silently.
         eprint_ts!("[ai-hook] {}: {}", t(Msg::M055), e);
+        logging::framework("error", &format!("stdin read failed: {}", e));
         let ctx = HookContext::parse("");
         let reason = t(Msg::M135).to_string();
         let dec = HookDecision::Deny {
@@ -878,10 +898,9 @@ fn handle_dispatch(args: &Cli) {
     }
 
     prof_mark!("③ stdin 读取完成");
-    // Debug aid (AI_HOOK_LOG_EXTERNAL=1): persist the raw payload BEFORE
-    // parsing so shape / platform-detection problems stay diagnosable even
-    // when parse itself fails. Never fails the hook.
-    ai_hook::engine::log_inbound_payload(&buffer);
+    // The raw payload is no longer written by a dedicated sink: it travels
+    // inside every audit record (`raw_input`), so `AI_HOOK_LOG_EXTERNAL=1` is
+    // now an alias for `AI_HOOK_LOG_AUDIT=all`.
 
     let ctx = HookContext::parse(&buffer);
     prof_mark!("④ payload 解析完成");
@@ -1118,6 +1137,7 @@ fn handle_dispatch(args: &Cli) {
         // debug log.
         if rules_configured(&explicit_paths) {
             eprint_ts!("[ai-hook] {}", t(Msg::M160));
+            logging::framework("error", "no rules loaded but rule paths were configured");
         }
         let dec = HookDecision::Allow;
         let out = dec.to_json_output(&ctx, None);
@@ -1165,6 +1185,7 @@ fn handle_dispatch(args: &Cli) {
             Err(e) => {
                 // Gate is broken: rules cannot run, so do NOT silently allow.
                 eprint_ts!("[ai-hook] {}: {}", t(Msg::M056), e);
+                logging::framework("error", &format!("rule engine init failed: {}", e));
                 let reason = t(Msg::M057).to_string();
                 let dec = HookDecision::Deny {
                     reason: reason.clone(),
@@ -1614,6 +1635,7 @@ fn handle_dispatch(args: &Cli) {
 
     if outcome.is_err() {
         eprint_ts!("[ai-hook] {}", t(Msg::M059));
+        logging::framework("error", "rule execution panicked (fail-closed deny)");
         let reason = t(Msg::M060).to_string();
         let dec = HookDecision::Deny {
             reason: reason.clone(),
@@ -2105,6 +2127,168 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, platform: &str, sc
         t(Msg::M091)
     );
     outln!("============================================================");
+}
+
+/// True when `name` is a log file of the requested sink.
+fn belongs_to_source(name: &str, source: &str) -> bool {
+    let stem = name
+        .strip_suffix(".log.1")
+        .or_else(|| name.strip_suffix(".log"))
+        .unwrap_or(name);
+    if !stem.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    match source {
+        "audit" => stem.starts_with("ai-hook-audit-"),
+        "console" => stem.starts_with("ai-hook-console-"),
+        "framework" => {
+            stem.starts_with("ai-hook-")
+                && !stem.starts_with("ai-hook-console-")
+                && !stem.starts_with("ai-hook-audit-")
+        }
+        _ => false,
+    }
+}
+
+/// Applies `--level`. Audit records are filtered on their `outcome` class;
+/// the framework/console sinks on their free-form `level` tag.
+fn passes_level_filter(v: &serde_json::Value, source: &str, level: Option<&str>) -> bool {
+    let Some(level) = level else {
+        return true;
+    };
+    let want = level.trim().to_ascii_lowercase();
+    let field = if source == "audit" {
+        "outcome"
+    } else {
+        "level"
+    };
+    v[field]
+        .as_str()
+        .is_some_and(|got| got.eq_ignore_ascii_case(&want))
+}
+
+/// One-line human summary of a record.
+fn format_log_summary(v: &serde_json::Value, source: &str) -> String {
+    let time = v["time"].as_str().unwrap_or("");
+    let agent = v["agent"].as_str().unwrap_or("-");
+    if source == "audit" {
+        let outcome = v["outcome"].as_str().unwrap_or("?");
+        let tool = v["context"]["tool"].as_str().unwrap_or("-");
+        let target = v["context"]["cmd"]
+            .as_str()
+            .or_else(|| v["context"]["file"]["path"].as_str())
+            .unwrap_or("");
+        let rule = v["hit_rule"].as_str().unwrap_or("-");
+        let summary = v["disposition"]["summary"].as_str().unwrap_or("");
+        format!("{time}  [{outcome}]  {agent}  {tool}  {target}  rule={rule}  {summary}")
+    } else {
+        let level = v["level"].as_str().unwrap_or("-");
+        let rule = v["rule"]
+            .as_str()
+            .map(|r| format!(" rule={r}"))
+            .unwrap_or_default();
+        let msg = v["msg"].as_str().unwrap_or("");
+        format!("{time}  [{level}]{rule}  {agent}  {msg}")
+    }
+}
+
+/// `ai-hook logs`: read back a log sink. Defaults to the audit sink — the one
+/// that answers "why was this blocked, and by which rule file".
+fn handle_logs(source: &str, tail: usize, level: Option<&str>, agent: Option<&str>, json: bool) {
+    if tail == 0 {
+        return;
+    }
+    let source = source.trim().to_ascii_lowercase();
+    if !matches!(source.as_str(), "audit" | "console" | "framework") {
+        eprint_ts!("[ai-hook logs] {}", tf(Msg::M177, &[&source]));
+        std::process::exit(1);
+    }
+
+    let Some(dir) = ai_hook::paths::log_dir() else {
+        errln!("[ai-hook] Could not determine user home directory.");
+        std::process::exit(1);
+    };
+
+    // Collect matching files, newest first. When the sink has an explicit
+    // path override configured, read exactly that file — it is where the
+    // records actually went, wherever they are.
+    let mut files: Vec<PathBuf> = match logging::override_path_for(&source) {
+        Some(f) => {
+            if f.is_file() {
+                vec![f]
+            } else {
+                Vec::new()
+            }
+        }
+        None => match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .filter(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    belongs_to_source(name, &source)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        },
+    };
+    files.sort_by(|a, b| {
+        b.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .cmp(&a.metadata().and_then(|m| m.modified()).ok())
+    });
+
+    // Walk newest files first, taking the most recent `tail` matching lines.
+    let mut records: Vec<(String, serde_json::Value)> = Vec::new();
+    'files: for path in &files {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if !passes_level_filter(&v, &source, level) {
+                continue;
+            }
+            if let Some(a) = agent
+                && v["agent"].as_str() != Some(a)
+            {
+                continue;
+            }
+            records.push((line.to_string(), v));
+            if records.len() >= tail {
+                break 'files;
+            }
+        }
+    }
+    records.reverse(); // oldest → newest
+
+    if records.is_empty() {
+        let scope = files
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| dir.display().to_string());
+        outln!(
+            "{}",
+            tf(Msg::M176, &[&format!("{} (source={})", scope, source)])
+        );
+        return;
+    }
+
+    for (raw, v) in &records {
+        if json {
+            outln!("{}", raw);
+        } else {
+            outln!("{}", format_log_summary(v, &source));
+        }
+    }
 }
 
 fn handle_clean(max_files: Option<usize>, dry_run: bool) {

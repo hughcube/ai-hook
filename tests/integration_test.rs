@@ -761,7 +761,7 @@ fn test_force_gui_rule() {
 
 #[test]
 fn test_rule_logging_sys_log_api() {
-    let _guard = TEST_LOG_MUTEX.lock().unwrap();
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // console.log / sys.log must not break evaluation. Disable the file
     // channel for tests (env is process-global; no other test logs).
     unsafe {
@@ -791,7 +791,7 @@ fn test_rule_logging_sys_log_api() {
 
 #[test]
 fn test_log_arguments_are_js_coerced_not_strict() {
-    let _guard = TEST_LOG_MUTEX.lock().unwrap();
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // console.log / sys.log accept non-string arguments exactly like plain
     // JS: numbers, booleans, null and objects are coerced, never rejected.
     // (A bare rquickjs String param is strict and threw TypeError on
@@ -3654,6 +3654,9 @@ fn test_loader_strips_utf8_bom() {
 #[test]
 fn test_debug_log_collector_and_retention() {
     use ai_hook::engine::debug::{DebugCollector, RuleTrace, prune_old_log_files};
+    use ai_hook::logging::AuditLevel;
+
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = std::env::temp_dir().join(format!("ai-hook-debug-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
@@ -3672,7 +3675,7 @@ fn test_debug_log_collector_and_retention() {
     .to_string();
 
     let ctx = HookContext::parse(&raw_payload);
-    let mut collector = DebugCollector::new();
+    let mut collector = DebugCollector::new(AuditLevel::All);
     collector.raw_input = raw_payload.clone();
     collector.rules_evaluated.push(RuleTrace {
         id: "rule_test".to_string(),
@@ -3697,7 +3700,8 @@ fn test_debug_log_collector_and_retention() {
         serde_json::from_str(content.lines().next().unwrap()).expect("parse debug jsonl");
     assert_eq!(json_line["raw_input"], raw_payload);
     assert_eq!(json_line["agent"], "claude_code");
-    assert_eq!(json_line["type"], "debug");
+    assert_eq!(json_line["type"], "audit");
+    assert_eq!(json_line["outcome"], "allow");
     assert!(json_line["time"].is_string());
     assert!(json_line["date"].is_string());
     assert_eq!(json_line["context"]["platform"], "claude_code");
@@ -3725,6 +3729,107 @@ fn test_debug_log_collector_and_retention() {
 
     unsafe {
         std::env::remove_var("AI_HOOK_DEBUG_FILE");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The audit level is a recording *scope*: `block` drops a plain allow but
+/// keeps a deny, `review` also keeps a confirm, `all` keeps everything and
+/// `off` keeps nothing. Each line that is written is the full snapshot.
+#[test]
+fn test_audit_level_recording_scope() {
+    use ai_hook::engine::debug::DebugCollector;
+    use ai_hook::logging::AuditLevel;
+
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = std::env::temp_dir().join(format!("ai-hook-audit-scope-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let audit_file = tmp.join("scope-audit.log");
+    let _ = std::fs::remove_file(&audit_file);
+
+    unsafe {
+        std::env::set_var("AI_HOOK_LOG_AUDIT_FILE", audit_file.to_str().unwrap());
+    }
+
+    let raw = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" },
+        "session_id": "sess-audit"
+    })
+    .to_string();
+    let ctx = HookContext::parse(&raw);
+
+    let record = |level: AuditLevel, decision: &HookDecision| {
+        let mut c = DebugCollector::new(level);
+        c.raw_input = raw.clone();
+        c.hit_rule = Some("rule_x".to_string());
+        let out = decision.to_json_output(&ctx, None);
+        c.record("codebuddy", Some(&ctx), decision, &out, 0);
+    };
+    let line_count = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+
+    let deny = HookDecision::Deny {
+        reason: "dangerous".to_string(),
+    };
+    let allow = HookDecision::Allow;
+    let confirm = HookDecision::Confirm {
+        reason: "sensitive".to_string(),
+        title: None,
+        gui: None,
+        timeout: None,
+        force_gui: None,
+    };
+
+    // block: a plain allow is dropped, a deny is kept.
+    record(AuditLevel::Block, &allow);
+    assert_eq!(
+        line_count(&audit_file),
+        0,
+        "block level must drop a plain allow"
+    );
+    record(AuditLevel::Block, &deny);
+    assert_eq!(line_count(&audit_file), 1, "block level must keep a deny");
+
+    // review: adds the confirm, still drops the plain allow.
+    record(AuditLevel::Review, &confirm);
+    record(AuditLevel::Review, &allow);
+    assert_eq!(
+        line_count(&audit_file),
+        2,
+        "review keeps confirm, drops allow"
+    );
+
+    // off: nothing at all.
+    record(AuditLevel::Off, &deny);
+    assert_eq!(line_count(&audit_file), 2, "off records nothing");
+
+    // all: everything, including the plain allow.
+    record(AuditLevel::All, &allow);
+    assert_eq!(line_count(&audit_file), 3);
+
+    // The recorded deny line carries the culprit rule and outcome tag.
+    let first: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&audit_file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["type"], "audit");
+    assert_eq!(first["outcome"], "block");
+    assert_eq!(first["hit_rule"], "rule_x");
+    assert_eq!(first["agent"], "codebuddy");
+    assert_eq!(first["raw_input"], raw);
+
+    unsafe {
+        std::env::remove_var("AI_HOOK_LOG_AUDIT_FILE");
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -3830,7 +3935,7 @@ fn test_clean_all_logs_multi_category_and_dry_run() {
 
 #[test]
 fn test_all_logs_contain_datetime_single_line_agent_type() {
-    let _guard = TEST_LOG_MUTEX.lock().unwrap();
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = std::env::temp_dir().join(format!("ai_hook_log_format_test_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
@@ -3873,7 +3978,7 @@ fn test_all_logs_contain_datetime_single_line_agent_type() {
         .find(|l| l.contains("test message 1"))
         .expect("Should contain our test message");
     let rule_json: serde_json::Value = serde_json::from_str(target_line).unwrap();
-    assert_eq!(rule_json["type"], "rule");
+    assert_eq!(rule_json["type"], "console");
     assert_eq!(rule_json["agent"], "antigravity");
     assert!(rule_json["time"].is_string());
     assert!(rule_json["date"].is_string());
@@ -5468,4 +5573,160 @@ fn test_ctx_command_dcg_database_and_sql_fail_closed() {
     let res = runner.execute_rule(&rule("piped-mysql-rule", piped_rule), &ctx_for(piped_cmd));
     assert_eq!(res.error, None);
     assert_eq!(res.decision, Some(HookDecision::Allow));
+}
+
+/// End-to-end exercise of the three log sinks through the real binary:
+///   * audit   — a blocked invocation is recorded in full, naming the rule FILE
+///   * audit   — a plain allow is NOT recorded at `block` level
+///   * console — the rule's console.log lands in the console sink
+///   * framework — the fast-path-with-rules warning lands in the framework sink
+///   * `ai-hook logs` reads the audit sink back
+#[test]
+fn test_logging_sinks_end_to_end() {
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = std::env::temp_dir().join(format!("ai-hook-sinks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let rules_dir = tmp.join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    write_temp_rule(
+        &rules_dir,
+        "blocker.js",
+        r#"export default function(ctx, sys) {
+            if (ctx.cmd && ctx.cmd.includes("rm -rf")) {
+                console.log("blocking dangerous command");
+                return { deny: "no-rm-rf" };
+            }
+            return null;
+        }"#,
+    );
+
+    let audit = tmp.join("audit.log");
+    let console = tmp.join("console.log");
+    let framework = tmp.join("framework.log");
+
+    let run = |cmd: &str| -> std::process::Output {
+        let payload = format!(
+            "{{\"toolCall\":{{\"name\":\"run_command\",\"args\":{{\"CommandLine\":\"{cmd}\"}}}},\"conversationId\":\"c\"}}"
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+            .env("HOOK_TEST_MODE", "1")
+            .env("AI_HOOK_LOG_AUDIT", "block")
+            .env("AI_HOOK_LOG_AUDIT_FILE", &audit)
+            .env("AI_HOOK_LOG_CONSOLE_FILE", &console)
+            .env("AI_HOOK_LOG_FRAMEWORK_FILE", &framework)
+            .env("AI_HOOK_RULES", &rules_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // 1. A blocked command.
+    let denied = run("rm -rf /tmp/x");
+    assert!(
+        String::from_utf8_lossy(&denied.stdout).contains("no-rm-rf"),
+        "the rule must block: {}",
+        String::from_utf8_lossy(&denied.stdout)
+    );
+
+    // 2. A plain allow (fast path, rules skipped).
+    let allowed = run("echo hello");
+    assert!(String::from_utf8_lossy(&allowed.stdout).contains("allow"));
+
+    let audit_content = std::fs::read_to_string(&audit).expect("audit log must exist");
+    let lines: Vec<&str> = audit_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "block level records exactly the blocked call, never the allow"
+    );
+
+    let rec: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(rec["type"], "audit");
+    assert_eq!(rec["outcome"], "block");
+    assert_eq!(rec["hit_rule"], "blocker");
+    assert!(
+        rec["rules_evaluated"][0]["path"]
+            .as_str()
+            .unwrap()
+            .contains("blocker.js"),
+        "the record must name the rule FILE, not only the id: {rec}"
+    );
+    // Full snapshot: raw input + the final decision are both present.
+    assert!(rec["raw_input"].as_str().unwrap().contains("rm -rf"));
+    assert_eq!(rec["result"]["rule_decision"]["type"], "Deny");
+
+    // 3. Console sink captured the rule's console.log.
+    let console_content = std::fs::read_to_string(&console).expect("console log must exist");
+    let cline: serde_json::Value = serde_json::from_str(
+        console_content
+            .lines()
+            .find(|l| l.contains("blocking dangerous"))
+            .expect("console line"),
+    )
+    .unwrap();
+    assert_eq!(cline["type"], "console");
+    assert_eq!(cline["rule"], "blocker");
+
+    // 4. Framework sink captures real framework errors only. A configured but
+    //    empty rule directory is one: the gate is open, so ai-hook records it.
+    let empty_rules = tmp.join("empty-rules");
+    std::fs::create_dir_all(&empty_rules).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .env("HOOK_TEST_MODE", "1")
+        .env("AI_HOOK_LOG_FRAMEWORK_FILE", &framework)
+        .env("AI_HOOK_RULES", &empty_rules)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            br#"{"toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf /tmp/x"}},"conversationId":"c"}"#,
+        )
+        .unwrap();
+    let _ = child.wait_with_output().unwrap();
+    let fw_content = std::fs::read_to_string(&framework).expect("framework log must exist");
+    assert!(
+        fw_content.contains("no rules loaded"),
+        "framework sink must record the gate-open error: {fw_content}"
+    );
+
+    // 5. `ai-hook logs --source audit --json` reads the record back.
+    let logs = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["logs", "--source", "audit", "--json"])
+        .env("AI_HOOK_LOG_AUDIT_FILE", &audit)
+        .output()
+        .unwrap();
+    let logs_stdout = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs_stdout.contains("\"outcome\":\"block\"") && logs_stdout.contains("blocker.js"),
+        "logs must echo the block: {logs_stdout}"
+    );
+
+    // 6. `--level allow` filters the block out; `--level block` keeps it.
+    let only_allow = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["logs", "--source", "audit", "--level", "allow"])
+        .env("AI_HOOK_LOG_AUDIT_FILE", &audit)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&only_allow.stdout).contains("no-rm-rf"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

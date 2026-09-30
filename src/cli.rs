@@ -53,7 +53,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_fast_path: bool,
 
-    /// Enable debug mode: record full raw input, normalized context, rule trace and decisions to log
+    /// Enable debug mode: record a complete snapshot of every invocation to the audit log
+    /// (equivalent to AI_HOOK_LOG_AUDIT=all)
     #[arg(long, global = true)]
     pub debug: bool,
 }
@@ -161,6 +162,30 @@ pub enum Commands {
         /// Preview files that would be deleted without actually deleting them
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Inspect ai-hook log files (framework / console / audit)
+    #[command(alias = "log")]
+    Logs {
+        /// Which sink to read: audit (default), console or framework
+        #[arg(short, long, default_value = "audit")]
+        source: String,
+
+        /// Number of records to show from the end of the newest files (default 20)
+        #[arg(short = 'n', long, default_value = "20")]
+        tail: usize,
+
+        /// Filter by level: audit uses allow|review|block; other sinks match their level field
+        #[arg(short, long)]
+        level: Option<String>,
+
+        /// Only show records whose agent field matches this value
+        #[arg(short, long)]
+        agent: Option<String>,
+
+        /// Print raw JSONL lines instead of a summary
+        #[arg(long)]
+        json: bool,
     },
 
     /// Display version information
@@ -290,6 +315,18 @@ pub fn localized_command() -> Command {
     let cmd = sub_help!(cmd, "update", M129, [("force", M130), ("repo", M131)]);
     let cmd = sub_help!(cmd, "tutorial", M132, [("lang", M133)]);
     let cmd = sub_help!(cmd, "clean", M162, [("max_files", M163), ("dry_run", M164)]);
+    let cmd = sub_help!(
+        cmd,
+        "logs",
+        M170,
+        [
+            ("source", M171),
+            ("tail", M172),
+            ("level", M173),
+            ("agent", M174),
+            ("json", M175)
+        ]
+    );
     let cmd = sub_help!(cmd, "version", M115, []);
     sub_help!(cmd, "help", M167, [("subcommand", M167)])
 }

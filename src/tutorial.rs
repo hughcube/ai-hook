@@ -156,10 +156,11 @@ fn chinese_tutorial_body() -> String {
   应用层再缓存只会多一个需要解释的概念。
   console.log(...)      stderr + 文件;错误也走 console.error(同通道)
   sys.log(level, ...)   结构化日志;level 自定(warn/info/debug…)
-  日志文件:默认 ~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log(UTC 按日切分),
+  日志文件:默认 ~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log(UTC 按日切分),
   JSONL 每行含 ts/agent/sessionId/rule/level/msg;按会话可用
   grep '"sessionId":"…"' 还原。仅当规则真的产生日志时才写盘(零日志零 IO)。
-  覆盖/关闭:AI_HOOK_LOG_FILE=自定义路径;AI_HOOK_LOG=0|false 完全关闭;
+  覆盖/关闭:AI_HOOK_LOG_CONSOLE_FILE(旧名 AI_HOOK_LOG_FILE)=自定义路径;
+  AI_HOOK_LOG_CONSOLE=off 或旧名 AI_HOOK_LOG=0 完全关闭;
   超过 20MB 自动轮转为同文件 .1。
 
   aiHook —— 规则公共解析 prelude(全局纯函数,无状态零 I/O;引号语义同 bash)
@@ -341,13 +342,18 @@ fn chinese_tutorial_body() -> String {
   --allow-on-error 规则出错放行;--no-fast-path 关闭只读白名单旁路;
   --debug 开启调试模式;
   AI_HOOK_LANG=zh|en 固定语言;
-  AI_HOOK_DEBUG=1|true|on:全量记录原生宿主输入(raw_input)、规则上下文(context)、
-  执行链与处理结果到 ~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log
-  (JSONL, 20MB 轮转, 零热路径删除开销;可用 ai-hook clean 清理并保留最后 14 个文件;
-  可通过 AI_HOOK_DEBUG_MAX_FILES 或 AI_HOOK_LOG_MAX_FILES 调整保留数量,或用 AI_HOOK_DEBUG_FILE 覆盖写入路径);
-  AI_HOOK_LOG_EXTERNAL=1|true:把每次宿主传入的原始 payload(stdin 原文,解析
-  前)记入 ~/.log/ai-hook/ai-hook-inbound-{日期}.log(JSONL,>1MiB 截断头部,
-  20MB 轮转)——调试 payload 形状/平台判别/解析问题用;默认关闭,关闭时零 IO;
+  日志分三类文件(取值一律用名字,不认数字):
+  AI_HOOK_LOG_FRAMEWORK=on|off(默认 on):ai-hook 自身诊断 ->
+  ~/.log/ai-hook/ai-hook-{YYYYMMDD}.log;
+  AI_HOOK_LOG_CONSOLE=on|off(默认 on):规则 console.log/sys.log ->
+  ~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log;
+  AI_HOOK_LOG_AUDIT=off|block|review|all(默认 off):每次调用一条完整快照
+  (原始 stdin payload + 上下文 + 规则执行链 + 最终决策) ->
+  ~/.log/ai-hook/ai-hook-audit-{agent}-{YYYYMMDD}.log。范围:block 只记拦截,
+  review 再加确认/改写,all 全记(等价旧 AI_HOOK_DEBUG=1 / AI_HOOK_LOG_EXTERNAL=1)。
+  JSONL,20MB 轮转;用 ai-hook clean 清理并保留最后 14 个文件(AI_HOOK_LOG_MAX_FILES);
+  路径覆盖 AI_HOOK_LOG_{FRAMEWORK,CONSOLE,AUDIT}_FILE(旧名 AI_HOOK_LOG_FILE / AI_HOOK_DEBUG_FILE);
+  用 ai-hook logs 回读日志。
   弹窗语言/日志语言跟随系统(Windows 区域或 LANG),可被 AI_HOOK_LANG 覆盖。
   console.log 与 sys.log 永远不进入 stdout,不会破坏协议。
 
@@ -518,11 +524,12 @@ III. sys — host-capability SDK (one name per capability; exec/http escape the 
   a concept that needs explaining.
   console.log(...)      stderr + file; console.error shares the channel
   sys.log(level, ...)   structured log; level is free-form (warn/info/debug…)
-  Log files: default ~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log (UTC day
+  Log files: default ~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log (UTC day
   rollover), JSONL per line with ts/agent/sessionId/rule/level/msg; rebuild a
   session's story with grep '"sessionId":"…"'. Disk I/O happens only when a
-  rule actually logs (zero logs = zero I/O). Overrides: AI_HOOK_LOG_FILE=<path>;
-  disable with AI_HOOK_LOG=0|false; >20MB auto-rotates to <name>.1.
+  rule actually logs (zero logs = zero I/O). Overrides: AI_HOOK_LOG_CONSOLE_FILE
+  (legacy AI_HOOK_LOG_FILE)=<path>; disable with AI_HOOK_LOG_CONSOLE=off (legacy
+  AI_HOOK_LOG=0); >20MB auto-rotates to <name>.1.
 
   aiHook — shared rule-parsing prelude (a global; pure, stateless, zero I/O;
   quote handling follows bash). Injected by the engine before each rule runs;
@@ -745,15 +752,19 @@ VII. Debug & operations
   --dry-run no dialogs; --no-gui disable dialogs; --force-gui force dialogs;
   --allow-on-error allow on rule failure; --no-fast-path disable the read-only
   whitelist bypass; --debug enable debug mode; AI_HOOK_LANG=zh|en pins language.
-  AI_HOOK_DEBUG=1|true|on: record full raw host input, rule context,
-  execution chain, and result to ~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log
-  (JSONL, 20MB rotation, zero hot-path deletion overhead; use ai-hook clean to prune
-  and retain the latest 14 files; configure via AI_HOOK_DEBUG_MAX_FILES or
-  AI_HOOK_LOG_MAX_FILES, or override destination with AI_HOOK_DEBUG_FILE).
-  AI_HOOK_LOG_EXTERNAL=1|true: record every host stdin payload verbatim
-  (before parsing) to ~/.log/ai-hook/ai-hook-inbound-{YYYYMMDD}.log as JSONL
-  (head-truncated over 1MiB, 20MB rotation) — for debugging payload shape,
-  platform detection and parse issues. Off by default; zero I/O when off.
+  Logging is split across three files (values are names, never digits):
+  AI_HOOK_LOG_FRAMEWORK=on|off (default on): ai-hook's own diagnostics ->
+  ~/.log/ai-hook/ai-hook-{YYYYMMDD}.log;
+  AI_HOOK_LOG_CONSOLE=on|off (default on): rule console.log/sys.log ->
+  ~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log;
+  AI_HOOK_LOG_AUDIT=off|block|review|all (default off): one complete snapshot
+  per invocation (raw stdin payload + context + rule chain + final decision) ->
+  ~/.log/ai-hook/ai-hook-audit-{agent}-{YYYYMMDD}.log. Scope: block records only
+  interceptions, review adds confirms/rewrites, all records everything (equals the
+  legacy AI_HOOK_DEBUG=1 / AI_HOOK_LOG_EXTERNAL=1). JSONL, 20MB rotation; prune with
+  ai-hook clean (AI_HOOK_LOG_MAX_FILES); path overrides
+  AI_HOOK_LOG_{FRAMEWORK,CONSOLE,AUDIT}_FILE (legacy AI_HOOK_LOG_FILE / AI_HOOK_DEBUG_FILE);
+  read them back with ai-hook logs.
   Dialog/log language follows the system (Windows locale or LANG), overridable
   with AI_HOOK_LANG. console.log/sys.log never touch stdout.
 

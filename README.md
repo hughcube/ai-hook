@@ -195,9 +195,15 @@ Configure in your hooks configuration:
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Default countdown timeout in seconds (auto-denies on expiration) |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (enabled) | Set to `0` or `false` to disable the GUI dialog completely |
 | `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (disabled) | **Forced Popup**: Forces GUI popup confirmation even if agent supports native terminal ask (except hard deny) |
-| `AI_HOOK_DEBUG` / `--debug` | `0` (disabled) | **Debug Mode**: Record raw host input, context, execution chain, and result to `~/.log/ai-hook/ai-hook-debug-{agent}-{YYYYMMDD}.log` |
-| `AI_HOOK_DEBUG_MAX_FILES` | `14` | Maximum log files retained (defaults to keeping the latest 14 files, older ones pruned automatically) |
-| `AI_HOOK_DEBUG_FILE` | (auto) | Custom debug log file path (overrides default naming/path) |
+| `AI_HOOK_LOG_FRAMEWORK` | `on` | **Sink #1 — framework**: ai-hook's own diagnostics → `~/.log/ai-hook/ai-hook-{YYYYMMDD}.log`. Path override `AI_HOOK_LOG_FRAMEWORK_FILE`. |
+| `AI_HOOK_LOG_CONSOLE` | `on` | **Sink #2 — console**: rule `console.log` / `sys.log` output → `~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log`. Path override `AI_HOOK_LOG_CONSOLE_FILE` (legacy `AI_HOOK_LOG_FILE`); legacy `AI_HOOK_LOG=off` disables it. |
+| `AI_HOOK_LOG_AUDIT` | `off` | **Sink #3 — audit**: one **complete snapshot per invocation** (raw stdin payload + rule trace + final decision) → `~/.log/ai-hook/ai-hook-audit-{agent}-{YYYYMMDD}.log`. Recording scope: `off` / `block` (only interceptions) / `review` (also confirms & rewrites) / `all` (every invocation). Path override `AI_HOOK_LOG_AUDIT_FILE` (legacy `AI_HOOK_DEBUG_FILE`). |
+| `AI_HOOK_LOG_MAX_FILES` | `14` | Maximum log files retained per category (older files are pruned by `ai-hook clean`) |
+| `--debug` | `0` (disabled) | **Shorthand for "record everything"**: equivalent to `AI_HOOK_LOG_AUDIT=all` (legacy `AI_HOOK_DEBUG=1` / `AI_HOOK_LOG_EXTERNAL=1` are still honored) |
+
+> **Values are names, never digits**: the three switches accept `on`/`off` (and `true`/`yes`), and `AI_HOOK_LOG_AUDIT` accepts the four scope names above. `AI_HOOK_LOG_AUDIT=1` is intentionally **not** accepted — `1` used to be ambiguous between "on" and a level.
+>
+> Read the logs back with **`ai-hook logs`** (`--source audit|console|framework`, `--tail N`, `--level`, `--agent`, `--json`).
 
 ---
 
@@ -465,7 +471,7 @@ Subprocess spawning is eliminated for standard reads. In addition, command execu
 | `sys.http.get(url, opt?)` | `object` | **Lightweight HTTP GET**: supports `headers`/`timeout`, returns `{ status, ok, headers, body }` |
 | `sys.http.post(url, opt?)` | `object` | **Lightweight HTTP POST**: supports `headers`/`body`/`timeout`, returns `{ status, ok, headers, body }` |
 | `console.log(...)` | `void` | Debug logging to stderr (never corrupts decision JSON) |
-| `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.log/ai-hook/ai-hook-{agent}-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; keeps latest 14 files by default; disable `AI_HOOK_LOG=0`, override `AI_HOOK_LOG_FILE`, configure retention via `AI_HOOK_LOG_MAX_FILES`) |
+| `sys.log(level, ...)` | `void` | Structured logging to stderr **and** `~/.log/ai-hook/ai-hook-console-{YYYYMMDD}.log` (JSONL; disk writes happen only when a rule logs; disable with `AI_HOOK_LOG_CONSOLE=off` or legacy `AI_HOOK_LOG=0`, override the path with `AI_HOOK_LOG_CONSOLE_FILE` / legacy `AI_HOOK_LOG_FILE`, prune with `ai-hook clean`) |
 | **Standard JS builtins** | - | `new Date()` clock (days, hours, freeze windows), `JSON` / `RegExp` / `Math` / `Map` / `Set` are QuickJS builtins — no sys needed; sys only adds the I/O that JS has no primitive for |
 
 ### 3. `aiHook` — Shared Rule-Parsing Prelude (Global, Pure Functions, Zero I/O)
