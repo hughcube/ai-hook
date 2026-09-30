@@ -24,9 +24,28 @@
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-file rotation threshold (rename to `<name>.1` once exceeded).
 const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Audit-sink kill switch.
+///
+/// `ai-hook test` synthesizes an invocation to exercise rules, so recording it
+/// as a real audit entry would pollute the audit trail. `main()` arms this for
+/// that subcommand only — the console and framework sinks keep working, since
+/// seeing a rule's own `console.log` output is the point of `test`.
+static AUDIT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Stops the audit sink from recording for the rest of this process. Other
+/// sinks are unaffected.
+pub fn suppress_audit() {
+    AUDIT_SUPPRESSED.store(true, Ordering::Relaxed);
+}
+
+fn audit_suppressed() -> bool {
+    AUDIT_SUPPRESSED.load(Ordering::Relaxed)
+}
 
 /// How much of the invocation stream the audit sink records. Ordered: a
 /// higher level records strictly more (`block` ⊂ `review` ⊂ `all`).
@@ -146,6 +165,9 @@ pub fn console_enabled() -> bool {
 /// `cli_debug` is the `--debug` flag; it and the legacy `AI_HOOK_DEBUG` /
 /// `AI_HOOK_LOG_EXTERNAL` switches all mean "record everything" (`all`).
 pub fn audit_level(cli_debug: bool) -> AuditLevel {
+    if audit_suppressed() {
+        return AuditLevel::Off;
+    }
     if let Some(v) = var("AI_HOOK_LOG_AUDIT")
         && let Some(level) = AuditLevel::parse(&v)
     {
@@ -165,7 +187,7 @@ pub fn audit_level(cli_debug: bool) -> AuditLevel {
 // ---------------------------------------------------------------------------
 
 fn date() -> String {
-    crate::engine::runner::utc_date_ymd()
+    crate::engine::runner::local_date_ymd()
 }
 
 /// First non-empty value among `names`, as a path.

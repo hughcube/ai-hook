@@ -620,6 +620,13 @@ fn main() {
     let args = parse_args();
     prof_mark!("② 参数解析完成");
 
+    // `ai-hook test` synthesizes an invocation to exercise rules, so it must
+    // never land in the audit trail. The console/framework sinks are left
+    // alone on purpose: a rule's own console.log output is what `test` is for.
+    if matches!(args.command, Some(Commands::Test { .. })) {
+        ai_hook::logging::suppress_audit();
+    }
+
     match args.command {
         Some(Commands::List { ref scripts }) => handle_list(&args, scripts),
         Some(Commands::Test {

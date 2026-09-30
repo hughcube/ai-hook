@@ -5730,3 +5730,57 @@ fn test_logging_sinks_end_to_end() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Regression: `ai-hook test` synthesizes an invocation to exercise rules, so
+/// it must never write the audit sink — while the console sink keeps recording
+/// the rule's own output, which is exactly what `test` exists to show.
+#[test]
+fn test_cli_test_subcommand_writes_no_audit_but_keeps_console() {
+    let _guard = TEST_LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = std::env::temp_dir().join(format!("ai-hook-noaudit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let rule_file = write_temp_rule(
+        &tmp,
+        "noisy.js",
+        r#"export default function(ctx, sys) {
+            console.log("subcommand noise");
+            sys.log("warn", "subcommand noise via sys");
+            return { deny: "blocked-for-audit" };
+        }"#,
+    );
+
+    let audit = tmp.join("audit.log");
+    let console = tmp.join("console.log");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .args(["test", "run something", &rule_file.to_string_lossy()])
+        .env("AI_HOOK_LOG_AUDIT", "all")
+        .env("AI_HOOK_LOG_AUDIT_FILE", &audit)
+        .env("AI_HOOK_LOG_CONSOLE_FILE", &console)
+        .output()
+        .expect("run ai-hook test");
+
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("blocked-for-audit"),
+        "the subcommand must still evaluate rules; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    assert!(
+        !audit.exists(),
+        "`ai-hook test` must not write the audit sink, but {} was created",
+        audit.display()
+    );
+
+    let console_content =
+        std::fs::read_to_string(&console).expect("console sink must still record");
+    assert!(
+        console_content.contains("subcommand noise"),
+        "the console sink must keep working under `test`: {console_content}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
