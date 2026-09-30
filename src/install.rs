@@ -47,7 +47,71 @@ pub fn path_entries_from_env() -> Vec<PathBuf> {
     std::env::split_paths(raw.as_ref()).collect()
 }
 
-/// Automatically detects an existing directory already in PATH to avoid adding any new environment variables.
+/// Drops the Windows verbatim prefix (`\\?\`, `\\?\UNC\`) that
+/// `canonicalize()` adds, so a resolved path still compares and prints like
+/// every other path instead of as `\\?\C:\…`.
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// The directory holding the currently running executable, symlinks resolved.
+///
+/// Resolution matters: if ai-hook was launched through a symlink, installing
+/// next to the *link* would replace the link itself with a regular file.
+/// Resolving keeps the link pointing at the refreshed binary. Hard links need
+/// no resolution — they are separate names for one file, and the name used to
+/// launch the process is already a real path.
+fn running_exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let resolved = strip_verbatim(&exe.canonicalize().unwrap_or(exe));
+    resolved.parent().map(Path::to_path_buf)
+}
+
+/// Build outputs and package caches rather than real installations — never a
+/// valid default install target.
+fn is_ignored_path(p: &Path) -> bool {
+    let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
+    (cfg!(windows) && s.contains("microsoft") && s.contains("windowsapps"))
+        || s.contains("/target/")
+        || s.contains("/node_modules/")
+        || s.contains("/build/")
+}
+
+/// Canonical form of one PATH entry for comparison: lower-case, `/`-separated,
+/// no trailing slash, with an MSYS `/c/…` drive prefix folded to `c:/…`.
+///
+/// A Windows PATH entry is `\`-separated while a `--target-dir` typed in Git
+/// Bash is `/`-separated, and a Git-Bash-native child may hold either shape —
+/// comparing them raw made a directory that IS on PATH report as missing.
+fn normalize_path_entry(p: &Path) -> String {
+    let cleaned = strip_verbatim(p);
+    let s = cleaned.to_string_lossy().replace('\\', "/").to_lowercase();
+    let folded = match s.strip_prefix('/') {
+        Some(rest)
+            if rest.len() >= 2
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b'/' =>
+        {
+            format!("{}:/{}", &rest[..1], &rest[2..])
+        }
+        _ => s,
+    };
+    folded.trim_end_matches('/').to_string()
+}
+
+/// Resolves the directory an install should land in.
+///
+/// Order: an explicit `--target-dir`, then the directory the running ai-hook
+/// itself lives in (so `install` refreshes that exact copy instead of an
+/// unrelated PATH entry), then PATH auto-detection for putting a freshly built
+/// binary on PATH without adding new environment variables.
 pub fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
     if let Some(explicit) = target_dir {
         return explicit;
@@ -68,6 +132,16 @@ pub fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
             .to_lowercase();
         s1 == s2
     };
+
+    // 0. Where this ai-hook itself lives. Build outputs are skipped so that
+    //    running `install` from `target/release/` still reaches the PATH
+    //    fallbacks below instead of no-op'ing onto its own build artifact.
+    if let Some(dir) = running_exe_dir()
+        && !is_ignored_path(&dir)
+        && is_dir_writable(&dir)
+    {
+        return dir;
+    }
 
     // 1. Unix: standard system-wide /usr/local/bin first when writable and in PATH
     #[cfg(not(windows))]
@@ -93,14 +167,6 @@ pub fn resolve_global_install_dir(target_dir: Option<PathBuf>) -> PathBuf {
     }
 
     // 3. Walk PATH left-to-right, skipping special/temporary paths
-    let is_ignored_path = |p: &Path| -> bool {
-        let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
-        (cfg!(windows) && s.contains("microsoft") && s.contains("windowsapps"))
-            || s.contains("/target/")
-            || s.contains("/node_modules/")
-            || s.contains("/build/")
-    };
-
     for path in &existing_paths {
         if path.as_os_str().is_empty() || is_ignored_path(path) {
             continue;
@@ -125,6 +191,36 @@ pub enum InstallOutcome {
     Installed(PathBuf),
 }
 
+/// True when `a` and `b` are the same physical file: identical after symlink
+/// resolution, or two hard links onto one inode.
+///
+/// The inode check is Unix-only — std exposes no equivalent on Windows, where
+/// the canonical-path comparison is the best available answer (and a copy onto
+/// the running executable fails loudly there instead of silently corrupting it).
+fn same_file(a: &Path, b: &Path) -> bool {
+    fn canonical(p: &Path) -> String {
+        p.canonicalize()
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_lowercase()
+    }
+
+    if canonical(a) == canonical(b) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+
+    false
+}
+
 pub fn install_binary_file(
     src_exe: &Path,
     dest_dir: &Path,
@@ -141,14 +237,11 @@ pub fn install_binary_file(
     };
 
     let dest_file = dest_dir.join(exe_name);
-    let norm = |p: &Path| {
-        p.canonicalize()
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .trim_start_matches(r"\\?\")
-            .to_lowercase()
-    };
-    if norm(src_exe) == norm(&dest_file) {
+
+    // Same physical file? Covers both "src is already the installed copy" and
+    // two hard links onto one inode — copying either onto itself would clobber
+    // the binary that is currently executing.
+    if same_file(src_exe, &dest_file) {
         return Ok(InstallOutcome::SameFile(dest_file));
     }
 
@@ -333,17 +426,11 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
         return;
     }
 
-    // Check if the destination is already in PATH (no environment variables modified)
-    let norm_dest = dest_dir
-        .to_string_lossy()
-        .trim_end_matches(['\\', '/'])
-        .to_lowercase();
-    let in_path = path_entries_from_env().iter().any(|p| {
-        p.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
-            == norm_dest
-    });
+    // Check if the destination is already in PATH (no environment variables modified).
+    let norm_dest = normalize_path_entry(&dest_dir);
+    let in_path = path_entries_from_env()
+        .iter()
+        .any(|p| normalize_path_entry(p) == norm_dest);
 
     if in_path {
         outln!("✓ {}", t(Msg::M099));
@@ -358,5 +445,116 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
         );
         outln!("   {}:", t(Msg::M104));
         outln!("     {}", dest_file.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_target_dir_wins() {
+        let dir = std::env::temp_dir().join("ai-hook-explicit-target");
+        assert_eq!(resolve_global_install_dir(Some(dir.clone())), dir);
+    }
+
+    #[test]
+    fn same_file_detects_identical_path() {
+        let f = std::env::current_exe().expect("current exe");
+        assert!(same_file(&f, &f));
+    }
+
+    #[test]
+    fn same_file_rejects_distinct_files() {
+        let tmp = std::env::temp_dir().join(format!("ai-hook-samefile-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let a = tmp.join("a.bin");
+        let b = tmp.join("b.bin");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        assert!(!same_file(&a, &b));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Two hard links are one inode under two names: copying either onto the
+    /// other would clobber the file, so they must resolve as the same file.
+    #[cfg(unix)]
+    #[test]
+    fn same_file_detects_hard_link() {
+        let tmp = std::env::temp_dir().join(format!("ai-hook-hardlink-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let a = tmp.join("a.bin");
+        let b = tmp.join("b.bin");
+        std::fs::write(&a, b"payload").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        assert!(
+            same_file(&a, &b),
+            "hard links must be recognised as the same file"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The two shapes a Git-Bash host hands over must compare equal: a
+    /// `--target-dir` typed as `C:/x` against the same directory in a Windows
+    /// PATH entry `C:\x`, and an MSYS `/c/x` against `C:/x`.
+    #[test]
+    fn path_entry_normalisation_bridges_shapes() {
+        let win = normalize_path_entry(Path::new(r"C:\Users\me\.local\bin\windows"));
+        assert_eq!(
+            win,
+            normalize_path_entry(Path::new("C:/Users/me/.local/bin/windows"))
+        );
+        assert_eq!(
+            win,
+            normalize_path_entry(Path::new("/c/Users/me/.local/bin/windows"))
+        );
+        // Trailing separators never change the answer.
+        assert_eq!(
+            normalize_path_entry(Path::new("C:/Users/me/bin/")),
+            normalize_path_entry(Path::new("C:/Users/me/bin"))
+        );
+        // A POSIX path that is not an MSYS drive mount is left alone.
+        assert_eq!(
+            normalize_path_entry(Path::new("/usr/local/bin")),
+            "/usr/local/bin"
+        );
+    }
+
+    /// `canonicalize()` on Windows yields a verbatim path; it must be folded
+    /// back so it both prints normally and compares against PATH entries.
+    #[test]
+    fn verbatim_prefix_is_stripped() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\Users\me\.local\bin\windows")),
+            PathBuf::from(r"C:\Users\me\.local\bin\windows")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share\bin")),
+            PathBuf::from(r"\\server\share\bin")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new("C:/Users/me/bin")),
+            PathBuf::from("C:/Users/me/bin")
+        );
+        assert_eq!(
+            normalize_path_entry(Path::new(r"\\?\C:\Users\me\.local\bin\windows")),
+            normalize_path_entry(Path::new(r"C:\Users\me\.local\bin\windows"))
+        );
+    }
+
+    /// The test binary lives under `target/`, a build output: the default must
+    /// fall through to PATH auto-detection instead of installing onto its own
+    /// build artifact.
+    #[test]
+    fn default_target_skips_build_outputs() {
+        let exe = std::env::current_exe().expect("current exe");
+        assert!(
+            is_ignored_path(&exe),
+            "the test binary is expected to live under target/"
+        );
+        assert!(
+            !is_ignored_path(&resolve_global_install_dir(None)),
+            "the default must not resolve to a build output"
+        );
     }
 }
