@@ -8,8 +8,7 @@
 
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::debug::{
-    AskTrace, DebugCollector, DispositionTrace, InteractionTrace, RuleTrace, UserActionTrace,
-    decision_to_value,
+    AskTrace, DebugCollector, DispositionTrace, InteractionTrace, UserActionTrace,
 };
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
@@ -1232,21 +1231,7 @@ fn handle_dispatch(args: &Cli) {
 
         if let Some(ref mut col) = *debug_col_cell.borrow_mut() {
             col.t_rules_done = Some(Instant::now());
-            for r in &results {
-                let p_str = r.rule_path.to_string_lossy().replace('\\', "/");
-                let compact_path = if let Some(pos) = p_str.find("/.agents/") {
-                    format!("~{}", &p_str[pos..])
-                } else {
-                    p_str
-                };
-                col.rules_evaluated.push(RuleTrace {
-                    id: r.rule_id.clone(),
-                    path: compact_path,
-                    duration_ms: r.duration.as_secs_f64() * 1000.0,
-                    decision: r.decision.as_ref().map(decision_to_value),
-                    error: r.error.clone(),
-                });
-            }
+            col.record_rules(&rules, &results);
             col.hit_rule = results
                 .iter()
                 .find(|r| r.decision.is_some() || r.error.is_some())
@@ -2186,8 +2171,24 @@ fn format_log_summary(v: &serde_json::Value, source: &str) -> String {
             .or_else(|| v["context"]["file"]["path"].as_str())
             .unwrap_or("");
         let rule = v["hit_rule"].as_str().unwrap_or("-");
+        // Rules the engine never reached still occupy a slot in the record;
+        // surface the count so a short-circuit is visible without --json.
+        let skipped = v["rules_evaluated"]
+            .as_array()
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter(|r| r["executed"].as_bool() == Some(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        let skipped = if skipped > 0 {
+            format!(" (+{skipped} skipped)")
+        } else {
+            String::new()
+        };
         let summary = v["disposition"]["summary"].as_str().unwrap_or("");
-        format!("{time}  [{outcome}]  {agent}  {tool}  {target}  rule={rule}  {summary}")
+        format!("{time}  [{outcome}]  {agent}  {tool}  {target}  rule={rule}{skipped}  {summary}")
     } else {
         let level = v["level"].as_str().unwrap_or("-");
         let rule = v["rule"]

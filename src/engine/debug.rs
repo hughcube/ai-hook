@@ -1,8 +1,19 @@
 use crate::engine::runner::{local_date_str, local_now_str};
+use crate::engine::{RuleExecutionResult, RuleSource};
 use crate::logging::{AuditLevel, Outcome};
 use crate::protocol::{HookContext, HookDecision};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Keeps `~/.agents/…` rule paths readable while leaving other absolute paths
+/// (a plugin clone, a temp dir) whole.
+fn compact_rule_path(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    match s.find("/.agents/") {
+        Some(pos) => format!("~{}", &s[pos..]),
+        None => s,
+    }
+}
 
 /// Default maximum number of debug log files kept per agent.
 pub const DEFAULT_MAX_LOG_FILES: usize = 14;
@@ -32,11 +43,17 @@ pub struct FastPathTrace {
     pub matched_prefix: Option<String>,
 }
 
-/// Rule execution entry in debug log.
+/// One rule's fate in an audit record.
+///
+/// Every rule the invocation *loaded* gets an entry — not just the ones that
+/// ran. `evaluate_all` short-circuits on the first decisive rule, so the tail
+/// carries `executed: false` with no decision: one record then explains the
+/// whole rule set instead of silently stopping at the rule that fired.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleTrace {
     pub id: String,
     pub path: String,
+    pub executed: bool,
     pub duration_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<serde_json::Value>,
@@ -620,6 +637,37 @@ impl DebugCollector {
         }
     }
 
+    /// Records the invocation's full rule set: every rule that ran (with its
+    /// own decision/error/timing), then every rule `evaluate_all` never reached
+    /// because an earlier one was decisive, marked `executed: false`.
+    ///
+    /// `ran` is always a prefix of `loaded` — the engine walks the slice in
+    /// order and returns on the first decisive outcome — so the unreached tail
+    /// is exactly `loaded[ran.len()..]`.
+    pub fn record_rules(&mut self, loaded: &[RuleSource], ran: &[RuleExecutionResult]) {
+        for r in ran {
+            self.rules_evaluated.push(RuleTrace {
+                id: r.rule_id.clone(),
+                path: compact_rule_path(&r.rule_path),
+                executed: true,
+                duration_ms: r.duration.as_secs_f64() * 1000.0,
+                decision: r.decision.as_ref().map(decision_to_value),
+                error: r.error.clone(),
+            });
+        }
+
+        for r in loaded.iter().skip(ran.len()) {
+            self.rules_evaluated.push(RuleTrace {
+                id: r.id.clone(),
+                path: compact_rule_path(&r.path),
+                executed: false,
+                duration_ms: 0.0,
+                decision: None,
+                error: None,
+            });
+        }
+    }
+
     pub fn record(
         self,
         agent: &str,
@@ -741,6 +789,43 @@ impl DebugCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record must explain the whole rule set: rules the engine never
+    /// reached (short-circuited by an earlier decisive rule) still get an
+    /// entry, marked `executed: false`.
+    #[test]
+    fn record_rules_lists_the_unreached_tail_as_not_executed() {
+        let loaded: Vec<RuleSource> = ["a", "b", "c"]
+            .iter()
+            .map(|id| RuleSource {
+                id: id.to_string(),
+                path: PathBuf::from(format!("/plug/hooks/{id}.js")),
+                code: String::new(),
+            })
+            .collect();
+        let ran = vec![RuleExecutionResult {
+            rule_id: "a".to_string(),
+            rule_path: PathBuf::from("/plug/hooks/a.js"),
+            decision: Some(HookDecision::Deny {
+                reason: "nope".to_string(),
+            }),
+            duration: std::time::Duration::from_micros(400),
+            error: None,
+        }];
+
+        let mut col = DebugCollector::new(AuditLevel::All);
+        col.record_rules(&loaded, &ran);
+
+        assert_eq!(col.rules_evaluated.len(), 3, "all loaded rules are listed");
+        assert!(col.rules_evaluated[0].executed);
+        assert_eq!(col.rules_evaluated[0].id, "a");
+        assert!(col.rules_evaluated[0].decision.is_some());
+        for skipped in &col.rules_evaluated[1..] {
+            assert!(!skipped.executed, "{} never ran", skipped.id);
+            assert!(skipped.decision.is_none());
+            assert!(skipped.error.is_none());
+        }
+    }
 
     #[test]
     fn test_retention_prunes_excess_files() {

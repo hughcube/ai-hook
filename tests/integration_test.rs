@@ -3680,6 +3680,7 @@ fn test_debug_log_collector_and_retention() {
     collector.rules_evaluated.push(RuleTrace {
         id: "rule_test".to_string(),
         path: "/path/to/rule.js".to_string(),
+        executed: true,
         duration_ms: 1.25,
         decision: Some(serde_json::json!({ "type": "Allow" })),
         error: None,
