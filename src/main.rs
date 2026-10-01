@@ -9,6 +9,7 @@
 use ai_hook::cli::{Cli, Commands, localized_command};
 use ai_hook::engine::debug::{
     AskTrace, DebugCollector, DispositionTrace, InteractionTrace, UserActionTrace,
+    is_decisive_decision,
 };
 use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
 use ai_hook::fast_path::check_fast_path;
@@ -1232,9 +1233,18 @@ fn handle_dispatch(args: &Cli) {
         if let Some(ref mut col) = *debug_col_cell.borrow_mut() {
             col.t_rules_done = Some(Instant::now());
             col.record_rules(&rules, &results);
+            // The rule named as "the one that fired" must be the rule whose
+            // decision actually stopped the chain — an earlier rule that
+            // explicitly returned `allow` decides nothing.
             col.hit_rule = results
                 .iter()
-                .find(|r| r.decision.is_some() || r.error.is_some())
+                .rev()
+                .find(|r| is_decisive_decision(r.decision.as_ref()))
+                .or_else(|| {
+                    results
+                        .iter()
+                        .find(|r| r.decision.is_some() || r.error.is_some())
+                })
                 .map(|r| r.rule_id.clone());
         }
 

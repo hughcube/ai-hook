@@ -3682,6 +3682,9 @@ fn test_debug_log_collector_and_retention() {
         path: "/path/to/rule.js".to_string(),
         executed: true,
         duration_ms: 1.25,
+        verdict: "allow".to_string(),
+        reason: None,
+        title: None,
         decision: Some(serde_json::json!({ "type": "Allow" })),
         error: None,
     });

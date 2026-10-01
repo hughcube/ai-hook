@@ -55,6 +55,18 @@ pub struct RuleTrace {
     pub path: String,
     pub executed: bool,
     pub duration_ms: f64,
+    /// The rule's own verdict, **always present**, so one log line states
+    /// plainly what the rule did: `skipped` (never reached), `error`, `none`
+    /// (ran and abstained — the silent pass), `allow`, `deny`, `confirm`,
+    /// `modify` or `keepgoing`. `executed` alone could not separate "ran and
+    /// had no opinion" from "blocked".
+    pub verdict: String,
+    /// Human-readable reason for `deny` / `confirm` / `keepgoing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Dialog title for `confirm`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,6 +377,39 @@ pub fn decision_to_value(decision: &HookDecision) -> serde_json::Value {
     }
 }
 
+/// The per-rule verdict label plus its quick-read `reason` / `title`.
+///
+/// `decision: None` splits into two very different cases that used to look
+/// identical in the audit line: `error` (the rule failed) and `none` (the rule
+/// ran and deliberately abstained — `return null`, the documented hand-over).
+fn rule_verdict(r: &RuleExecutionResult) -> (String, Option<String>, Option<String>) {
+    match r.decision.as_ref() {
+        None if r.error.is_some() => ("error".to_string(), None, None),
+        None => ("none".to_string(), None, None),
+        Some(HookDecision::Allow) => ("allow".to_string(), None, None),
+        Some(HookDecision::Deny { reason }) => ("deny".to_string(), Some(reason.clone()), None),
+        Some(HookDecision::Confirm { reason, title, .. }) => {
+            ("confirm".to_string(), Some(reason.clone()), title.clone())
+        }
+        Some(HookDecision::Modify(_)) => ("modify".to_string(), None, None),
+        Some(HookDecision::KeepGoing { reason }) => {
+            ("keepgoing".to_string(), Some(reason.clone()), None)
+        }
+    }
+}
+
+/// True for the rule outcomes that stop evaluation of the remaining rules.
+/// An explicit `allow` is **not** decisive — the chain keeps walking.
+pub fn is_decisive_decision(decision: Option<&HookDecision>) -> bool {
+    matches!(
+        decision,
+        Some(HookDecision::Confirm { .. })
+            | Some(HookDecision::Deny { .. })
+            | Some(HookDecision::Modify(_))
+            | Some(HookDecision::KeepGoing { .. })
+    )
+}
+
 /// True when `name` is a log file of exactly category `prefix`.
 ///
 /// The category is `<prefix>{YYYYMMDD}.log`, optionally rotated to
@@ -658,11 +703,15 @@ impl DebugCollector {
     /// is exactly `loaded[ran.len()..]`.
     pub fn record_rules(&mut self, loaded: &[RuleSource], ran: &[RuleExecutionResult]) {
         for r in ran {
+            let (verdict, reason, title) = rule_verdict(r);
             self.rules.push(RuleTrace {
                 id: r.rule_id.clone(),
                 path: compact_rule_path(&r.rule_path),
                 executed: true,
                 duration_ms: r.duration.as_secs_f64() * 1000.0,
+                verdict,
+                reason,
+                title,
                 decision: r.decision.as_ref().map(decision_to_value),
                 error: r.error.clone(),
             });
@@ -674,6 +723,9 @@ impl DebugCollector {
                 path: compact_rule_path(&r.path),
                 executed: false,
                 duration_ms: 0.0,
+                verdict: "skipped".to_string(),
+                reason: None,
+                title: None,
                 decision: None,
                 error: None,
             });
@@ -836,7 +888,92 @@ mod tests {
             assert!(!skipped.executed, "{} never ran", skipped.id);
             assert!(skipped.decision.is_none());
             assert!(skipped.error.is_none());
+            assert_eq!(skipped.verdict, "skipped");
         }
+        assert_eq!(col.rules[0].verdict, "deny");
+        assert_eq!(col.rules[0].reason.as_deref(), Some("nope"));
+    }
+
+    /// One log line must state plainly what each rule did — including the three
+    /// cases that used to look identical because `decision` was omitted:
+    /// "ran and abstained" (`none`), "ran and failed" (`error`) and
+    /// "explicitly allowed" (`allow`).
+    #[test]
+    fn record_rules_labels_every_rule_verdict() {
+        let ids = [
+            "abstain",
+            "explicit_allow",
+            "broken",
+            "blocker",
+            "unreached",
+        ];
+        let loaded: Vec<RuleSource> = ids
+            .iter()
+            .map(|id| RuleSource {
+                id: id.to_string(),
+                path: PathBuf::from(format!("/plug/hooks/{id}.js")),
+                code: String::new(),
+            })
+            .collect();
+        let mk =
+            |id: &str, decision: Option<HookDecision>, error: Option<&str>| RuleExecutionResult {
+                rule_id: id.to_string(),
+                rule_path: PathBuf::from(format!("/plug/hooks/{id}.js")),
+                decision,
+                duration: std::time::Duration::from_micros(300),
+                error: error.map(str::to_string),
+            };
+        let ran = vec![
+            mk("abstain", None, None),
+            mk("explicit_allow", Some(HookDecision::Allow), None),
+            mk("broken", None, Some("boom")),
+            mk(
+                "blocker",
+                Some(HookDecision::Deny {
+                    reason: "nope".to_string(),
+                }),
+                None,
+            ),
+        ];
+
+        let mut col = DebugCollector::new(AuditLevel::All);
+        col.record_rules(&loaded, &ran);
+
+        assert_eq!(col.rules.len(), 5, "every loaded rule gets a line");
+        assert_eq!(col.rules[0].verdict, "none", "ran and abstained");
+        assert_eq!(
+            col.rules[1].verdict, "allow",
+            "explicit allow is its own verdict"
+        );
+        assert_eq!(col.rules[2].verdict, "error", "failed without a decision");
+        assert_eq!(col.rules[3].verdict, "deny", "blocked");
+        assert_eq!(col.rules[4].verdict, "skipped", "never reached");
+        assert_eq!(col.rules[3].reason.as_deref(), Some("nope"));
+        assert!(
+            col.rules[0].reason.is_none(),
+            "an abstaining rule has nothing to explain"
+        );
+    }
+
+    /// An explicit `allow` does not stop the chain, so it must never be
+    /// mistaken for the rule that decided the outcome.
+    #[test]
+    fn only_decisive_decisions_stop_the_chain() {
+        assert!(is_decisive_decision(Some(&HookDecision::Deny {
+            reason: "x".to_string()
+        })));
+        assert!(is_decisive_decision(Some(&HookDecision::Confirm {
+            reason: "x".to_string(),
+            title: None,
+            gui: None,
+            timeout: None,
+            force_gui: None,
+        })));
+        assert!(is_decisive_decision(Some(&HookDecision::KeepGoing {
+            reason: "x".to_string()
+        })));
+        assert!(!is_decisive_decision(Some(&HookDecision::Allow)));
+        assert!(!is_decisive_decision(None));
     }
 
     #[test]
