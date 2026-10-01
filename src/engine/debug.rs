@@ -367,7 +367,8 @@ pub fn decision_to_value(decision: &HookDecision) -> serde_json::Value {
 
 /// True when `name` is a log file of exactly category `prefix`.
 ///
-/// The category is `<prefix>{YYYYMMDD}.log` (optionally rotated to `.log.1`).
+/// The category is `<prefix>{YYYYMMDD}.log`, optionally rotated to
+/// `<prefix>{YYYYMMDD}.log.<slot>` (a digit run — `.1`, `.2`, …).
 /// A plain `starts_with(prefix)` is NOT enough: `ai-hook-` is a prefix of
 /// `ai-hook-console-…` and `ai-hook-audit-…`, so prefix matching would make
 /// each category prune its siblings.
@@ -375,10 +376,17 @@ pub fn log_file_matches(name: &str, prefix: &str) -> bool {
     let Some(rest) = name.strip_prefix(prefix) else {
         return false;
     };
-    let Some(stem) = rest
-        .strip_suffix(".log")
-        .or_else(|| rest.strip_suffix(".log.1"))
-    else {
+    // `<digits>.log` or `<digits>.log.<digits>`. Every rotation slot must stay
+    // matchable: a rotation that is invisible to retention would never be
+    // pruned (and an overwriting `.1` would lose records outright).
+    let stem = if let Some(stem) = rest.strip_suffix(".log") {
+        stem
+    } else if let Some((stem, slot)) = rest.split_once(".log.") {
+        if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        stem
+    } else {
         return false;
     };
     !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
@@ -940,6 +948,11 @@ mod tests {
     fn test_log_file_category_exact_match() {
         assert!(log_file_matches("ai-hook-20261001.log", "ai-hook-"));
         assert!(log_file_matches("ai-hook-20261001.log.1", "ai-hook-"));
+        // Any rotation slot belongs to the same category (see `logging::rotate`).
+        assert!(log_file_matches("ai-hook-20261001.log.2", "ai-hook-"));
+        assert!(log_file_matches("ai-hook-20261001.log.9", "ai-hook-"));
+        assert!(!log_file_matches("ai-hook-20261001.log.", "ai-hook-"));
+        assert!(!log_file_matches("ai-hook-20261001.log.x", "ai-hook-"));
         assert!(log_file_matches(
             "ai-hook-console-20261001.log",
             "ai-hook-console-"

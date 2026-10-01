@@ -22,12 +22,32 @@
 //! `AI_HOOK_LOG_EXTERNAL`, so existing setups keep working.
 
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Per-file rotation threshold (rename to `<name>.1` once exceeded).
 const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Test-only override of [`MAX_LOG_BYTES`], so the rotation path can be
+/// exercised without writing 20 MiB in a unit test.
+#[cfg(test)]
+static ROTATE_AT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(MAX_LOG_BYTES);
+
+/// The rotation threshold in effect (constant in production).
+fn rotate_threshold() -> u64 {
+    #[cfg(test)]
+    {
+        ROTATE_AT_BYTES.load(Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_LOG_BYTES
+    }
+}
 
 /// Audit-sink kill switch.
 ///
@@ -227,31 +247,122 @@ pub fn audit_path(agent: &str) -> Option<PathBuf> {
 // Sink primitive
 // ---------------------------------------------------------------------------
 
-/// Renames `path` to `<path>.1` once it exceeds [`MAX_LOG_BYTES`].
+/// Rotation slots kept per log file. Beyond this the oldest slot is reused.
+const MAX_ROTATION_SLOTS: u32 = 9;
+
+/// Renames `path` to the first free `<path>.<slot>`.
+///
+/// A fixed `.1` target would **overwrite** the previous rotation on POSIX and
+/// therefore silently drop records; taking the first free slot keeps every
+/// rotation until retention prunes it (`debug::log_file_matches` accepts any
+/// `.log.<digits>`).
+fn rotate(path: &Path) {
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    let name = name.to_string_lossy();
+    for slot in 1..=MAX_ROTATION_SLOTS {
+        let candidate = path.with_file_name(format!("{name}.{slot}"));
+        if !candidate.exists() {
+            let _ = std::fs::rename(path, &candidate);
+            return;
+        }
+    }
+    // Every slot taken: reuse the oldest rather than let the live file grow
+    // without bound. Retention prunes whole slots long before this is reached.
+    let _ = std::fs::rename(path, path.with_file_name(format!("{name}.1")));
+}
+
+/// Renames `path` to `<path>.1` once it exceeds the rotation threshold.
 pub fn rotate_if_oversized(path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > MAX_LOG_BYTES
-        && let Some(name) = path.file_name()
-    {
-        let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
-        let _ = std::fs::rename(path, &rotated);
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > rotate_threshold()) {
+        rotate(path);
     }
 }
 
-/// Appends one JSONL line, creating the parent directory on demand. Never
-/// fails the caller: logging must not break the decision path.
-pub fn append_jsonl(path: &Path, value: &Value) {
-    rotate_if_oversized(path);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// Creates the parent directory **once per process** instead of once per
+/// record: `create_dir_all` costs a `mkdir` plus a `stat` on its happy path, and
+/// the hot path only ever targets one or two log directories.
+fn ensure_parent_dir(path: &Path) {
+    static DONE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() {
+        return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+
+    let done = DONE.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(done) = done.lock()
+        && done.contains(parent)
     {
-        let _ = writeln!(f, "{}", value);
+        return;
     }
+    if std::fs::create_dir_all(parent).is_ok()
+        && let Ok(mut done) = done.lock()
+    {
+        done.insert(parent.to_path_buf());
+    }
+}
+
+/// Appends one JSONL line. Never fails the caller — logging must not break the
+/// decision path — but a failure is reported on stderr rather than swallowed.
+///
+/// The record is serialized into a single buffer and appended with **one**
+/// `write_all` call. `writeln!(f, "{}", value)` would route through
+/// `io::Write::write_fmt`, which emits one `write` syscall per formatting
+/// fragment — and ai-hook runs many processes concurrently (one per rule,
+/// several rules per tool call). Those partial writes interleave and tear whole
+/// JSONL lines apart, which is exactly how the audit trail becomes unparseable.
+/// A single `write_all` on an `O_APPEND` handle is atomic with respect to the
+/// other appenders, and a *short* write is retried to completion rather than
+/// being dropped, so no record is lost to a partial append.
+///
+/// The size probe that drives rotation is taken from the handle already held
+/// (an `fstat`) instead of a path-based `stat`, which on Windows would add a
+/// whole `CreateFile`/`Close` pair to every record.
+pub fn append_jsonl(path: &Path, value: &Value) {
+    ensure_parent_dir(path);
+
+    let mut line = match serde_json::to_vec(value) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    line.push(b'\n');
+
+    // At most two attempts: the second only happens right after a rotation.
+    for attempt in 0..2 {
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            report_io_failure(path, "open");
+            return;
+        };
+
+        if attempt == 0 && file.metadata().is_ok_and(|m| m.len() > rotate_threshold()) {
+            drop(file);
+            rotate(path);
+            continue;
+        }
+
+        if file.write_all(&line).is_err() {
+            report_io_failure(path, "write");
+        }
+        return;
+    }
+}
+
+/// Logging never breaks the decision path, but it must not vanish silently
+/// either: surface the failure where the hosting agent already collects output.
+fn report_io_failure(path: &Path, op: &str) {
+    let _ = writeln!(
+        std::io::stderr(),
+        "[ai-hook] log {op} failed for {} (record not written)",
+        path.display()
+    );
 }
 
 /// `(local time, local date, epoch millis)` — the envelope every line shares.
@@ -390,5 +501,142 @@ mod tests {
         // Digits are rejected by the names-only contract.
         assert_eq!(on_off("1"), None);
         assert_eq!(on_off("0"), None);
+    }
+
+    /// These tests share process-global state (the rotation threshold), so they
+    /// must not overlap with each other.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-hook-log-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every JSONL line produced for `path`, including any rotation slot
+    /// (`<path>.1` … `<path>.9`) written while the test was running.
+    fn all_lines(path: &Path) -> Vec<String> {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let mut targets = vec![path.to_path_buf()];
+        for slot in 1..=MAX_ROTATION_SLOTS {
+            targets.push(path.with_file_name(format!("{name}.{slot}")));
+        }
+        let mut out = Vec::new();
+        for p in targets {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                out.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
+            }
+        }
+        out
+    }
+
+    /// The audit sink is appended by many ai-hook processes concurrently (one
+    /// process per rule, several rules per tool call). Every append must land as
+    /// one intact JSONL line — and **no record may be lost or duplicated**.
+    #[test]
+    fn append_jsonl_concurrent_writes_lose_nothing_and_never_interleave() {
+        use std::sync::Arc;
+
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fresh_dir("concurrent");
+        let path = Arc::new(dir.join("audit.log"));
+
+        const THREADS: u64 = 24;
+        const PER_THREAD: u64 = 40;
+        // A payload large enough that a fragmented append would be split by a
+        // concurrent writer.
+        let filler = "x".repeat(2000);
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = Arc::clone(&path);
+                let filler = filler.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        append_jsonl(&path, &json!({ "thread": t, "seq": i, "filler": filler }));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let lines = all_lines(&path);
+        assert_eq!(
+            lines.len() as u64,
+            THREADS * PER_THREAD,
+            "no record may be lost"
+        );
+
+        let mut seen = HashSet::new();
+        for line in &lines {
+            let value: Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!(
+                    "torn/interleaved JSONL line ({e}): {}",
+                    &line[..line.len().min(160)]
+                )
+            });
+            let key = (
+                value["thread"].as_u64().unwrap(),
+                value["seq"].as_u64().unwrap(),
+            );
+            assert!(seen.insert(key), "record {key:?} was appended twice");
+        }
+        assert_eq!(seen.len() as u64, THREADS * PER_THREAD, "every record arrives once");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rotation moves records aside; it must never drop them.
+    #[test]
+    fn append_jsonl_rotation_keeps_every_record() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fresh_dir("rotate");
+        let path = dir.join("audit.log");
+
+        let previous = ROTATE_AT_BYTES.swap(200, Ordering::Relaxed);
+        for i in 0..12 {
+            append_jsonl(&path, &json!({ "seq": i, "filler": "y".repeat(64) }));
+        }
+        ROTATE_AT_BYTES.store(previous, Ordering::Relaxed);
+
+        assert!(
+            path.with_file_name("audit.log.1").exists(),
+            "an oversized file must be rotated aside"
+        );
+        let lines = all_lines(&path);
+        assert_eq!(lines.len(), 12, "rotation must not lose records");
+        for line in &lines {
+            serde_json::from_str::<Value>(line).expect("rotated records stay parseable");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Informational: sustained single-writer append cost. Asserted only for
+    /// completeness — run with `--nocapture` to read the printed rate.
+    #[test]
+    fn append_jsonl_throughput_probe() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fresh_dir("throughput");
+        let path = dir.join("audit.log");
+        let record = json!({ "kind": "probe", "filler": "z".repeat(1000) });
+
+        const N: usize = 5_000;
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            append_jsonl(&path, &record);
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "[probe] {N} appends in {elapsed:?} ({:.2} µs/append, {:.0} appends/s)",
+            elapsed.as_secs_f64() * 1e6 / N as f64,
+            N as f64 / elapsed.as_secs_f64()
+        );
+
+        assert_eq!(all_lines(&path).len(), N, "probe must not lose records");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
