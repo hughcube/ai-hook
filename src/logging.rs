@@ -517,7 +517,11 @@ mod tests {
     /// Every JSONL line produced for `path`, including any rotation slot
     /// (`<path>.1` … `<path>.9`) written while the test was running.
     fn all_lines(path: &Path) -> Vec<String> {
-        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let mut targets = vec![path.to_path_buf()];
         for slot in 1..=MAX_ROTATION_SLOTS {
             targets.push(path.with_file_name(format!("{name}.{slot}")));
@@ -584,7 +588,11 @@ mod tests {
             );
             assert!(seen.insert(key), "record {key:?} was appended twice");
         }
-        assert_eq!(seen.len() as u64, THREADS * PER_THREAD, "every record arrives once");
+        assert_eq!(
+            seen.len() as u64,
+            THREADS * PER_THREAD,
+            "every record arrives once"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
