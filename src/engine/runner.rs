@@ -13,6 +13,26 @@ use std::time::{Duration, Instant};
 /// without this bound a buggy infinite loop would hang the whole hook.
 pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for an explicit `--rule-timeout` override.
+///
+/// Same clamping spirit as the GUI dialog's `MAX_TIMEOUT`: hosts kill the
+/// hook process long before this (typical host hook timeout ≤ 600 s), so a
+/// larger budget is meaningless — while a unit slip (`--rule-timeout 300`
+/// meaning "300000") would otherwise stall the host's key path for hours.
+pub const MAX_RULE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Resolves the per-rule watchdog budget from a CLI override in milliseconds.
+///
+/// `None` (flag absent) and `0` keep [`DEFAULT_RULE_TIMEOUT`]; positive values
+/// are clamped to [`MAX_RULE_TIMEOUT`]. Sub-second budgets are legal on
+/// purpose — tests and tight probes rely on them.
+pub fn resolve_rule_timeout(override_ms: Option<u64>) -> Duration {
+    match override_ms {
+        Some(ms) if ms > 0 => Duration::from_millis(ms).min(MAX_RULE_TIMEOUT),
+        _ => DEFAULT_RULE_TIMEOUT,
+    }
+}
+
 /// Builtins each rule context is created with.
 ///
 /// `Context::full` registers every QuickJS intrinsic and measured 250-390 µs

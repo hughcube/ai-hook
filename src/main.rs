@@ -11,8 +11,8 @@ use ai_hook::engine::debug::{
     AskTrace, DebugCollector, DispositionTrace, InteractionTrace, UserActionTrace,
     is_decisive_decision,
 };
-use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner};
-use ai_hook::fast_path::check_fast_path;
+use ai_hook::engine::{ErrorPolicy, RuleLoader, RuleRunner, resolve_rule_timeout};
+use ai_hook::fast_path::{check_fast_path, is_safe_ai_hook_test_invocation};
 use ai_hook::i18n::{Msg, lang, t, tf};
 use ai_hook::logging;
 use ai_hook::protocol::input::env_flag_true;
@@ -312,7 +312,7 @@ fn is_known_flag(flag_name: &str, subcmd: Option<&str>) -> (bool, bool) {
         "h" | "help" | "V" | "version" => return (true, false),
         "no-gui" | "force-gui" | "force-popup" | "dry-run" | "allow-on-error" | "no-fast-path"
         | "debug" => return (true, false),
-        "r" | "rule" | "timeout" => return (true, true),
+        "r" | "rule" | "timeout" | "rule-timeout" => return (true, true),
         _ => {}
     }
 
@@ -494,6 +494,16 @@ fn parse_simple_args(args: &[OsString]) -> Option<Cli> {
                         None => args.get(i + 1)?.to_str()?,
                     };
                     cli.timeout = Some(value.parse::<u32>().ok()?);
+                    if inline.is_none() {
+                        i += 1;
+                    }
+                }
+                "rule-timeout" => {
+                    let value = match inline {
+                        Some(v) => v,
+                        None => args.get(i + 1)?.to_str()?,
+                    };
+                    cli.rule_timeout = Some(value.parse::<u64>().ok()?);
                     if inline.is_none() {
                         i += 1;
                     }
@@ -1085,9 +1095,22 @@ fn handle_dispatch(args: &Cli) {
     let explicit_paths = collect_target_rules(args, None);
 
     // 1. Fast path check (< 0.01ms)
-    if !fast_path_disabled(args)
-        && let Some(decision) = check_fast_path(&ctx)
-    {
+    // Safe self-test invocations (`ai-hook test/bench` or sealed piped tests) are meta-safe
+    // and must bypass the rule engine even if the hook command line specified `--no-fast-path`.
+    let is_meta_test = ctx
+        .cmd
+        .as_deref()
+        .map(is_safe_ai_hook_test_invocation)
+        .unwrap_or(false);
+    let fast_path_decision = if is_meta_test {
+        Some(HookDecision::Allow)
+    } else if !fast_path_disabled(args) {
+        check_fast_path(&ctx)
+    } else {
+        None
+    };
+
+    if let Some(decision) = fast_path_decision {
         // Rules exist but were skipped: say so, otherwise the bypass is
         // invisible and rules appear to "not work" for these commands.
         if rules_configured(&explicit_paths) {
@@ -1103,6 +1126,21 @@ fn handle_dispatch(args: &Cli) {
             col.fast_path_prefix = matched.clone();
             let prefix_desc = matched.unwrap_or_else(|| "whitelist".to_string());
             let l = lang();
+            let summary_str = if is_meta_test {
+                if l.is_zh() {
+                    "命中 ai-hook 自身安全测试调用（防注入隔离），跳过规则引擎与用户交互"
+                        .to_string()
+                } else {
+                    "Hit ai-hook self-test meta-safe invocation, skipped rule engine and user interaction".to_string()
+                }
+            } else if l.is_zh() {
+                format!("命中白名单快速路径 [{}]，无耗时直接放行", prefix_desc)
+            } else {
+                format!(
+                    "Fast-path hit [{}], zero latency allowed directly",
+                    prefix_desc
+                )
+            };
             col.disposition = Some(DispositionTrace {
                 engine_action: "FastPath".to_string(),
                 final_effect: "Allowed".to_string(),
@@ -1117,14 +1155,7 @@ fn handle_dispatch(args: &Cli) {
                         )
                         .to_string(),
                 },
-                summary: if l.is_zh() {
-                    format!("命中白名单快速路径 [{}]，无耗时直接放行", prefix_desc)
-                } else {
-                    format!(
-                        "Fast-path hit [{}], zero latency allowed directly",
-                        prefix_desc
-                    )
-                },
+                summary: summary_str,
             });
             col.record(&ctx.platform.to_string(), Some(&ctx), &decision, &out, 0);
         }
@@ -1187,7 +1218,7 @@ fn handle_dispatch(args: &Cli) {
     //    empty output is interpreted as "allow" by every host protocol.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let policy = ErrorPolicy::from_flag(allow_on_error_requested(args));
-        let runner = match RuleRunner::new() {
+        let runner = match RuleRunner::with_timeout(resolve_rule_timeout(args.rule_timeout)) {
             Ok(r) => r,
             Err(e) => {
                 // Gate is broken: rules cannot run, so do NOT silently allow.
@@ -1997,7 +2028,7 @@ fn handle_test(
         return;
     }
 
-    let runner = match RuleRunner::new() {
+    let runner = match RuleRunner::with_timeout(resolve_rule_timeout(args.rule_timeout)) {
         Ok(r) => r,
         Err(e) => {
             eprint_ts!("{}: {}", t(Msg::M074), e);
@@ -2101,7 +2132,7 @@ fn handle_bench(args: &Cli, iterations: usize, command: &str, platform: &str, sc
         return;
     }
 
-    let runner = match RuleRunner::new() {
+    let runner = match RuleRunner::with_timeout(resolve_rule_timeout(args.rule_timeout)) {
         Ok(r) => r,
         Err(e) => {
             eprint_ts!("{}: {}", t(Msg::M085), e);
@@ -2471,6 +2502,8 @@ mod tests {
             &["-r=rules/a.js"],
             &["--timeout", "30"],
             &["--timeout=30"],
+            &["--rule-timeout", "280000"],
+            &["--rule-timeout=280000"],
             &["--no-gui", "--rule", "rules/a.js", "extra.js"],
             &["--", "weird --name.js"],
             // trailing_var_arg: once a positional is seen, flags are scripts
@@ -2506,6 +2539,8 @@ mod tests {
         assert!(parse_simple_args(&os(&["--rule"])).is_none());
         assert!(parse_simple_args(&os(&["--timeout", "abc"])).is_none());
         assert!(parse_simple_args(&os(&["--timeout"])).is_none());
+        assert!(parse_simple_args(&os(&["--rule-timeout"])).is_none());
+        assert!(parse_simple_args(&os(&["--rule-timeout", "abc"])).is_none());
         assert!(parse_simple_args(&os(&["-x"])).is_none());
     }
 }

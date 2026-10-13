@@ -224,7 +224,7 @@ fn chinese_tutorial_body() -> String {
       · timeout: 秒(默认 60,<=0 视为默认);弹窗超时一律按拒绝处理
       · forceGui: true → 强制桌面弹窗(与 gui:true 同级)
   return false;                   → 拒绝(reason 自动生成)
-  引擎级硬边界:规则必须为同步函数;5 秒执行看门狗;64MB 内存上限;
+  引擎级硬边界:规则必须为同步函数;5 秒执行看门狗(默认,可 --rule-timeout 调大);64MB 内存上限;
   不支持 async/Promise、import、require;文件必须是单文件 ES 语法。
   规则顺序:按文件名字典序执行;首个 ask、deny、inject/modify 或 keepGoing 立即短路;
   allow/无表态不短路。目录加载顺序已保证确定性。
@@ -340,6 +340,7 @@ fn chinese_tutorial_body() -> String {
   ai-hook tutorial --lang en        英文版本文档
   --dry-run 不弹窗;--no-gui 禁用弹窗;--force-gui 强制弹窗;
   --allow-on-error 规则出错放行;--no-fast-path 关闭只读白名单旁路;
+  --rule-timeout <毫秒> 覆盖单条规则执行看门狗预算(默认 5000,上限 600000);
   --debug 开启调试模式;
   AI_HOOK_LANG=zh|en 固定语言;
   日志分三类文件(取值一律用名字,不认数字):
@@ -361,7 +362,7 @@ fn chinese_tutorial_body() -> String {
 --------------------------------------------------------------------------------
   1) 白名单 fast path 只放行“无任何元字符的单条只读命令”,其余全走规则;
   2) 规则失败默认关闭(fail-closed),错误即拒绝并附原因;
-  3) 每条规则 5s 看门狗 + 64MB 沙箱,死循环/超内存被中断;
+  3) 每条规则 5s 看门狗(可用 --rule-timeout 调整) + 64MB 沙箱,死循环/超内存被中断;
   4) 规则提供受控同步只读 SDK、外部执行(sys.exec)与 HTTP 接口(sys.http),
      专供 0-Token 拦截与自动化注入;
   5) 协议输出仅 JSON;日志双通道(stderr+文件)不污染 stdout;
@@ -609,7 +610,7 @@ IV. Decision protocol (rule return values)
       · forceGui: true → force the desktop dialog
         (same strength as gui: true)
   return false;                   → deny (auto-generated reason)
-  Engine hard limits: rules MUST be synchronous; 5s watchdog; 64MB heap cap;
+  Engine hard limits: rules MUST be synchronous; 5s watchdog (tunable via --rule-timeout); 64MB heap cap;
   no async/Promise, no import/require; single-file ES syntax only.
   Order: rules run in file-name lexicographic order; the first ask, deny, modify or
   keep-going short-circuits; allow / no-opinion never short-circuit. Directory loading
@@ -751,7 +752,9 @@ VII. Debug & operations
   ai-hook tutorial --lang zh         this document in Chinese
   --dry-run no dialogs; --no-gui disable dialogs; --force-gui force dialogs;
   --allow-on-error allow on rule failure; --no-fast-path disable the read-only
-  whitelist bypass; --debug enable debug mode; AI_HOOK_LANG=zh|en pins language.
+  whitelist bypass; --rule-timeout <ms> override the per-rule watchdog budget
+  (default 5000, clamp 600000); --debug enable debug mode;
+  AI_HOOK_LANG=zh|en pins language.
   Logging is split across three files (values are names, never digits):
   AI_HOOK_LOG_FRAMEWORK=on|off (default on): ai-hook's own diagnostics ->
   ~/.log/ai-hook/ai-hook-{YYYYMMDD}.log;
@@ -773,8 +776,8 @@ VIII. Security model summary (for reviewers)
   1) Whitelist fast path only passes metacharacter-free single read-only
      commands; everything else goes through the rules.
   2) Rule failure is fail-closed by default: an error denies with its reason.
-  3) Each rule has a 5s watchdog and a 64MB sandbox; runaway loops are
-     interrupted, over-memory is bounded.
+  3) Each rule has a 5s watchdog (tunable via --rule-timeout) and a 64MB sandbox;
+     runaway loops are interrupted, over-memory is bounded.
   4) Rules provide controlled synchronous read SDK, external execution (sys.exec)
      and HTTP (sys.http) strictly for 0-Token interception and automation.
   5) Protocol output is JSON only; logs go to stderr + file, never stdout.

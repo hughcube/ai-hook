@@ -192,6 +192,7 @@ ai-hook install
 | 环境变量 / CLI 参数 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | 默认倒计时弹窗秒数（超时自动拒绝关闭） |
+| `--rule-timeout <毫秒>` | `5000` | 单条规则执行看门狗预算（上限 `600000`，`0` = 默认）。仅当规则必须同步跑长任务时才调大；宿主自身的 hook 超时仍是外层边界。 |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (开启) | 设置为 `0` 或 `false` 可完全静默关闭桌面弹窗 |
 | `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (关闭) | **强制弹出**：即使 Agent (如 Claude Code) 支持原生终端 ask，亦强制唤起系统弹窗确认（硬阻断 deny 场景除外） |
 | `AI_HOOK_LOG_FRAMEWORK` | `on` | **日志 #1 — 框架**：ai-hook 自身诊断 → `~/.log/ai-hook/ai-hook-{YYYYMMDD}.log`。路径覆盖 `AI_HOOK_LOG_FRAMEWORK_FILE`。 |
@@ -533,7 +534,7 @@ return {
 return null; // 或 return { allow: true };
 ```
 
-> **规则执行失败的处理(fail-closed)**:任意规则出现语法错误、运行时异常、死循环超时或返回 Promise(async)时,ai-hook **默认直接拒绝**该命令,并把规则异常作为拒绝原因返回——绝不静默放行。每条规则受 5 秒执行超时保护(死循环会被自动中断)。如需出错放行,可显式传 `--allow-on-error` 或设置环境变量 `AI_HOOK_ALLOW_ON_ERROR=1`(不推荐用于生产安全门禁)。
+> **规则执行失败的处理(fail-closed)**:任意规则出现语法错误、运行时异常、死循环超时或返回 Promise(async)时,ai-hook **默认直接拒绝**该命令,并把规则异常作为拒绝原因返回——绝不静默放行。每条规则受 5 秒执行超时保护(死循环会被自动中断;可用 `--rule-timeout <毫秒>` 调大,上限 600000)。如需出错放行,可显式传 `--allow-on-error` 或设置环境变量 `AI_HOOK_ALLOW_ON_ERROR=1`(不推荐用于生产安全门禁)。
 > **输出语言**:弹窗、提示与日志语言跟随系统语言(Windows 系统区域 / `LANG`),可用 `AI_HOOK_LANG=zh|en` 强制指定;`ai-hook tutorial` 默认也跟随系统语言,`--lang en|zh` 可覆盖。
 
 ---

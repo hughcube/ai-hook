@@ -11,5 +11,8 @@ pub use debug::{
     UserActionTrace, clean_all_logs, log_file_matches, resolve_max_log_files,
 };
 pub use loader::{RuleLoader, RuleSource};
-pub use runner::{ErrorPolicy, RuleExecutionResult, RuleRunner, local_now_str};
+pub use runner::{
+    DEFAULT_RULE_TIMEOUT, ErrorPolicy, MAX_RULE_TIMEOUT, RuleExecutionResult, RuleRunner,
+    local_now_str, resolve_rule_timeout,
+};
 pub use sys::SysContext;

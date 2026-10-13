@@ -618,6 +618,55 @@ fn test_infinite_loop_rule_is_interrupted_by_timeout() {
 }
 
 #[test]
+fn test_rule_timeout_resolution_and_clamp() {
+    use ai_hook::engine::{DEFAULT_RULE_TIMEOUT, MAX_RULE_TIMEOUT, resolve_rule_timeout};
+    assert_eq!(resolve_rule_timeout(None), DEFAULT_RULE_TIMEOUT);
+    assert_eq!(resolve_rule_timeout(Some(0)), DEFAULT_RULE_TIMEOUT);
+    assert_eq!(resolve_rule_timeout(Some(250)), Duration::from_millis(250));
+    assert_eq!(resolve_rule_timeout(Some(600_000)), MAX_RULE_TIMEOUT);
+    assert_eq!(resolve_rule_timeout(Some(u64::MAX)), MAX_RULE_TIMEOUT);
+}
+
+#[test]
+fn test_rule_timeout_override_tightens_and_loosens() {
+    // Busy-waits ~600 ms and then answers. The override must be able to both
+    // tighten (interrupt before it finishes) and loosen (let it complete)
+    // the watchdog — this is exactly what `--rule-timeout` relies on.
+    let busy = rule(
+        "busy",
+        "export default function() { const t0 = Date.now(); while (Date.now() - t0 < 600) {} return { allow: true }; }",
+    );
+    let ctx = ctx_for("echo hi");
+
+    let tight = RuleRunner::with_timeout(Duration::from_millis(300)).unwrap();
+    let start = std::time::Instant::now();
+    let res = tight.execute_rule(&busy, &ctx);
+    assert!(
+        res.decision.is_none(),
+        "tight budget must not complete: {:?}",
+        res.decision
+    );
+    assert!(res.error.is_some(), "tight budget must report an error");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "tight run exceeded bounds"
+    );
+
+    let loose = RuleRunner::with_timeout(Duration::from_millis(10_000)).unwrap();
+    let start = std::time::Instant::now();
+    let res = loose.execute_rule(&busy, &ctx);
+    assert!(
+        matches!(res.decision, Some(HookDecision::Allow)),
+        "loose budget must let the rule finish: {:?}",
+        res.error
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(400),
+        "rule finished too early"
+    );
+}
+
+#[test]
 fn test_export_default_inside_comments_or_strings_is_not_misparsed() {
     let runner = RuleRunner::new().expect("Failed to initialize runner");
 

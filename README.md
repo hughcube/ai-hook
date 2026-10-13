@@ -193,6 +193,7 @@ Configure in your hooks configuration:
 | Env Variable / CLI Option | Default | Description |
 | :--- | :--- | :--- |
 | `AI_HOOK_GUI_TIMEOUT` / `--timeout <N>` | `60` | Default countdown timeout in seconds (auto-denies on expiration) |
+| `--rule-timeout <MS>` | `5000` | Per-rule execution watchdog budget (clamped to `600000`; `0` = default). Raise it only for rules that must run long tasks synchronously — the host's hook timeout remains the outer bound. |
 | `AI_HOOK_GUI` / `--no-gui` | `1` (enabled) | Set to `0` or `false` to disable the GUI dialog completely |
 | `AI_HOOK_FORCE_GUI` / `--force-gui` | `0` (disabled) | **Forced Popup**: Forces GUI popup confirmation even if agent supports native terminal ask (except hard deny) |
 | `AI_HOOK_LOG_FRAMEWORK` | `on` | **Sink #1 — framework**: ai-hook's own diagnostics → `~/.log/ai-hook/ai-hook-{YYYYMMDD}.log`. Path override `AI_HOOK_LOG_FRAMEWORK_FILE`. |
@@ -546,7 +547,7 @@ return {
 return null; // or return { allow: true };
 ```
 
-> **Rule failure handling (fail-closed)**: if any rule fails — syntax error, runtime exception, infinite-loop timeout, or a returned Promise (async) — ai-hook **denies** the command by default and returns the rule error as the reason; a broken gate never silently opens. Every rule has a 5s execution watchdog that interrupts runaway loops. To opt in to allow-on-error, pass `--allow-on-error` or set `AI_HOOK_ALLOW_ON_ERROR=1` (not recommended for production gates).
+> **Rule failure handling (fail-closed)**: if any rule fails — syntax error, runtime exception, infinite-loop timeout, or a returned Promise (async) — ai-hook **denies** the command by default and returns the rule error as the reason; a broken gate never silently opens. Every rule has a 5s execution watchdog that interrupts runaway loops (the budget can be raised per invocation with `--rule-timeout <ms>`, clamped to 600000). To opt in to allow-on-error, pass `--allow-on-error` or set `AI_HOOK_ALLOW_ON_ERROR=1` (not recommended for production gates).
 > **Output language**: dialogs, messages and logs follow the system language (Windows user locale / `LANG`); force it with `AI_HOOK_LANG=zh|en`. `ai-hook tutorial` also follows the system language by default (`--lang en|zh` overrides).
 
 

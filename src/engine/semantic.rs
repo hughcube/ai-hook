@@ -1992,8 +1992,11 @@ pub fn classify_and_mask(
                 prev_token_is_inline_flag = false;
             } else {
                 // Pure data: mask interior with spaces
-                for b in &mut masked_bytes[start + 1..i.saturating_sub(1)] {
-                    *b = b' ';
+                let mask_end = i.saturating_sub(1);
+                if start + 1 < mask_end {
+                    for b in &mut masked_bytes[start + 1..mask_end] {
+                        *b = b' ';
+                    }
                 }
                 spans.push(Span {
                     kind: SpanKind::Data,
@@ -2068,8 +2071,11 @@ pub fn classify_and_mask(
             } else if prev_token_is_data_flag || in_command_pos || is_all_args_data_tool(executable)
             {
                 // Data argument: mask interior with spaces
-                for b in &mut masked_bytes[start + 1..i.saturating_sub(1)] {
-                    *b = b' ';
+                let mask_end = i.saturating_sub(1);
+                if start + 1 < mask_end {
+                    for b in &mut masked_bytes[start + 1..mask_end] {
+                        *b = b' ';
+                    }
                 }
                 spans.push(Span {
                     kind: SpanKind::Data,

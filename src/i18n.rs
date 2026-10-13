@@ -358,6 +358,8 @@ pub enum Msg {
     M176,
     /// `ai-hook logs`: unknown --source value.
     M177,
+    /// CLI help text for `--rule-timeout`.
+    M178,
 }
 
 impl Msg {
@@ -1220,6 +1222,12 @@ impl Msg {
             Msg::M177 => match l {
                 Lang::Zh => "未知的 --source 取值: {}(可选 audit / console / framework)",
                 Lang::En => "Unknown --source value: {} (expected audit / console / framework)",
+            },
+            Msg::M178 => match l {
+                Lang::Zh => "覆盖单条规则的执行看门狗预算(毫秒;默认 5000,上限 600000,0 维持默认)",
+                Lang::En => {
+                    "Override the per-rule execution watchdog budget in milliseconds (default 5000, clamped to 600000; 0 keeps the default)"
+                }
             },
             Msg::AllowWord => match l {
                 Lang::Zh => "允许",

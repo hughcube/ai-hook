@@ -38,6 +38,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub timeout: Option<u32>,
 
+    /// Override the per-rule execution watchdog budget in milliseconds
+    /// (default: 5000; clamped to 600000; 0 keeps the default). Raise it
+    /// only for rules that must run long tasks synchronously — the host's
+    /// own hook timeout stays the outer bound.
+    #[arg(long, global = true)]
+    pub rule_timeout: Option<u64>,
+
     /// Dry run mode (does not trigger GUI popups)
     #[arg(long, global = true)]
     pub dry_run: bool,
@@ -273,6 +280,7 @@ pub fn localized_command() -> Command {
             ("no_gui", M109),
             ("force_gui", M110),
             ("timeout", M111),
+            ("rule_timeout", M178),
             ("dry_run", M112),
             ("allow_on_error", M113),
             ("no_fast_path", M139),
