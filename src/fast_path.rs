@@ -255,19 +255,17 @@ pub(crate) fn is_ai_hook_bin(token: &str) -> bool {
         return clean.eq_ignore_ascii_case("ai-hook") || clean.eq_ignore_ascii_case("ai-hook.exe");
     }
 
-    // 3. Case B: Must be a genuine absolute path (not a relative subpath like `bin/ai-hook`)
-    let is_absolute = if cfg!(windows) {
-        // e.g. `C:\...`, `c:/...`, or UNC `\\server\share\...`
-        (clean.len() >= 3
-            && clean.as_bytes()[0].is_ascii_alphabetic()
-            && clean.as_bytes()[1] == b':'
-            && (clean.as_bytes()[2] == b'\\' || clean.as_bytes()[2] == b'/'))
-            || clean.starts_with("\\\\")
-    } else {
-        clean.starts_with('/')
-    };
+    // 3. Case B: Must be a genuine absolute path (not a relative subpath like `bin/ai-hook`).
+    // Supports both Unix root paths (`/...`) and Windows drive/UNC paths (`C:\...`, `\\server\...`)
+    // cross-platform so that tests and cross-compiled runs behave consistently.
+    let is_windows_abs = (clean.len() >= 3
+        && clean.as_bytes()[0].is_ascii_alphabetic()
+        && clean.as_bytes()[1] == b':'
+        && (clean.as_bytes()[2] == b'\\' || clean.as_bytes()[2] == b'/'))
+        || clean.starts_with("\\\\");
+    let is_unix_abs = clean.starts_with('/');
 
-    if !is_absolute {
+    if !is_windows_abs && !is_unix_abs {
         return false;
     }
 
@@ -649,6 +647,12 @@ mod tests {
         assert_eq!(
             check_fast_path(&ctx_for(
                 "C:\\bin\\ai-hook.exe test \"DROP TABLE users\" protect-sql.js"
+            )),
+            Some(HookDecision::Allow)
+        );
+        assert_eq!(
+            check_fast_path(&ctx_for(
+                "/usr/local/bin/ai-hook test \"DROP TABLE users\" protect-sql.js"
             )),
             Some(HookDecision::Allow)
         );
