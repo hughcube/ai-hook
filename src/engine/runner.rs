@@ -828,7 +828,26 @@ impl RuleRunner {
         let mut results = Vec::new();
 
         for rule in rules {
-            let res = self.execute_rule(rule, ctx);
+            // 2026-10-14：单独捕获「某条规则执行期间的 Rust panic」并把**规则名**带出来再抛出。
+            //   否则顶层只能记 `rule execution panicked (fail-closed deny)`，无从定位是哪条规则崩的
+            //   （历史 framework 日志里 28 条 panic 全部无法归因）。
+            //   行为保持：仍 resume_unwind → 顶层照旧 fail-closed（Deny），只是日志可归因了。
+            let rule_id_for_panic = rule.id.clone();
+            let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.execute_rule(rule, ctx)
+            })) {
+                Ok(r) => r,
+                Err(p) => {
+                    crate::logging::framework(
+                        "error",
+                        &format!(
+                            "rule execution panicked (fail-closed deny) | rule={}",
+                            rule_id_for_panic
+                        ),
+                    );
+                    std::panic::resume_unwind(p);
+                }
+            };
 
             // A rule that failed without producing a decision must not be
             // treated as "pass" when the gate is fail-closed.

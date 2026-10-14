@@ -1125,10 +1125,10 @@ impl Msg {
             },
             Msg::M160 => match l {
                 Lang::Zh => {
-                    "警告:已配置规则(AI_HOOK_RULES 或显式路径)但实际加载到 0 条规则,当前所有命令都会被放行。请检查路径是否存在、扩展名是否为 .js、目录规则是否被 _/*.tmp.js/*.test.js 过滤规则排除。"
+                    "已配置规则(AI_HOOK_RULES 或显式路径)但实际加载到 0 条规则 -> 本次调用已按 fail-closed **拒绝**(避免安全网静默失效)。请检查路径是否存在、扩展名是否为 .js、目录规则是否被 _/*.tmp.js/*.test.js 过滤规则排除；修好后本提示即消失。"
                 }
                 Lang::En => {
-                    "Warning: rules were configured (AI_HOOK_RULES or explicit paths) but 0 loaded; every command will now pass. Check that the paths exist, use .js files, and remember directory rules skip _-prefixed, *.tmp.js and *.test.js files."
+                    "Rules were configured (AI_HOOK_RULES or explicit paths) but 0 loaded -> this call was **denied** (fail-closed) to avoid a silent safety-net gap. Check that the paths exist, use .js files, and remember directory rules skip _-prefixed, *.tmp.js and *.test.js files."
                 }
             },
             Msg::M161 => match l {

@@ -1170,20 +1170,30 @@ fn handle_dispatch(args: &Cli) {
     if rules.is_empty() {
         // No gate at all. If rules were configured (explicit CLI paths or
         // AI_HOOK_RULES) but nothing loaded (typo, wrong extension, filtered
-        // directory rules), this is a silent full bypass - warn loudly so the
-        // operator hears it even when the host only surfaces stderr in its
-        // debug log.
-        if rules_configured(&explicit_paths) {
+        // directory rules), the safety net is silently gone.
+        // 2026-10-14：不再 fail-open —— 「静默失去全部防护」远比「响亮地误拦」危险，
+        //   故改为 **fail-closed (Deny)**，并把原由一并回给模型以便自修。
+        let misconfigured = rules_configured(&explicit_paths);
+        if misconfigured {
             eprint_ts!("[ai-hook] {}", t(Msg::M160));
-            logging::framework("error", "no rules loaded but rule paths were configured");
+            logging::framework(
+                "error",
+                "no rules loaded but rule paths were configured (fail-closed deny)",
+            );
         }
-        let dec = HookDecision::Allow;
+        let dec = if misconfigured {
+            HookDecision::Deny {
+                reason: t(Msg::M160).to_string(),
+            }
+        } else {
+            HookDecision::Allow
+        };
         let out = dec.to_json_output(&ctx, None);
         if let Some(mut col) = debug_collector {
             let l = lang();
             col.disposition = Some(DispositionTrace {
-                engine_action: "Bypass".to_string(),
-                final_effect: "Allowed".to_string(),
+                engine_action: if misconfigured { "Deny" } else { "Bypass" }.to_string(),
+                final_effect: if misconfigured { "Blocked" } else { "Allowed" }.to_string(),
                 ask: None,
                 user: UserActionTrace {
                     action: "NotApplicable".to_string(),
@@ -1195,12 +1205,19 @@ fn handle_dispatch(args: &Cli) {
                         )
                         .to_string(),
                 },
-                summary: l
-                    .pick(
+                summary: if misconfigured {
+                    l.pick(
+                        "已配置规则路径但加载到 0 条规则 → fail-closed 拒绝（避免安全网静默失效）",
+                        "Rule paths configured but 0 rules loaded -> fail-closed deny (avoid a silent safety-net gap)",
+                    )
+                    .to_string()
+                } else {
+                    l.pick(
                         "未配置或未加载到任何规则文件，默认放行",
                         "No rules configured or loaded, default allowed",
                     )
-                    .to_string(),
+                    .to_string()
+                },
             });
             col.record(&ctx.platform.to_string(), Some(&ctx), &dec, &out, 0);
         }
