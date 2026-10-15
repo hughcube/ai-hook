@@ -1,8 +1,10 @@
-# ai-hook — Unified Multi-Agent Security Interceptor & Autonomous Rule Dispatcher
+# ai-hook — Cross-Platform Hook Dispatcher & Guardrail Engine for AI Coding Agents
 
 [![CI](https://github.com/hughcube/ai-hook/actions/workflows/ci.yml/badge.svg)](https://github.com/hughcube/ai-hook/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hughcube/ai-hook)](https://github.com/hughcube/ai-hook/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+**One rule set for every AI agent's hooks.** `ai-hook` is a single zero-dependency Rust binary that replaces per-agent Bash hook scripts with sandboxed, in-process rule evaluation — the same guardrail rules run unchanged across **Claude Code hooks**, **OpenAI Codex**, **CodeBuddy / WorkBuddy**, **Google Antigravity**, **Gemini CLI** and **OpenCode**, on Windows / macOS / Linux.
 
 > **It exists for two things: hiding complexity, and making rules pleasant to write.**  
 > **① Hide the complexity** — hook-protocol differences across agents, platform quirks, and subprocess/context-fetching plumbing are all wrapped into one native binary: the same rules are written once and run everywhere, with no per-agent, per-platform script matrix. On Windows it also collapses the old one-process-per-fetch stutter into a single process with millisecond-scale in-process evaluation.  
@@ -13,6 +15,34 @@
 > **OpenCode note:** OpenCode has no out-of-process hook protocol of its own — it loads in-process JS/TS plugins (see [opencode.ai/docs/plugins](https://opencode.ai/docs/plugins/)). ai-hook reaches it through the community bridge [`magarcia/opencode-claude-hooks`](https://github.com/magarcia/opencode-claude-hooks), which forwards Claude-Code-shaped envelopes and sets `OPENCODE_COMPAT=1`. Install the bridge (or use the in-process plugin approach) for OpenCode support.
 
 English | [中文](README_zh.md)
+
+---
+
+## Table of Contents
+
+- [Why ai-hook?](#why-ai-hook)
+- [Motivation & Problem Statement](#-motivation--problem-statement)
+- [Architecture Overview](#-architecture-overview)
+- [Key Features](#-key-features)
+- [Performance Benchmarks](#-performance-benchmarks-windows-11-x64--node-style-host)
+- [Quick Start](#-quick-start)
+- [Rule Authoring Guide](#-rule-authoring-guide)
+- [Rule Demos](#-rule-demos)
+- [CLI Reference](#️cli-reference)
+- [License](#-license)
+
+---
+
+## Why ai-hook?
+
+| Aspect | Hand-written Bash hooks (per agent) | `ai-hook` |
+| :--- | :--- | :--- |
+| **Maintenance** | One script per agent, per platform — a growing script matrix | One rule set, shared verbatim by every agent |
+| **Hook latency** | 10+ sequential `bash.exe` spawns → 420–750ms | 1 native process → **~7ms median** |
+| **Isolation** | Scripts `source`-ed into a shared shell; variables and functions leak between plugins | Every rule in its own QuickJS sandbox, discarded on exit |
+| **Dynamic context** | Spawns `date` / `git` / `cat` / `curl` per rule, per call | Native `sys` APIs (microsecond scale), zero subprocess |
+| **Portability** | Shell glue re-written per OS *and* per agent | Identical behavior on Windows / macOS / Linux |
+| **Failure mode** | A broken script silently lets the command through | Fail-closed when rules are configured but none load |
 
 ---
 

@@ -1,8 +1,10 @@
-# ai-hook —— 多 Agent 统一安全拦截与规则自治调度基座
+# ai-hook —— 跨平台多 Agent Hook 调度与安全护栏引擎
 
 [![CI](https://github.com/hughcube/ai-hook/actions/workflows/ci.yml/badge.svg)](https://github.com/hughcube/ai-hook/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hughcube/ai-hook)](https://github.com/hughcube/ai-hook/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+**一套规则，通吃所有 AI Agent 的 Hook。** `ai-hook` 是单个零依赖 Rust 二进制，用沙箱化的进程内规则评估取代「每个 Agent 各写一份」的 Bash Hook 脚本 —— 同一套安全护栏（guardrail）规则，在 **Claude Code**、**OpenAI Codex**、**CodeBuddy / WorkBuddy**、**Google Antigravity**、**Gemini CLI**、**OpenCode** 上原样运行，Windows / macOS / Linux 行为一致。
 
 > **为两件事而生：屏蔽复杂度，与舒服地写规则。**  
 > **① 屏蔽复杂度**——把多 Agent 的 Hook 协议差异、平台差异、进程与上下文获取等底层细节，全部封装进单个原生二进制：同一套规则一次编写、处处运行，不再为每个 Agent / 每套平台各维护一份脚本；在 Windows 上，还顺带把旧方案“每次调用连开十余个脚本进程”的顿挫收敛为单进程内的毫秒级评估。  
@@ -13,6 +15,34 @@
 > **OpenCode 说明：** OpenCode 本身没有进程外 Hook 协议，它加载的是进程内 JS/TS 插件（见 [opencode.ai/docs/plugins](https://opencode.ai/docs/plugins/)）。ai-hook 通过社区桥 [`magarcia/opencode-claude-hooks`](https://github.com/magarcia/opencode-claude-hooks) 接入——该桥转发 Claude Code 形态的信封并置 `OPENCODE_COMPAT=1`。使用 OpenCode 时需先装该桥（或改用进程内插件方案）。
 
 [English](README.md) | 中文
+
+---
+
+## 目录
+
+- [为什么选 ai-hook？](#为什么选-ai-hook)
+- [背景与痛点](#-背景与痛点)
+- [架构全景](#-架构全景)
+- [核心特性](#-核心特性)
+- [性能基准](#-性能基准windows-11-x64--node-式宿主实测)
+- [快速开始](#-快速开始)
+- [规则开发全景指南](#-规则开发全景指南-rule-authoring-guide)
+- [规则示例](#-规则示例-rule-demos)
+- [CLI 命令行指南](#️cli-命令行指南)
+- [License](#-license)
+
+---
+
+## 为什么选 ai-hook？
+
+| 维度 | 手写 Bash Hook（每个 Agent 一份） | `ai-hook` |
+| :--- | :--- | :--- |
+| **维护成本** | 每个 Agent、每套平台各一份脚本，脚本矩阵不断膨胀 | 一套规则，所有 Agent 原样共用 |
+| **Hook 延迟** | 串行拉起 10+ 个 `bash.exe` 进程 → 420–750ms | 1 个原生进程 → **中位数 ~7ms** |
+| **隔离性** | 脚本被 `source` 进同一个 shell，变量与函数在插件间相互泄漏 | 每条规则独占一个 QuickJS 沙箱，执行完即销毁 |
+| **动态上下文** | 每条规则每次调用都要拉起 `date` / `git` / `cat` / `curl` | 原生 `sys` API（微秒级），零子进程 |
+| **跨平台** | Shell 胶水需按操作系统 **和** Agent 各重写一遍 | Windows / macOS / Linux 行为完全一致 |
+| **失败行为** | 脚本出错时会静默放行命令 | 配置了规则却一条都没加载时，fail-closed 拒绝 |
 
 ---
 
