@@ -28,7 +28,7 @@
 - [快速开始](#-快速开始)
 - [规则开发全景指南](#-规则开发全景指南-rule-authoring-guide)
 - [规则示例](#-规则示例-rule-demos)
-- [CLI 命令行指南](#️cli-命令行指南)
+- [CLI 命令行指南](#️-cli-命令行指南)
 - [License](#-license)
 
 ---

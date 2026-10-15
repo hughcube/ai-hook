@@ -28,7 +28,7 @@ English | [中文](README_zh.md)
 - [Quick Start](#-quick-start)
 - [Rule Authoring Guide](#-rule-authoring-guide)
 - [Rule Demos](#-rule-demos)
-- [CLI Reference](#️cli-reference)
+- [CLI Reference](#️-cli-reference)
 - [License](#-license)
 
 ---
