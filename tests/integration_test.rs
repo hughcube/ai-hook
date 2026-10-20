@@ -4096,9 +4096,15 @@ fn test_install_command_lifecycle_and_force_flag() {
     };
     let target_file = tmp.join(exe_name);
 
+    // Hermetic PATH: the "already installed" gate refuses to act when any
+    // ai-hook resolves through PATH, so the test must not inherit the
+    // developer environment (which normally has one).
+    let isolated_path = tmp.to_string_lossy().to_string();
+
     // 1. First install without -f into empty directory: succeeds
     let out1 = Command::new(bin_path)
         .args(["install", "-t", &tmp.to_string_lossy()])
+        .env("PATH", &isolated_path)
         .output()
         .expect("Failed to run install");
     assert!(out1.status.success(), "First install should succeed");
@@ -4119,9 +4125,11 @@ fn test_install_command_lifecycle_and_force_flag() {
         "Version output should contain ai-hook: {ver_str}"
     );
 
-    // 2. Second install without -f: detects existing file and hints -f/--force
+    // 2. Second install without -f into the same explicit target: the file is
+    //    already there, so nothing is overwritten and -f is advised.
     let out2 = Command::new(bin_path)
         .args(["install", "-t", &tmp.to_string_lossy()])
+        .env("PATH", &isolated_path)
         .output()
         .expect("Failed to run install without force");
     assert!(out2.status.success());
@@ -4134,6 +4142,7 @@ fn test_install_command_lifecycle_and_force_flag() {
     // 3. Force install with -f: succeeds and overwrites safely
     let out3 = Command::new(bin_path)
         .args(["install", "-f", "-t", &tmp.to_string_lossy()])
+        .env("PATH", &isolated_path)
         .output()
         .expect("Failed to run install with force");
     assert!(out3.status.success(), "Force install should succeed");
@@ -4142,6 +4151,7 @@ fn test_install_command_lifecycle_and_force_flag() {
     // 4. Force install with --force: succeeds
     let out4 = Command::new(bin_path)
         .args(["install", "--force", "-t", &tmp.to_string_lossy()])
+        .env("PATH", &isolated_path)
         .output()
         .expect("Failed to run install with --force");
     assert!(
@@ -4151,6 +4161,74 @@ fn test_install_command_lifecycle_and_force_flag() {
     assert!(target_file.exists());
 
     // Clean up
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// `install` never adds a second copy: when an ai-hook already resolves
+/// through PATH it refuses without --force and rewrites that exact file with
+/// --force, which is the only way to guarantee the new build is what runs.
+#[test]
+fn install_refuses_duplicate_and_replaces_path_copy_in_place() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai_hook_test_install_gate_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let bin_dir = tmp.join("bin");
+    let _ = std::fs::create_dir_all(&bin_dir);
+
+    let bin_path = env!("CARGO_BIN_EXE_ai-hook");
+    let exe_name = if cfg!(windows) {
+        "ai-hook.exe"
+    } else {
+        "ai-hook"
+    };
+    let installed = bin_dir.join(exe_name);
+    std::fs::copy(bin_path, &installed).expect("seed an existing installation");
+    let isolated_path = bin_dir.to_string_lossy().to_string();
+
+    // A) No --force: nothing is written, and the operator is sent to update.
+    let out = Command::new(bin_path)
+        .args(["install"])
+        .env("PATH", &isolated_path)
+        .output()
+        .expect("Failed to run install");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("update"),
+        "install must point at update when a copy is already on PATH: {stdout}"
+    );
+    assert!(
+        stdout.contains("--force") || stdout.contains("-f"),
+        "install must explain how to overwrite: {stdout}"
+    );
+
+    // B) --force: the existing file is the destination, not a sibling copy.
+    let out = Command::new(bin_path)
+        .args(["install", "--force"])
+        .env("PATH", &isolated_path)
+        .output()
+        .expect("Failed to run install --force");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "force install failed: {stdout}{stderr}"
+    );
+    assert!(
+        installed.exists(),
+        "the PATH copy must still exist after a forced install"
+    );
+    let ver = Command::new(&installed)
+        .arg("--version")
+        .output()
+        .expect("replaced binary should execute");
+    assert!(ver.status.success());
+    assert!(String::from_utf8_lossy(&ver.stdout).contains("ai-hook"));
+
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

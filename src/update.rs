@@ -1,6 +1,6 @@
 use crate::NoConsoleSpawn;
 use crate::i18n::{Msg, t, tf};
-use crate::{errln, outln};
+use crate::{err, errln, outln};
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -319,28 +319,45 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
 
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let agent = build_agent(API_TIMEOUT);
-    let mut req = agent
-        .get(&api_url)
-        .set(
-            "User-Agent",
-            &format!("ai-hook-updater/{}", current_version),
-        )
-        .set("Accept", "application/vnd.github.v3+json")
-        .set("Cache-Control", "no-cache, no-store")
-        .set("Pragma", "no-cache");
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", trimmed));
+    // Transport failures against api.github.com are routinely transient on
+    // mainland networks ("tls connection init failed: unexpected end of file",
+    // measured at roughly one attempt in two here): aborting on the first one
+    // made update look like a no-op. HTTP status errors (404/403) are
+    // definitive and are never retried.
+    let mut attempt = 1;
+    let response = loop {
+        let mut attempt_req = agent
+            .get(&api_url)
+            .set(
+                "User-Agent",
+                &format!("ai-hook-updater/{}", current_version),
+            )
+            .set("Accept", "application/vnd.github.v3+json")
+            .set("Cache-Control", "no-cache, no-store")
+            .set("Pragma", "no-cache");
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                attempt_req = attempt_req.set("Authorization", &format!("Bearer {}", trimmed));
+            }
         }
-    }
-
-    let response = req.call().map_err(|e| match e {
-        ureq::Error::Status(404, _) => tf(Msg::M016, &[&repo]),
-        ureq::Error::Status(403, _) => t(Msg::M017).to_string(),
-        other => tf(Msg::M018, &[&other]),
-    })?;
+        match attempt_req.call() {
+            Ok(r) => break r,
+            Err(ureq::Error::Transport(e)) if attempt < 3 => {
+                outln!("   [重试 {}/3] {}", attempt, tf(Msg::M018, &[&e]));
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(600 * attempt as u64));
+            }
+            Err(e) => {
+                return Err(match e {
+                    ureq::Error::Status(404, _) => tf(Msg::M016, &[&repo]),
+                    ureq::Error::Status(403, _) => t(Msg::M017).to_string(),
+                    other => tf(Msg::M018, &[&other]),
+                });
+            }
+        }
+    };
 
     let release_val: serde_json::Value = response.into_json().map_err(|e| tf(Msg::M019, &[&e]))?;
 
@@ -472,12 +489,14 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
                                     let total_mb = total as f64 / (1024.0 * 1024.0);
                                     let pct =
                                         (binary_bytes.len() as f64 / total as f64 * 100.0) as u32;
-                                    eprint!(
+                                    err!(
                                         "\r   ⬇ {:.2} MB / {:.2} MB ({}%)...",
-                                        downloaded_mb, total_mb, pct
+                                        downloaded_mb,
+                                        total_mb,
+                                        pct
                                     );
                                 } else {
-                                    eprint!("\r   ⬇ {:.2} MB...", downloaded_mb);
+                                    err!("\r   ⬇ {:.2} MB...", downloaded_mb);
                                 }
                                 let _ = std::io::stderr().flush();
                                 last_reported = std::time::Instant::now();
@@ -491,7 +510,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
                     }
                 }
                 if content_len.is_some() {
-                    eprintln!();
+                    errln!();
                 }
                 if !read_failed && !binary_bytes.is_empty() {
                     download_err.clear();
@@ -503,7 +522,7 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
             }
         }
         if attempt < 3 {
-            eprintln!("   [重试 {}/3] 下载连接中断，正在重试...", attempt);
+            outln!("   [重试 {}/3] 下载连接中断，正在重试...", attempt);
             std::thread::sleep(Duration::from_millis(1000));
         }
     }

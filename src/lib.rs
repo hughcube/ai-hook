@@ -43,6 +43,14 @@ macro_rules! out {
 }
 
 #[macro_export]
+macro_rules! err {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write;
+        let _ = ::std::io::stderr().lock().write_fmt(format_args!($($arg)*));
+    }};
+}
+
+#[macro_export]
 macro_rules! errln {
     () => {{
         use ::std::io::Write;

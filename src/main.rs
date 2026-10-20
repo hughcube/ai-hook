@@ -660,7 +660,21 @@ fn main() {
         }) => ai_hook::install::handle_install(target_dir.clone(), force),
         Some(Commands::Update { force, ref repo }) => {
             if let Err(e) = ai_hook::update::handle_update(force, repo) {
-                eprint_ts!("[ai-hook update] {}: {}", t(Msg::M054), e);
+                let line = format!(
+                    "[{}] [ai-hook update] {}: {}",
+                    ai_hook::engine::local_now_str(),
+                    t(Msg::M054),
+                    e
+                );
+                // A GUI-subsystem process can be launched without a usable
+                // stderr (NULL handle, nothing to AttachConsole to). Writing
+                // the failure only there makes `update` look like it did
+                // nothing at all, so fall back to stdout -- the stream every
+                // progress line of this command already goes to.
+                use std::io::Write;
+                if writeln!(std::io::stderr().lock(), "{line}").is_err() {
+                    outln!("{}", line);
+                }
                 std::process::exit(1);
             }
         }

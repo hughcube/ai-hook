@@ -397,7 +397,25 @@ pub fn install_binary_file(
 /// destroy a package-managed file, so the caller surfaces a warning instead of
 /// mutating the filesystem.
 fn first_shadowing_binary(dest_file: &Path, path_entries: &[PathBuf]) -> Option<PathBuf> {
+    let first = binaries_on_path(path_entries).into_iter().next()?;
+    if same_file(&first, dest_file) {
+        // PATH reaches the copy we just installed: nothing shadows it.
+        None
+    } else {
+        Some(first)
+    }
+}
+
+/// Every ai-hook executable the given PATH entries resolve, in resolution
+/// order, de-duplicated so a directory listed twice is reported once.
+///
+/// `install` treats a non-empty result as "already installed somewhere" and
+/// refuses to add a second copy: a duplicate install is exactly the state that
+/// produces the silent "installed but never runs" failure described above, and
+/// an existing installation should be upgraded in place through `update`.
+fn binaries_on_path(path_entries: &[PathBuf]) -> Vec<PathBuf> {
     let exe_name = installed_binary_name();
+    let mut found: Vec<PathBuf> = Vec::new();
     for dir in path_entries {
         // An empty PATH entry means "the current directory" on Unix. It is not
         // an installation location, and joining onto it would yield a relative
@@ -406,16 +424,12 @@ fn first_shadowing_binary(dest_file: &Path, path_entries: &[PathBuf]) -> Option<
             continue;
         }
         let candidate = dir.join(exe_name);
-        if !candidate.is_file() {
+        if !candidate.is_file() || found.iter().any(|f| same_file(f, &candidate)) {
             continue;
         }
-        if same_file(&candidate, dest_file) {
-            // PATH reaches the copy we just installed: nothing shadows it.
-            return None;
-        }
-        return Some(candidate);
+        found.push(candidate);
     }
-    None
+    found
 }
 
 /// Warns when an earlier PATH entry would win over the binary we just
@@ -456,6 +470,36 @@ fn warn_if_shadowed(dest_file: &Path, path_entries: &[PathBuf]) {
     );
 }
 
+/// Explains why `install` did nothing and what to run instead. Printed on
+/// stdout: it is the command's answer, not a diagnostic.
+fn report_already_installed(existing: &[PathBuf]) {
+    let l = crate::i18n::lang();
+    outln!(
+        "{}",
+        l.pick(
+            "⚠️  检测到 ai-hook 已存在于 PATH 中，本次不再重复安装：",
+            "⚠️  ai-hook is already on PATH; nothing was installed this time:"
+        )
+    );
+    for p in existing {
+        outln!("     {}", p.display());
+    }
+    outln!(
+        "{}",
+        l.pick(
+            "   升级请用 `ai-hook update --force`（更新当前实际生效的那一份）。",
+            "   Upgrade with `ai-hook update --force` (updates the copy that actually runs)."
+        )
+    );
+    outln!(
+        "{}",
+        l.pick(
+            "   想用本地构建覆盖它，请加 `--force`：会原地替换上面这一份，不会新增副本。",
+            "   To overwrite it with this build, add `--force`: it replaces the copy above in place."
+        )
+    );
+}
+
 pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
     let current_exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -465,7 +509,41 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
         }
     };
 
-    let dest_dir = resolve_global_install_dir(target_dir);
+    // `install` is first-time setup, not an upgrade path. When an ai-hook
+    // already resolves through PATH -- at any position, any priority -- the
+    // command refreshes *that* copy instead of writing another one: a second
+    // copy is exactly the duplicate that later shadows the new build (see
+    // `first_shadowing_binary`).
+    let path_entries = path_entries_from_env();
+    let existing = binaries_on_path(&path_entries);
+
+    let dest_dir = match (target_dir, existing.first()) {
+        // An explicit destination always wins: the caller named it.
+        (Some(explicit), _) => explicit,
+        (None, Some(first)) => {
+            if !force {
+                report_already_installed(&existing);
+                return;
+            }
+            // --force means "replace the installation", not "add another".
+            let dir = first
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| resolve_global_install_dir(None));
+            outln!(
+                "{}",
+                crate::i18n::lang().pick(
+                    &format!("♻️  原地替换 PATH 中的现有安装: {}", first.display()),
+                    &format!(
+                        "♻️  Replacing the existing PATH installation in place: {}",
+                        first.display()
+                    )
+                )
+            );
+            dir
+        }
+        (None, None) => resolve_global_install_dir(None),
+    };
 
     let (dest_file, outcome) = match install_binary_file(&current_exe, &dest_dir, force) {
         Ok(outcome) => {
@@ -507,7 +585,6 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
     }
 
     // Check if the destination is already in PATH (no environment variables modified).
-    let path_entries = path_entries_from_env();
     let norm_dest = normalize_path_entry(&dest_dir);
     let in_path = path_entries
         .iter()
@@ -580,6 +657,32 @@ mod tests {
             same_file(&a, &b),
             "hard links must be recognised as the same file"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Every copy that resolves through PATH is reported, in PATH order, and
+    /// directories without a binary are skipped. This is what makes `install`
+    /// refuse to create a second installation.
+    #[test]
+    fn binaries_on_path_lists_every_copy_in_order() {
+        let tmp = std::env::temp_dir().join(format!("ai-hook-onpath-{}", std::process::id()));
+        let first = tmp.join("first");
+        let second = tmp.join("second");
+        let empty = tmp.join("empty");
+        for d in [&first, &second, &empty] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let a = first.join(installed_binary_name());
+        let b = second.join(installed_binary_name());
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        assert_eq!(
+            binaries_on_path(&[first.clone(), empty, second.clone()]),
+            vec![a, b],
+            "copies are listed in PATH order, directories without one are skipped"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
