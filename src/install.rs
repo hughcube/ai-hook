@@ -221,6 +221,16 @@ fn same_file(a: &Path, b: &Path) -> bool {
     false
 }
 
+/// File name the installer writes, and therefore the name to look for when
+/// checking whether another copy wins the PATH race.
+fn installed_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "ai-hook.exe"
+    } else {
+        "ai-hook"
+    }
+}
+
 pub fn install_binary_file(
     src_exe: &Path,
     dest_dir: &Path,
@@ -230,13 +240,7 @@ pub fn install_binary_file(
         std::fs::create_dir_all(dest_dir).map_err(|e| format!("{}: {}", dest_dir.display(), e))?;
     }
 
-    let exe_name = if cfg!(windows) {
-        "ai-hook.exe"
-    } else {
-        "ai-hook"
-    };
-
-    let dest_file = dest_dir.join(exe_name);
+    let dest_file = dest_dir.join(installed_binary_name());
 
     // Same physical file? Covers both "src is already the installed copy" and
     // two hard links onto one inode — copying either onto itself would clobber
@@ -256,7 +260,7 @@ pub fn install_binary_file(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        Some(dest_dir.join(format!("{}.old.{}", exe_name, nonce)))
+        Some(dest_dir.join(format!("{}.old.{}", installed_binary_name(), nonce)))
     } else {
         None
     };
@@ -371,6 +375,87 @@ pub fn install_binary_file(
     Ok(InstallOutcome::Installed(dest_file))
 }
 
+/// Returns the first `ai-hook` executable that PATH resolves *before* the copy
+/// we just installed, i.e. a stale binary that shadows the new one.
+///
+/// Why this check exists: `ai-hook install` writes exactly one target
+/// directory. If another copy already sits earlier in PATH -- a stale manual
+/// install, a package-manager copy, a leftover from an older version -- then
+/// every hook invocation keeps executing that old binary, while the freshly
+/// installed one only answers when it is called by absolute path. `--version`
+/// then reports the new number and the operator concludes the upgrade took
+/// effect. The failure is silent and extremely confusing: rules look correct,
+/// the engine looks current, yet the new behaviour never happens.
+///
+/// Real-world case (2026-10-20): `~/.local/bin/windows/ai-hook.exe` held the
+/// fixed build while `~/.local/bin/ai-hook.exe` kept an older one. Host hook
+/// processes resolved the latter, so a WorkBuddy fix that routed `confirm`
+/// into the GUI fallback never ran -- the rule fired, returned `ask`, and the
+/// command was silently allowed.
+///
+/// The scan is intentionally read-only: deleting another installation could
+/// destroy a package-managed file, so the caller surfaces a warning instead of
+/// mutating the filesystem.
+fn first_shadowing_binary(dest_file: &Path, path_entries: &[PathBuf]) -> Option<PathBuf> {
+    let exe_name = installed_binary_name();
+    for dir in path_entries {
+        // An empty PATH entry means "the current directory" on Unix. It is not
+        // an installation location, and joining onto it would yield a relative
+        // path that only matches when ai-hook happens to sit in the cwd.
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(exe_name);
+        if !candidate.is_file() {
+            continue;
+        }
+        if same_file(&candidate, dest_file) {
+            // PATH reaches the copy we just installed: nothing shadows it.
+            return None;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Warns when an earlier PATH entry would win over the binary we just
+/// installed. Kept separate from [`handle_install`] so the detection predicate
+/// stays unit-testable and the install flow stays readable.
+fn warn_if_shadowed(dest_file: &Path, path_entries: &[PathBuf]) {
+    let Some(shadow) = first_shadowing_binary(dest_file, path_entries) else {
+        return;
+    };
+    let l = crate::i18n::lang();
+    eprint_ts!(
+        "{}",
+        l.pick(
+            "⚠️  PATH 中存在更靠前的另一个 ai-hook 副本，刚安装的版本不会被执行！",
+            "⚠️  Another ai-hook copy precedes the installed one in PATH; the new build will NOT run!"
+        )
+    );
+    eprint_ts!(
+        "{}",
+        l.pick(
+            &format!("    实际会被调用: {}", shadow.display()),
+            &format!("    Resolved at runtime: {}", shadow.display())
+        )
+    );
+    eprint_ts!(
+        "{}",
+        l.pick(
+            &format!("    本次安装目标: {}", dest_file.display()),
+            &format!("    Install target:       {}", dest_file.display())
+        )
+    );
+    eprint_ts!(
+        "{}",
+        l.pick(
+            "    处置：删除或替换旧副本，或调整 PATH 顺序，然后重新验证 `ai-hook version` 与钩子实际行为。",
+            "    Fix: remove/replace the stale copy or reorder PATH, then re-verify `ai-hook version` AND the actual hook behaviour."
+        )
+    );
+}
+
 pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
     let current_exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -413,12 +498,7 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
         }
         Err(e) => {
             eprint_ts!("[ai-hook install] 错误: {}", e);
-            let exe_name = if cfg!(windows) {
-                "ai-hook.exe"
-            } else {
-                "ai-hook"
-            };
-            (dest_dir.join(exe_name), None)
+            (dest_dir.join(installed_binary_name()), None)
         }
     };
 
@@ -427,8 +507,9 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
     }
 
     // Check if the destination is already in PATH (no environment variables modified).
+    let path_entries = path_entries_from_env();
     let norm_dest = normalize_path_entry(&dest_dir);
-    let in_path = path_entries_from_env()
+    let in_path = path_entries
         .iter()
         .any(|p| normalize_path_entry(p) == norm_dest);
 
@@ -436,6 +517,14 @@ pub fn handle_install(target_dir: Option<PathBuf>, force: bool) {
         outln!("✓ {}", t(Msg::M099));
         outln!("  '{}' {}.", dest_dir.display(), t(Msg::M100));
         outln!("  {}", t(Msg::M101));
+
+        // Upgrade correctness gate: a second copy earlier in PATH silently wins
+        // over the binary we just wrote, which makes "I installed the fix" and
+        // "the fix runs" two different facts. Surface it loudly. Only checked
+        // when the target dir is on PATH at all -- otherwise the message above
+        // ("not on PATH") already names the real problem and "an earlier copy
+        // wins" would describe an ordering that does not exist.
+        warn_if_shadowed(&dest_file, &path_entries);
     } else {
         outln!(
             "ℹ️  {} '{}' {}.",
@@ -491,6 +580,45 @@ mod tests {
             same_file(&a, &b),
             "hard links must be recognised as the same file"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PATH order decides which copy actually runs: a binary found before the
+    /// install target shadows it, one found after it does not, and reaching the
+    /// target itself ends the scan.
+    #[test]
+    fn shadow_scan_respects_path_order() {
+        let tmp = std::env::temp_dir().join(format!("ai-hook-shadow-{}", std::process::id()));
+        let early = tmp.join("early");
+        let dest_dir = tmp.join("dest");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let shadow = early.join(installed_binary_name());
+        let dest = dest_dir.join(installed_binary_name());
+        std::fs::write(&shadow, b"old build").unwrap();
+        std::fs::write(&dest, b"new build").unwrap();
+
+        assert_eq!(
+            first_shadowing_binary(&dest, &[early.clone(), dest_dir.clone()]),
+            Some(shadow.clone()),
+            "a copy earlier in PATH must be reported"
+        );
+        assert_eq!(
+            first_shadowing_binary(&dest, &[dest_dir.clone(), early.clone()]),
+            None,
+            "the target coming first means nothing shadows it"
+        );
+        assert_eq!(
+            first_shadowing_binary(&dest, &[PathBuf::new(), dest_dir.clone()]),
+            None,
+            "an empty PATH entry (cwd on Unix) is never a candidate"
+        );
+        assert_eq!(
+            first_shadowing_binary(&dest, &[tmp.join("missing"), dest_dir.clone()]),
+            None,
+            "directories without a binary are skipped"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -705,3 +705,29 @@ impl GuiDialog {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DialogResult;
+
+    /// Fail-closed contract for the confirmation dialog.
+    ///
+    /// Only an explicit `Approved` may authorize a tool call. Every other
+    /// outcome -- deny, Esc, countdown expiry, or a dialog that failed to spawn
+    /// -- must block. This is the single most safety-critical predicate in the
+    /// engine: because the host may auto-approve a protocol `ask` without ever
+    /// showing it to a human (WorkBuddy Desktop's `parseHookOutput` has no ask
+    /// branch), a timeout that resolves to "approved" degrades every guard rule
+    /// into a silent no-op. A regression here is invisible in normal testing --
+    /// the dialog still appears and still disappears on schedule -- so the
+    /// predicate is pinned by an explicit assertion instead of being inferred
+    /// from the `matches!` expression alone.
+    #[test]
+    fn only_explicit_approval_authorizes() {
+        assert!(DialogResult::Approved.is_approved());
+        assert!(!DialogResult::Denied.is_approved());
+        assert!(!DialogResult::EscCancelled.is_approved());
+        assert!(!DialogResult::TimedOut.is_approved());
+        assert!(!DialogResult::Error.is_approved());
+    }
+}
