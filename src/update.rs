@@ -656,21 +656,38 @@ pub fn handle_update(force: bool, repo: &str) -> Result<(), String> {
     // HTML error pages and wrong-architecture assets before they can corrupt
     // the installed copy.
     outln!("{}...", t(Msg::M045));
-    let verify_ok = Command::new(&temp_bin_path)
-        .arg("--version")
-        .no_console_window()
-        .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout)
-                    .to_lowercase()
-                    .contains("ai-hook")
-        })
-        .unwrap_or(false);
+    // A freshly written executable can be locked for a moment by antivirus or
+    // the search indexer; one immediate execution failing is not evidence that
+    // the download is bad, and aborting here throws away a valid update with a
+    // message that says nothing about what actually happened.
+    let mut verify_ok = false;
+    let mut verify_err = String::new();
+    for attempt in 1..=3 {
+        match Command::new(&temp_bin_path)
+            .arg("--version")
+            .no_console_window()
+            .output()
+        {
+            Ok(o)
+                if o.status.success()
+                    && String::from_utf8_lossy(&o.stdout)
+                        .to_lowercase()
+                        .contains("ai-hook") =>
+            {
+                verify_ok = true;
+                break;
+            }
+            Ok(o) => verify_err = format!("exit status {}", o.status),
+            Err(e) => verify_err = e.to_string(),
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+        }
+    }
 
     if !verify_ok {
         let _ = std::fs::remove_file(&temp_bin_path);
-        return Err(t(Msg::M046).to_string());
+        return Err(format!("{} ({})", t(Msg::M046), verify_err));
     }
 
     outln!("{}...", t(Msg::M047));

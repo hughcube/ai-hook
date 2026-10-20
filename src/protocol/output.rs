@@ -240,7 +240,7 @@ impl HookDecision {
                 // top-level `decision:"deny"`), so keeping `Op::Deny` either
                 // blocks or is ignored — never the opposite of what the rule asked.
                 if !caps.gate {
-                    eprintln!("[ai-hook] {}: {}", t(Msg::M150), ctx.event_enum.as_str());
+                    errln!("[ai-hook] {}: {}", t(Msg::M150), ctx.event_enum.as_str());
                 }
                 Op::Deny { reason: msg }
             }

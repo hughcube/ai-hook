@@ -1846,7 +1846,7 @@ fn synthetic_payload(
     // to the command key only for non-file kinds.
     let needs_file = matches!(kind, SimToolKind::File | SimToolKind::ApplyPatch);
     if needs_file && file.is_empty() {
-        eprintln!(
+        errln!(
             "⚠️  工具 {tool} 是文件类工具:未提供 -f <path>,合成的 payload 将无 ctx.file(文件规则会全部放行)。请用 -f 指定目标文件路径。"
         );
     }
@@ -1863,7 +1863,7 @@ fn synthetic_payload(
     match platform {
         "antigravity" => {
             if is_prompt_event {
-                eprintln!(
+                errln!(
                     "⚠️  Antigravity 没有 prompt 类事件(UserPromptSubmit/BeforeAgent),--event {event} 无法模拟,仍按工具信封构造。"
                 );
             }
@@ -2375,7 +2375,7 @@ fn handle_clean(max_files: Option<usize>, dry_run: bool) {
     let limit = max_files.unwrap_or_else(ai_hook::engine::debug::resolve_max_log_files);
 
     let Some(logs_dir) = ai_hook::paths::log_dir() else {
-        eprintln!("[ai-hook] Could not determine user home directory.");
+        errln!("[ai-hook] Could not determine user home directory.");
         std::process::exit(1);
     };
     let lang = ai_hook::i18n::lang();
