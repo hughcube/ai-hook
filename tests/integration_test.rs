@@ -1383,6 +1383,24 @@ fn test_can_ask_host_matrix() {
     );
     assert!(!agy_yolo.can_ask(), "AGY YOLO 模式不可 ask(ask 被静默放行)");
 
+    // WorkBuddy 桌面端:普通模式走宿主原生确认框;fullAccess(bypassPermissions)
+    // 下宿主自动批准协议 ask(2026-10-20 实测:规则确实被调用、返回
+    // permissionDecision:"ask",界面无提示、命令照跑) → 该模式必须视为不可 ask,
+    // 否则所有依赖 ask 的门禁在 fullAccess 下等于不存在。
+    let wb = HookContext::parse(
+        &serde_json::json!({"hook_event_name":"PreToolUse","transcript_path":"/home/u/.workbuddy/projects/x.jsonl","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert_eq!(wb.platform, Platform::WorkBuddy);
+    assert!(wb.can_ask(), "WorkBuddy 普通模式应走宿主原生 ask");
+    let wb_yolo = HookContext::parse(
+        &serde_json::json!({"hook_event_name":"PreToolUse","transcript_path":"/home/u/.workbuddy/projects/x.jsonl","permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert_eq!(wb_yolo.platform, Platform::WorkBuddy);
+    assert!(
+        !wb_yolo.can_ask(),
+        "WorkBuddy fullAccess 下 ask 被自动批准 → 必须走 GUI 兜底"
+    );
+
     // Generic:无 ask 协议
     let generic = HookContext::parse("not-json");
     assert!(!generic.can_ask(), "Generic 无 ask 协议");

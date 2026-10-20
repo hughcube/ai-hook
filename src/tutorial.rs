@@ -244,7 +244,9 @@ fn chinese_tutorial_body() -> String {
   codex          ✗ 协议无 ask(输出 ask 会被判 unsupported 并 fail open:宿主
                    标记 hook failed 后继续执行工具调用)→ confirm 一律走 GUI,
                    无 GUI 时 fail-closed 拒绝   hookSpecificOutput.permissionDecision
-  workbuddy      ✓ ask(终端)         ✓ ask(同上)          同上
+  workbuddy      ✓ ask(原生确认框)   ✗(bypass 下 ask 被宿主自动批准,
+                   与 CodeBuddy 不同 → confirm 走 GUI 兜底,
+                   无 GUI 时 fail-closed 拒绝)           同上
   gemini         ✗ 协议无 ask        ✗                    顶层 {decision, reason}
   antigravity    ✓ force_ask         ✗(bypass 不弹,走 GUI) 顶层 {decision, reason}
   opencode       ✗ 桥未实现 ask      ✗                    见下方 opencode 专节

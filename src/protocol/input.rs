@@ -1440,6 +1440,12 @@ impl HookContext {
     /// - CodeBuddy `@tencent-ai/codebuddy-code` 随包文档
     ///   `dist/web-ui/docs/cn/cli/hooks.md`:`permissionDecision` 取值
     ///   `allow`/`deny`/`ask`,`permissionDecisionReason` 显示在确认对话框。
+    /// - WorkBuddy 桌面端(CodeBuddy 内核)是**例外**:fullAccess
+    ///   (`bypassPermissions`)下宿主会把 hook 的协议 ask 直接批准 —— 实测
+    ///   规则确实被调用(`fired marker=true`)、确实返回
+    ///   `permissionDecision:"ask"`,界面无任何提示、命令照常执行。故该模式
+    ///   一律视为「不能 ask」,让 confirm 落到 GUI 兜底,否则所有靠 ask 的
+    ///   门禁在 fullAccess 下等于不存在。
     /// - Antigravity `https://antigravity.google/docs/hooks/`:`decision` 取值含
     ///   `ask`(尊重 "Always Allow")与 `force_ask`(忽略缓存)。
     /// - Gemini CLI `https://geminicli.com/docs/hooks/reference/`:
@@ -1450,7 +1456,11 @@ impl HookContext {
     #[must_use]
     pub fn can_ask(&self) -> bool {
         match self.platform {
-            Platform::ClaudeCode | Platform::CodeBuddy | Platform::WorkBuddy => true,
+            Platform::ClaudeCode | Platform::CodeBuddy => true,
+            // WorkBuddy 桌面端:免确认模式(bypassPermissions / dontAsk)下宿主自动批准
+            // 协议 ask(2026-10-20 实测),与 CodeBuddy CLI 不同 → 该模式视为不能 ask,
+            // confirm 走 GUI 兜底;普通模式仍走宿主原生确认框。
+            Platform::WorkBuddy => !self.is_yolo,
             // Codex 全模式均无协议 ask(输出 ask = 静默放行),故恒 false。
             Platform::Codex => false,
             // 桥未实现 ask,输出会被完全忽略(fail-open)。
