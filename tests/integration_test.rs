@@ -4189,12 +4189,19 @@ fn install_refuses_duplicate_and_replaces_path_copy_in_place() {
     std::fs::copy(bin_path, &installed).expect("seed an existing installation");
     let isolated_path = bin_dir.to_string_lossy().to_string();
 
+    // Windows keeps the variable under whatever casing the parent used ("Path"
+    // on GitHub runners). Adding only "PATH" leaves a duplicate that the child
+    // can read instead, silently restoring the real PATH, so start clean.
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(bin_path);
+        cmd.args(args).env_clear().env("PATH", &isolated_path);
+        #[cfg(windows)]
+        cmd.env("Path", &isolated_path);
+        cmd.output().expect("run ai-hook install")
+    };
+
     // A) No --force: nothing is written, and the operator is sent to update.
-    let out = Command::new(bin_path)
-        .args(["install"])
-        .env("PATH", &isolated_path)
-        .output()
-        .expect("Failed to run install");
+    let out = run(&["install"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -4207,11 +4214,7 @@ fn install_refuses_duplicate_and_replaces_path_copy_in_place() {
     );
 
     // B) --force: the existing file is the destination, not a sibling copy.
-    let out = Command::new(bin_path)
-        .args(["install", "--force"])
-        .env("PATH", &isolated_path)
-        .output()
-        .expect("Failed to run install --force");
+    let out = run(&["install", "--force"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
