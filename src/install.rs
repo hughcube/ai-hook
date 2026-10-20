@@ -24,10 +24,26 @@ pub fn path_entries_from_env() -> Vec<PathBuf> {
     let Some(raw) = std::env::var_os("PATH") else {
         return Vec::new();
     };
-    let raw = raw.to_string_lossy();
+    parse_path_var(&raw.to_string_lossy())
+}
 
-    #[cfg(windows)]
-    if !raw.contains(';') && raw.contains(':') {
+#[cfg(windows)]
+fn parse_path_var(raw: &str) -> Vec<PathBuf> {
+    // A single native entry ("C:\tools\bin") also contains a ':' and no ';',
+    // so the MSYS heuristic below must not claim it: splitting it on ':'
+    // yields a bogus "C" plus a rooted "\tools\bin", which resolves against
+    // the *current drive*. On a workspace living on D: that silently produced
+    // an empty PATH and every PATH lookup (duplicate-install gate, shadow scan)
+    // saw nothing.
+    let is_native = {
+        let b = raw.as_bytes();
+        b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && (b[2] == b'\\' || b[2] == b'/')
+    };
+
+    if !raw.contains(';') && raw.contains(':') && !is_native {
         return raw
             .split(':')
             .filter(|p| !p.is_empty())
@@ -44,7 +60,12 @@ pub fn path_entries_from_env() -> Vec<PathBuf> {
             .collect();
     }
 
-    std::env::split_paths(raw.as_ref()).collect()
+    std::env::split_paths(raw).collect()
+}
+
+#[cfg(not(windows))]
+fn parse_path_var(raw: &str) -> Vec<PathBuf> {
+    std::env::split_paths(raw).collect()
 }
 
 /// Drops the Windows verbatim prefix (`\\?\`, `\\?\UNC\`) that
@@ -658,6 +679,27 @@ mod tests {
             "hard links must be recognised as the same file"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A single native Windows entry has a ':' but no ';', so the MSYS
+    /// heuristic must not claim it: doing so split "C:\tools\bin" into a bogus
+    /// "C" plus a drive-rooted "\tools\bin", which resolved against whatever
+    /// drive the process happened to sit on and left PATH effectively empty.
+    #[cfg(windows)]
+    #[test]
+    fn single_native_path_entry_is_not_msys() {
+        assert_eq!(
+            parse_path_var(r"C:\tools\bin"),
+            vec![PathBuf::from(r"C:\tools\bin")]
+        );
+        assert_eq!(
+            parse_path_var(r"C:\tools\bin;D:\other"),
+            vec![PathBuf::from(r"C:\tools\bin"), PathBuf::from(r"D:\other")]
+        );
+        assert_eq!(
+            parse_path_var("/c/tools/bin:/d/other"),
+            vec![PathBuf::from(r"C:\tools\bin"), PathBuf::from(r"D:\other")]
+        );
     }
 
     /// Every copy that resolves through PATH is reported, in PATH order, and
