@@ -1383,23 +1383,36 @@ fn test_can_ask_host_matrix() {
     );
     assert!(!agy_yolo.can_ask(), "AGY YOLO 模式不可 ask(ask 被静默放行)");
 
-    // WorkBuddy 桌面端:普通模式走宿主原生确认框;fullAccess(bypassPermissions)
-    // 下宿主自动批准协议 ask(2026-10-20 实测:规则确实被调用、返回
-    // permissionDecision:"ask",界面无提示、命令照跑) → 该模式必须视为不可 ask,
-    // 否则所有依赖 ask 的门禁在 fullAccess 下等于不存在。
+    // WorkBuddy 桌面端:与权限模式无关 —— 随包解析器 parseHookOutput
+    // (resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs,
+    // WorkBuddy 37.10.3-42)对 permissionDecision 只实现 deny / allow,
+    // allowed 初值 = exitCode===0,返回 "ask" 既不弹窗也不改 allowed
+    // (仅用于抑制提示消息)→ 等价静默放行。故默认模式与 fullAccess 都必须
+    // 视为不可 ask,confirm 一律走 GUI 兜底。
     let wb = HookContext::parse(
         &serde_json::json!({"hook_event_name":"PreToolUse","transcript_path":"/home/u/.workbuddy/projects/x.jsonl","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string(),
     );
     assert_eq!(wb.platform, Platform::WorkBuddy);
-    assert!(wb.can_ask(), "WorkBuddy 普通模式应走宿主原生 ask");
+    assert!(!wb.can_ask(), "WorkBuddy 任何模式都没有协议 ask");
+    assert!(!wb.is_yolo, "permission_mode:default 不是免确认");
+    // WorkBuddy 的免确认模式在宿主日志里叫 fullAccess(daemon.log
+    // [conversation-runtime] resolveConversationConfig 记录
+    // "permissionMode":"fullAccess"),不是 bypassPermissions;两者都要识别。
+    let wb_full = HookContext::parse(
+        &serde_json::json!({"hook_event_name":"PreToolUse","transcript_path":"/home/u/.workbuddy/projects/x.jsonl","permission_mode":"fullAccess","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string(),
+    );
+    assert_eq!(wb_full.platform, Platform::WorkBuddy);
+    assert!(!wb_full.can_ask(), "WorkBuddy fullAccess 下没有协议 ask");
+    assert!(wb_full.is_yolo, "WorkBuddy fullAccess 必须识别为免确认模式");
     let wb_yolo = HookContext::parse(
         &serde_json::json!({"hook_event_name":"PreToolUse","transcript_path":"/home/u/.workbuddy/projects/x.jsonl","permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"ls"}}).to_string(),
     );
     assert_eq!(wb_yolo.platform, Platform::WorkBuddy);
     assert!(
         !wb_yolo.can_ask(),
-        "WorkBuddy fullAccess 下 ask 被自动批准 → 必须走 GUI 兜底"
+        "WorkBuddy bypassPermissions 下没有协议 ask"
     );
+    assert!(wb_yolo.is_yolo, "bypassPermissions 仍须识别为免确认模式");
 
     // Generic:无 ask 协议
     let generic = HookContext::parse("not-json");

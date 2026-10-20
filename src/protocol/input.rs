@@ -182,7 +182,8 @@ pub struct HookContext {
     /// | "dontAsk" | "bypassPermissions" (hosts that provide it).
     pub permission_mode: Option<String>,
     /// True when the host will not ask for confirmation
-    /// (permission_mode bypassPermissions/dontAsk, or AGY skip flag).
+    /// (permission_mode bypassPermissions/dontAsk, WorkBuddy Desktop's
+    /// fullAccess, or AGY skip flag).
     ///
     /// Antigravity has no documented way to learn this: its official common
     /// input fields (`conversationId` / `workspacePaths` / `transcriptPath` /
@@ -412,9 +413,21 @@ fn detect_cc_family(val: &serde_json::Value, _raw_json: &str) -> Platform {
 }
 
 /// YOLO = host runs without confirmation prompts.
+///
+/// Vocabulary actually seen on the wire (all lower-cased below):
+/// - Claude Code / CodeBuddy CLI: `bypassPermissions`, `dontAsk`.
+/// - WorkBuddy Desktop: `fullAccess` — its own 免确认 mode. Two independent
+///   vendor sources agree on the literal: the host logs
+///   `[conversation-runtime] resolveConversationConfig ... "permissionMode":
+///   "fullAccess"` (~/.workbuddy/logs/daemon.log, observed 2026-10-20), and
+///   the shipped CLI lists it next to `bypassPermissions` in its permission
+///   modes (`["default","acceptEdits","bypassPermissions","plan","dontAsk",
+///   "auto","fullAccess"]`; `isUnrestrictedPermissionMode()` treats both as
+///   unrestricted). Matching only `bypass`/`dontask` therefore reported
+///   `isYolo:false` inside WorkBuddy's full-access mode.
 fn permission_mode_is_yolo(mode: &str) -> bool {
     let m = mode.to_ascii_lowercase();
-    m.contains("bypass") || m.contains("dontask")
+    m.contains("bypass") || m.contains("dontask") || m.contains("fullaccess")
 }
 
 /// True for the Google Antigravity envelope.
@@ -1440,12 +1453,14 @@ impl HookContext {
     /// - CodeBuddy `@tencent-ai/codebuddy-code` 随包文档
     ///   `dist/web-ui/docs/cn/cli/hooks.md`:`permissionDecision` 取值
     ///   `allow`/`deny`/`ask`,`permissionDecisionReason` 显示在确认对话框。
-    /// - WorkBuddy 桌面端(CodeBuddy 内核)是**例外**:fullAccess
-    ///   (`bypassPermissions`)下宿主会把 hook 的协议 ask 直接批准 —— 实测
-    ///   规则确实被调用(`fired marker=true`)、确实返回
-    ///   `permissionDecision:"ask"`,界面无任何提示、命令照常执行。故该模式
-    ///   一律视为「不能 ask」,让 confirm 落到 GUI 兜底,否则所有靠 ask 的
-    ///   门禁在 fullAccess 下等于不存在。
+    /// - WorkBuddy 桌面端(CodeBuddy 内核)是**例外,且与权限模式无关**:
+    ///   随包解析器 `parseHookOutput`(`resources/app.asar.unpacked/cli/dist/
+    ///   codebuddy-lite-wb.mjs`,WorkBuddy 37.10.3-42)对
+    ///   `hookSpecificOutput.permissionDecision` 只实现 `deny` / `allow`
+    ///   两个分支,`allowed` 初值是 `exitCode === 0`;返回 `"ask"` 时既不改
+    ///   `allowed` 也不弹窗(该值只用于抑制随附的提示消息),等价于静默放行。
+    ///   故任何模式下一律视为「不能 ask」,confirm 落到 GUI 兜底,无 GUI 时
+    ///   fail-closed 拒绝。
     /// - Antigravity `https://antigravity.google/docs/hooks/`:`decision` 取值含
     ///   `ask`(尊重 "Always Allow")与 `force_ask`(忽略缓存)。
     /// - Gemini CLI `https://geminicli.com/docs/hooks/reference/`:
@@ -1457,10 +1472,19 @@ impl HookContext {
     pub fn can_ask(&self) -> bool {
         match self.platform {
             Platform::ClaudeCode | Platform::CodeBuddy => true,
-            // WorkBuddy 桌面端:免确认模式(bypassPermissions / dontAsk)下宿主自动批准
-            // 协议 ask(2026-10-20 实测),与 CodeBuddy CLI 不同 → 该模式视为不能 ask,
-            // confirm 走 GUI 兜底;普通模式仍走宿主原生确认框。
-            Platform::WorkBuddy => !self.is_yolo,
+            // WorkBuddy Desktop: hard false, independent of the permission
+            // mode. Its shipped hook parser (`parseHookOutput` in
+            // cli/dist/codebuddy-lite-wb.mjs) implements only "deny" and
+            // "allow" for `hookSpecificOutput.permissionDecision`; a returned
+            // "ask" is recognized but never turns into a confirmation prompt,
+            // so it behaves exactly like a silent allow. The earlier revision
+            // returned `!self.is_yolo`, which assumed the normal mode still had
+            // a native ask channel -- that assumption was wrong and made the
+            // bug invisible in default mode. Returning false keeps this runtime
+            // check consistent with the capability table in
+            // protocol/capability.rs (AskShape::None), so every "confirm"
+            // decision goes to the GUI popup fallback or a fail-closed deny.
+            Platform::WorkBuddy => false,
             // Codex 全模式均无协议 ask(输出 ask = 静默放行),故恒 false。
             Platform::Codex => false,
             // 桥未实现 ask,输出会被完全忽略(fail-open)。

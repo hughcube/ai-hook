@@ -244,9 +244,10 @@ fn chinese_tutorial_body() -> String {
   codex          ✗ 协议无 ask(输出 ask 会被判 unsupported 并 fail open:宿主
                    标记 hook failed 后继续执行工具调用)→ confirm 一律走 GUI,
                    无 GUI 时 fail-closed 拒绝   hookSpecificOutput.permissionDecision
-  workbuddy      ✓ ask(原生确认框)   ✗(bypass 下 ask 被宿主自动批准,
-                   与 CodeBuddy 不同 → confirm 走 GUI 兜底,
-                   无 GUI 时 fail-closed 拒绝)           同上
+  workbuddy      ✗ 协议无 ask        ✗(同左:随包解析器只认 deny/
+                   (解析器只认 deny/   allow,返回 ask 等于静默放行,
+                    allow)            → 走 GUI 兜底,无 GUI 直接拒绝)
+                                                          同上
   gemini         ✗ 协议无 ask        ✗                    顶层 {decision, reason}
   antigravity    ✓ force_ask         ✗(bypass 不弹,走 GUI) 顶层 {decision, reason}
   opencode       ✗ 桥未实现 ask      ✗                    见下方 opencode 专节
@@ -637,7 +638,12 @@ V. Host decision matrix (can_ask × mode; output is mapped automatically)
                   hook run is marked failed and the tool call CONTINUES, i.e.
                   fail open. Confirmations fall back to the GUI dialog, or
                   fail-closed deny when no dialog is available)
-  workbuddy      ✓ ask (terminal)   ✓ ask (same as CC)       same
+  workbuddy      ✗ no ask in protocol ✗                      same
+                 (the shipped parser handles only deny/allow — an ask is
+                  recognized but leaves `allowed` at exit-code-0 = true,
+                  i.e. a silent allow, so every confirmation falls back to
+                  the GUI dialog or a fail-closed deny. Mode-independent:
+                  fullAccess behaves the same as the default mode)
   gemini         ✗ no ask in protocol ✗                      top-level {decision, reason}
   antigravity    ✓ force_ask        ✗ (bypass: no prompt,
                                     GUI fallback)          top-level {decision, reason}

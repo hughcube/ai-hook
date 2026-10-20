@@ -300,9 +300,38 @@ pub fn capabilities(platform: Platform, event: HookEvent) -> Capabilities {
             F::None,
         )
         .gated(),
-        (P::CodeBuddy | P::WorkBuddy, E::PreToolUse) => Capabilities::new(
+        // CodeBuddy keeps the native protocol ask: in the CodeBuddy CLI the
+        // terminal confirmation prompt is honored even under bypassPermissions
+        // (verified against CodeBuddy 2.146.0), so `permissionDecision:"ask"`
+        // actually reaches a human.
+        (P::CodeBuddy, E::PreToolUse) => Capabilities::new(
             D::PermissionDecision,
             A::PermissionAsk,
+            I::AdditionalContext,
+            true,
+            M::UpdatedInput,
+            R::None,
+            F::None,
+        )
+        .gated(),
+        // WorkBuddy Desktop is deliberately split off from CodeBuddy above.
+        // It shares the same engine, but its hook output parser
+        // (`parseHookOutput` in resources/app.asar.unpacked/cli/dist/
+        // codebuddy-lite-wb.mjs, WorkBuddy 37.10.3-42) implements only two
+        // branches for `hookSpecificOutput.permissionDecision`:
+        // "deny" and "allow".
+        // There is no "ask" branch -- a returned ask is recognized (the agent
+        // uses it to suppress the accompanying notice) yet leaves `allowed` at
+        // its initial value (exit code 0 => true), so the tool call proceeds
+        // silently. Declaring AskShape::None is therefore the only honest
+        // capability statement: `ask_ok` becomes false and every "confirm"
+        // decision is routed to the GUI popup fallback, or to a fail-closed
+        // deny when no GUI is available. This is intentional -- emitting a
+        // protocol ask here would be indistinguishable from a silent allow,
+        // which is the worst possible outcome for a user-defined guard rule.
+        (P::WorkBuddy, E::PreToolUse) => Capabilities::new(
+            D::PermissionDecision,
+            A::None,
             I::AdditionalContext,
             true,
             M::UpdatedInput,
@@ -662,14 +691,18 @@ mod tests {
         // UserPromptSubmit has no protocol ask on any host.
         assert!(!capabilities(Platform::Codex, HookEvent::UserPromptSubmit).can_ask());
         assert!(!capabilities(Platform::ClaudeCode, HookEvent::UserPromptSubmit).can_ask());
-        // Claude Code / CodeBuddy / WorkBuddy do honor ask, even in bypass
-        // mode: official PreToolUse decision control says `"ask" prompts the
-        // user to confirm`, and "A hook's `"ask"` also forces a permission
-        // prompt in auto mode" (both sentences verified present on
+        // Claude Code / CodeBuddy do honor ask, even in bypass mode: official
+        // PreToolUse decision control says `"ask" prompts the user to confirm`,
+        // and "A hook's `"ask"` also forces a permission prompt in auto mode"
+        // (both sentences verified present on
         // https://code.claude.com/docs/en/hooks as of 2026-09-08).
         assert!(capabilities(Platform::ClaudeCode, HookEvent::PreToolUse).can_ask());
         assert!(capabilities(Platform::CodeBuddy, HookEvent::PreToolUse).can_ask());
-        assert!(capabilities(Platform::WorkBuddy, HookEvent::PreToolUse).can_ask());
+        // WorkBuddy Desktop is the exception: its shipped parser handles only
+        // "deny" and "allow", so an ask degrades into an implicit allow. It
+        // must therefore advertise no ask capability and rely on the GUI
+        // popup fallback instead (see the WorkBuddy PreToolUse branch above).
+        assert!(!capabilities(Platform::WorkBuddy, HookEvent::PreToolUse).can_ask());
         // Gemini has no ask in its protocol at all.
         assert!(!capabilities(Platform::Gemini, HookEvent::BeforeTool).can_ask());
         // The opencode bridge never implements ask in either handler.

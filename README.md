@@ -546,7 +546,7 @@ return {
 > **Behavior**: A sleek floating card pops up. Clicking "Allow" or pressing `Enter` permits execution. Clicking "Deny", pressing `Esc`, or timing out aborts the command.
 
 #### Scenario C: Terminal-Only Confirmation (No GUI)
-Delegate confirmation to the Agent CLI interface (e.g. Claude Code `(y/n)` prompt). If the host cannot ask (no ask channel in its protocol), the command is auto-denied instead — fail-closed:
+Delegate confirmation to the Agent CLI interface (e.g. Claude Code `(y/n)` prompt). If the host cannot ask (no ask channel in its protocol), the command is auto-denied instead — fail-closed. Note that **WorkBuddy Desktop counts as "cannot ask"**: its shipped hook parser only understands `deny`/`allow`, and a returned `ask` degrades into a silent allow, so ai-hook never emits a protocol ask for WorkBuddy — confirmations go to the GUI dialog, and `gui: false` denies outright:
 ```javascript
 return {
   ask: "Release publishing detected. Proceed?",

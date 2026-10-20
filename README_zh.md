@@ -533,7 +533,7 @@ return {
 > **效果**：屏幕中央立即弹出现代化卡片弹窗。用户点击【允许执行】或敲击 `Enter` 后 Agent 继续执行；点击【拒绝】、敲击 `Esc` 或倒计时超时自动阻断！
 
 #### 场景 C: 【终端命令行确认，不唤起弹窗】 (Terminal-Only Ask)
-若希望将确认交由 Agent 终端交互（如 Claude Code CLI 内的 `(y/n)` 提示）。宿主不支持协议 ask 时会直接自动拒绝（fail-closed）：
+若希望将确认交由 Agent 终端交互（如 Claude Code CLI 内的 `(y/n)` 提示）。宿主不支持协议 ask 时会直接自动拒绝（fail-closed）。注意 **WorkBuddy 桌面端属于"不支持"**：它随包的 hook 解析器只认 `deny`/`allow`，返回 `ask` 会被当作静默放行，因此 ai-hook 对 WorkBuddy 从不发协议 ask —— 确认走 GUI 弹窗，`gui: false` 时直接拒绝：
 ```javascript
 return {
   ask: "检测到版本发布命令，是否确认推送到公共制品库？",
