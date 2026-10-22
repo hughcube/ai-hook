@@ -771,6 +771,7 @@ fn normalize_semantics(
     // read_file / write_file / replace use file_path, list_directory uses
     // dir_path. Claude Code / Codex use file_path / path.
     let path_keys: &[&str] = &[
+        "Path",
         "file_path",
         "filePath",
         "FilePath",

@@ -5949,3 +5949,50 @@ fn test_cli_test_subcommand_writes_no_audit_but_keeps_console() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_antigravity_read_file_uppercase_path() {
+    let raw = serde_json::json!({
+        "conversationId": "test-session",
+        "toolCall": {
+            "name": "read_file",
+            "args": {
+                "Path": "C:\\Users\\hugh.li\\.ssh\\id_rsa"
+            }
+        },
+        "stepIdx": 1
+    });
+    let ctx = HookContext::parse(&raw.to_string());
+    assert_eq!(ctx.platform, Platform::Antigravity);
+    assert_eq!(ctx.tool_name, "read_file");
+    let file = ctx.file.as_ref().expect("file context should be populated");
+    assert_eq!(file.action, FileAction::Read);
+    assert_eq!(
+        file.path.as_deref(),
+        Some("C:\\Users\\hugh.li\\.ssh\\id_rsa")
+    );
+
+    let raw_write = serde_json::json!({
+        "conversationId": "test-session",
+        "toolCall": {
+            "name": "write_file",
+            "args": {
+                "Path": "C:\\Users\\hugh.li\\.ssh\\id_rsa",
+                "Content": "test"
+            }
+        },
+        "stepIdx": 2
+    });
+    let ctx_write = HookContext::parse(&raw_write.to_string());
+    assert_eq!(ctx_write.platform, Platform::Antigravity);
+    assert_eq!(ctx_write.tool_name, "write_file");
+    let file_write = ctx_write
+        .file
+        .as_ref()
+        .expect("file context should be populated");
+    assert_eq!(file_write.action, FileAction::Write);
+    assert_eq!(
+        file_write.path.as_deref(),
+        Some("C:\\Users\\hugh.li\\.ssh\\id_rsa")
+    );
+}
