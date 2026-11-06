@@ -1190,9 +1190,17 @@ fn handle_dispatch(args: &Cli) {
         let misconfigured = rules_configured(&explicit_paths);
         if misconfigured {
             eprint_ts!("[ai-hook] {}", t(Msg::M160));
+            let configured_paths: Vec<String> = explicit_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
             logging::framework(
                 "error",
-                "no rules loaded but rule paths were configured (fail-closed deny)",
+                &format!(
+                    "no rules loaded but rule paths were configured (fail-closed deny): paths={:?}, AI_HOOK_RULES={:?}",
+                    configured_paths,
+                    std::env::var("AI_HOOK_RULES").ok()
+                ),
             );
         }
         let dec = if misconfigured {

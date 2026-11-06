@@ -551,11 +551,16 @@ pub struct CleanReport {
 /// Extracts the category prefix (e.g. `ai-hook-claude_code-`, `ai-hook-debug-antigravity-`, `ai-hook-inbound-`)
 /// from a log filename.
 pub fn extract_log_category(file_name: &str) -> Option<String> {
-    if !file_name.contains(".log") {
+    let base = if let Some(stem) = file_name.strip_suffix(".log") {
+        stem
+    } else if let Some((stem, slot)) = file_name.split_once(".log.") {
+        if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        stem
+    } else {
         return None;
-    }
-    let base = file_name.strip_suffix(".1").unwrap_or(file_name);
-    let base = base.strip_suffix(".log").unwrap_or(base);
+    };
 
     if let Some(last_dash) = base.rfind('-') {
         let (prefix_without_dash, suffix) = base.split_at(last_dash);
@@ -1111,6 +1116,25 @@ mod tests {
         ));
         assert!(!log_file_matches("ai-hook-2026100x.log", "ai-hook-"));
         assert!(!log_file_matches("random.log", "ai-hook-"));
+
+        assert_eq!(
+            extract_log_category("ai-hook-20261001.log"),
+            Some("ai-hook-".to_string())
+        );
+        assert_eq!(
+            extract_log_category("ai-hook-20261001.log.1"),
+            Some("ai-hook-".to_string())
+        );
+        assert_eq!(
+            extract_log_category("ai-hook-20261001.log.2"),
+            Some("ai-hook-".to_string())
+        );
+        assert_eq!(
+            extract_log_category("ai-hook-audit-codebuddy-20261104.log.9"),
+            Some("ai-hook-audit-codebuddy-".to_string())
+        );
+        assert_eq!(extract_log_category("ai-hook-20261001.log."), None);
+        assert_eq!(extract_log_category("ai-hook-20261001.log.x"), None);
     }
 
     #[test]

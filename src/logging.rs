@@ -227,19 +227,37 @@ pub fn override_path_for(source: &str) -> Option<PathBuf> {
     }
 }
 
+fn in_test_mode() -> bool {
+    var("HOOK_TEST_MODE").is_some_and(|v| legacy_on(&v))
+}
+
 pub fn framework_path() -> Option<PathBuf> {
-    path_override(&["AI_HOOK_LOG_FRAMEWORK_FILE"])
-        .or_else(|| Some(crate::paths::log_dir()?.join(format!("ai-hook-{}.log", date()))))
+    path_override(&["AI_HOOK_LOG_FRAMEWORK_FILE"]).or_else(|| {
+        if in_test_mode() {
+            None
+        } else {
+            Some(crate::paths::log_dir()?.join(format!("ai-hook-{}.log", date())))
+        }
+    })
 }
 
 pub fn console_path() -> Option<PathBuf> {
-    path_override(&["AI_HOOK_LOG_CONSOLE_FILE", "AI_HOOK_LOG_FILE"])
-        .or_else(|| Some(crate::paths::log_dir()?.join(format!("ai-hook-console-{}.log", date()))))
+    path_override(&["AI_HOOK_LOG_CONSOLE_FILE", "AI_HOOK_LOG_FILE"]).or_else(|| {
+        if in_test_mode() {
+            None
+        } else {
+            Some(crate::paths::log_dir()?.join(format!("ai-hook-console-{}.log", date())))
+        }
+    })
 }
 
 pub fn audit_path(agent: &str) -> Option<PathBuf> {
     path_override(&["AI_HOOK_LOG_AUDIT_FILE", "AI_HOOK_DEBUG_FILE"]).or_else(|| {
-        Some(crate::paths::log_dir()?.join(format!("ai-hook-audit-{}-{}.log", agent, date())))
+        if in_test_mode() {
+            None
+        } else {
+            Some(crate::paths::log_dir()?.join(format!("ai-hook-audit-{}-{}.log", agent, date())))
+        }
     })
 }
 

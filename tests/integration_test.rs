@@ -1265,6 +1265,7 @@ fn test_cli_fast_path_can_be_disabled() {
 
     // Fast path enabled (default): the rule never runs.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .env("HOOK_TEST_MODE", "1")
         .args([&rule_arg])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1284,6 +1285,7 @@ fn test_cli_fast_path_can_be_disabled() {
 
     // --no-fast-path: the same command now reaches the rule and is denied.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .env("HOOK_TEST_MODE", "1")
         .args(["--no-fast-path", &rule_arg])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1797,6 +1799,7 @@ fn test_codex_dangerously_skip_permissions_env_detection() {
     // 1. Without CODEX_DANGEROUSLY_SKIP_PERMISSIONS: Codex 仍无协议 ask(输出
     //    ask = fail open),且 --no-gui 关闭了弹窗兜底 → 必须 fail-closed 拒绝。
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .env("HOOK_TEST_MODE", "1")
         .args(["--no-gui", rule_file.to_string_lossy().as_ref()])
         .env_remove("CODEX_DANGEROUSLY_SKIP_PERMISSIONS")
         .stdin(Stdio::piped())
@@ -1822,6 +1825,7 @@ fn test_codex_dangerously_skip_permissions_env_detection() {
 
     // 2. With CODEX_DANGEROUSLY_SKIP_PERMISSIONS=1: should output "deny"
     let mut child_yolo = Command::new(env!("CARGO_BIN_EXE_ai-hook"))
+        .env("HOOK_TEST_MODE", "1")
         .args(["--no-gui", rule_file.to_string_lossy().as_ref()])
         .env("CODEX_DANGEROUSLY_SKIP_PERMISSIONS", "1")
         .stdin(Stdio::piped())
