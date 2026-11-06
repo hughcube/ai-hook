@@ -881,6 +881,13 @@ const CLI_WITH_SUBCOMMANDS: &[&str] = &[
     "go",
     "systemctl",
     "service",
+    "sc",
+    "net",
+    "redis-cli",
+    "crictl",
+    "ctr",
+    "podman",
+    "tunnels",
     "svn",
     "hg",
     "apt",
@@ -1209,7 +1216,7 @@ pub fn extract_executable_and_subcommand(normalized: &str) -> (String, Option<St
         return (String::new(), None);
     }
 
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let words = split_args(trimmed);
     if words.is_empty() {
         return (String::new(), None);
     }
@@ -1228,7 +1235,7 @@ pub fn extract_executable_and_subcommand(normalized: &str) -> (String, Option<St
     if CLI_WITH_SUBCOMMANDS.contains(&exec_lower.as_str()) {
         let mut i = 1;
         while i < words.len() {
-            let w = words[i];
+            let w = &words[i];
             if w.starts_with('-') {
                 // Git -C /path, docker --context ctx, etc.
                 if (w == "-C" || w == "-c" || w == "--git-dir" || w == "--work-tree")
@@ -1241,7 +1248,10 @@ pub fn extract_executable_and_subcommand(normalized: &str) -> (String, Option<St
                 i += 1;
                 continue;
             }
-            subcommand = Some(w.to_ascii_lowercase());
+            subcommand = Some(
+                w.trim_matches(|c| c == '\'' || c == '"')
+                    .to_ascii_lowercase(),
+            );
             break;
         }
     }
@@ -2474,6 +2484,18 @@ mod tests {
         let (exec3, sub3) = extract_executable_and_subcommand("cat file.txt");
         assert_eq!(exec3, "cat");
         assert_eq!(sub3, None);
+
+        let (exec4, sub4) = extract_executable_and_subcommand(
+            r#""C:\Program Files\Git\bin\git.exe" -C /root commit -m 'initial'"#,
+        );
+        assert_eq!(exec4, "git");
+        assert_eq!(sub4.as_deref(), Some("commit"));
+
+        let (exec5, sub5) = extract_executable_and_subcommand(
+            r#""C:\Program Files\Docker\docker.exe" compose up -d"#,
+        );
+        assert_eq!(exec5, "docker");
+        assert_eq!(sub5.as_deref(), Some("compose"));
     }
 
     #[test]

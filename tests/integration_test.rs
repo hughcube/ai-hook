@@ -5188,15 +5188,27 @@ fn test_prelude_aihook_helpers_available() {
 
             // predicates
             if (!aiHook.isSearchPrefix("  grep -a err app.log")) return { deny: "search" };
+            if (!aiHook.isSearchPrefix("git grep foo")) return { deny: "git-grep" };
+            if (!aiHook.isSearchPrefix("git status")) return { deny: "git-status" };
+            if (!aiHook.isSearchPrefix("git diff HEAD")) return { deny: "git-diff" };
+            if (aiHook.isSearchPrefix("git push --force")) return { deny: "git-push-fp" };
+            if (aiHook.isSearchPrefix("git reset --hard")) return { deny: "git-reset-fp" };
             if (aiHook.isSearchPrefix("mysql -e x")) return { deny: "search-fp" };
             if (!aiHook.isGitCommit('git commit -m "x"')) return { deny: "commit" };
             if (aiHook.isGitCommit("git status")) return { deny: "commit-fp" };
+            if (!aiHook.hasCmdSubstitution("echo $(whoami)")) return { deny: "subst-dollar" };
+            if (!aiHook.hasCmdSubstitution("echo `whoami`")) return { deny: "subst-backtick" };
+            if (aiHook.hasCmdSubstitution("echo hello")) return { deny: "subst-none" };
             if (!aiHook.hasWriteVector("echo x > f")) return { deny: "write" };
             if (!aiHook.hasWriteVector("echo x >> f")) return { deny: "write-append" };
             if (aiHook.hasWriteVector("echo x 2>&1")) return { deny: "write-fp" };
             if (aiHook.hasWriteVector("echo x 2>/dev/null")) return { deny: "write-devnull-fp" };
             if (aiHook.hasWriteVector("echo x >/dev/null")) return { deny: "write-devnull-fp2" };
             if (aiHook.hasWriteVector("echo x >nul")) return { deny: "write-nul-fp" };
+            if (!aiHook.hasWriteVector("git status | Out-File out.txt")) return { deny: "write-outfile" };
+            if (!aiHook.hasWriteVector("cat log | tee out.txt")) return { deny: "write-tee" };
+            if (!aiHook.hasWriteVector("echo a | Set-Content f.txt")) return { deny: "write-setcontent" };
+            if (!aiHook.hasWriteVector("echo a | Add-Content f.txt")) return { deny: "write-addcontent" };
 
             // non-string inputs (ctx.cmd is null for non-command tools) are safe
             if (aiHook.splitTopCommands(null).length !== 0) return { deny: "null-split" };
@@ -5999,4 +6011,50 @@ fn test_antigravity_read_file_uppercase_path() {
         file_write.path.as_deref(),
         Some("C:\\Users\\hugh.li\\.ssh\\id_rsa")
     );
+}
+
+#[test]
+fn test_multiedit_action_parsing() {
+    let raw = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": "/tmp/test.rs",
+            "edits": []
+        }
+    });
+    let ctx = HookContext::parse(&raw.to_string());
+    let file = ctx.file.expect("file should be parsed");
+    assert_eq!(file.action, FileAction::Edit);
+    assert_eq!(file.path.as_deref(), Some("/tmp/test.rs"));
+}
+
+#[test]
+fn test_notebook_path_parsing() {
+    let raw = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "EditNotebook",
+        "tool_input": {
+            "notebook_path": "/workspace/analysis.ipynb",
+            "cell_index": 0
+        }
+    });
+    let ctx = HookContext::parse(&raw.to_string());
+    let file = ctx.file.expect("file should be parsed");
+    assert_eq!(file.action, FileAction::Edit);
+    assert_eq!(file.path.as_deref(), Some("/workspace/analysis.ipynb"));
+}
+
+#[test]
+fn test_quoted_executable_with_spaces() {
+    let cmd =
+        ai_hook::engine::semantic::analyze_command(r#""C:\Program Files\Git\bin\git.exe" status"#);
+    assert_eq!(cmd.executable, "git");
+    assert_eq!(cmd.subcommand.as_deref(), Some("status"));
+
+    let cmd2 = ai_hook::engine::semantic::analyze_command(
+        r#""C:\Program Files\Docker\docker.exe" compose up -d"#,
+    );
+    assert_eq!(cmd2.executable, "docker");
+    assert_eq!(cmd2.subcommand.as_deref(), Some("compose"));
 }

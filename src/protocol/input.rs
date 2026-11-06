@@ -781,6 +781,13 @@ fn normalize_semantics(
         "path",
         "dir_path",
         "file",
+        "notebook_path",
+        "notebookPath",
+        "NotebookPath",
+        "target_file",
+        "targetFile",
+        "absolute_path",
+        "directory_path",
     ];
 
     // Codex `apply_patch` carries its targets inside the patch text
@@ -822,7 +829,11 @@ fn normalize_semantics(
         // Edit (in place) — "replace" is Gemini CLI's registered edit tool
         "edit"
         | "multi_edit"
+        | "multiedit"
         | "notebookedit"
+        | "notebook_edit"
+        | "editnotebook"
+        | "edit_notebook"
         | "apply_patch"
         | "replace"
         | "replace_file_content"

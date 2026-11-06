@@ -29,9 +29,9 @@ pub const PRELUDE_JS: &str = r#"
 // Pure, stateless, I/O-free helpers for command-text analysis. Single source
 // of truth shared by every rule; never redefine these inside a rule file.
 globalThis.aiHook = (function () {
-    var SEARCH_PREFIX = /^\s*(grep|rg|git|find|cat|head|tail|sed|awk|echo|printf)\b/i;
+    var SEARCH_PREFIX = /^\s*(grep|rg|find|cat|head|tail|sed|awk|echo|printf|git\s+(?:grep|status|diff|log|branch|show|rev-parse))\b/i;
     var GIT_COMMIT = /^\s*git\s+commit\b/i;
-    var CMD_SUBSTITUTION = /\$\(/;
+    var CMD_SUBSTITUTION = /\$\(|`[^`]+`/;
 
     // Quote-aware top-level segmentation of a command line.
     //   - splits on && || ; and newlines; never splits inside quotes
@@ -92,11 +92,11 @@ globalThis.aiHook = (function () {
     }
 
     // Write vector: redirect to disk (`>` / `>>`, `2>&1` / `/dev/null` / `nul` allowed)
-    // or a pipe into `tee`.
+    // or a pipe into `tee` / PowerShell file-writing cmdlets.
     function hasWriteVector(cmdStr) {
         if (typeof cmdStr !== "string") return false;
         if (/(?:>>|>)\s*(?!&|\/dev\/null|nul\b)\S/.test(cmdStr)) return true;
-        if (/[>|]\s*[^;&|]*\b(tee)\b/i.test(cmdStr)) return true;
+        if (/[>|]\s*[^;&|]*\b(tee|out-file|set-content|add-content)\b/i.test(cmdStr)) return true;
         return false;
     }
 
